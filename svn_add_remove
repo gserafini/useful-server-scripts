@@ -12,6 +12,7 @@
 # Author: Gabriel Serafini <gserafini@gmail.com>
 # http://www.gabrielserafini.com
 #
+# ln -s svn_add_remove /usr/local/bin/svn_add_remove
 ################################################################
 
 USER=(`whoami`)
