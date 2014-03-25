@@ -12,7 +12,9 @@
 # Author: Gabriel Serafini <gserafini@gmail.com>
 # http://www.gabrielserafini.com
 #
-# ln -s svn_add_remove /usr/local/bin/svn_add_remove
+# INSTALL
+# Symlink the file into /usr/local/bin to enable system-wide
+# ln -s $PWD/svn_add_remove /usr/local/bin/svn_add_remove
 ################################################################
 
 USER=(`whoami`)
