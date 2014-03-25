@@ -1,0 +1,117 @@
+#! /bin/bash
+
+#################################################################
+#
+# Script to tell svn to schedule for addition new unknown files 
+# found using svn st | grep ? and to schedule for deletion files
+# found using svn st | grep !
+#
+# Useful for when upgrading WordPress using automatic method and
+# we want to check in the changed fileset
+#
+# Author: Gabriel Serafini <gserafini@gmail.com>
+# http://www.gabrielserafini.com
+#
+################################################################
+
+USER=(`whoami`)
+DIR_OWNER=(`ls -al | awk 'NR==2{print $3}'`)
+
+if [[ "$USER" == 'root' ]];
+then
+  echo
+  echo "**** WARNING: You are operating as root user. ****"
+  echo "It is strongly recommended to NOT schedule or check in files as root due to permissions issues with .svn directories."
+  echo
+  echo "Would you like to su to the current directory's owner ($DIR_OWNER)? [y]/n"
+  read -e su
+  if [[ "$su" == 'y' || "$su" == "" ]]
+  then
+    echo "Changing user to $DIR_OWNER for svn operations, will exit back to root when done..."
+    su $DIR_OWNER -c svn_add_remove
+    exit 0
+  else
+    echo "Proceed as root user... but keep in mind you may have to do some cleanup afterwards..."
+  fi
+  echo
+fi
+
+echo "svn st | grep ?"
+
+TOTAL_COUNT=(`svn st | grep ? | wc -l`)
+
+if [ "$TOTAL_COUNT" -gt 0 ]
+then
+  svn st | grep ?
+  echo "----------------------------------------------------"
+  echo "TOTAL UNKNOWN FILES: $TOTAL_COUNT"
+  echo
+  echo "Schedule these files for addition? [y]/n "
+  read -e t1
+  echo
+
+  if [[ "$t1" == 'y' || "$t1" == 'yes' || "$t1" == "" ]];
+  then
+    svn st | grep ? | sed 's/? *//' | xargs svn add
+    echo
+    echo "$TOTAL_COUNT files scheduled for addition. Don't forget to commit your changes. ;)"
+    echo
+  fi
+
+fi
+
+echo "svn st | grep !"
+
+TOTAL_COUNT=(`svn st | grep ! | wc -l`)
+
+if [ "$TOTAL_COUNT" -gt '0' ]
+then
+
+  svn st | grep !
+  echo "----------------------------------------------------"
+  echo "TOTAL MISSING FILES: $TOTAL_COUNT"
+  echo
+  echo "Schedule these files for deletion? [y]/n"
+  read -e t2
+
+  if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]];
+  then
+    svn st | grep ! | sed 's/! *//' | xargs svn rm
+    echo "$TOTAL_COUNT files scheduled for deletion. Don't forget to commit your changes. ;)"
+    echo
+  fi
+
+fi
+
+# echo "svn st | grep ~"
+
+# TOTAL_COUNT=(`svn st | grep \~ | wc -l`)
+# 
+# if [ "$TOTAL_COUNT" -gt '0' ]
+# then
+# 
+#   svn st | grep ~
+#   echo "----------------------------------------------------"
+#   echo "TOTAL REPLACED RESOURCES: $TOTAL_COUNT"
+#   echo
+#   echo "Check in the new versions? (This will svn rm the old versions and svn add and commit the new ones) [y]/n"
+#   read -e t2
+# 
+#   if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]];
+#   then
+#     svn st | grep \~ | sed 's/\~ *//' | while read line
+# 		do
+# 			mv $line "$line-tmp"
+# 			svn rm --force $line
+# 			mv "$line-tmp" $line
+# 		done
+# 
+#     #echo "$TOTAL_COUNT files scheduled for deletion. Don't forget to commit your changes. ;)"
+#     echo
+#   fi
+# 
+# fi
+
+
+exit 0
+
