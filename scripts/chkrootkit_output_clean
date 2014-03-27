@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# This script is designed to run the chkrootkit script in quiet mode (only print alerts / warnings)
+# and clean known false positives (ie on cPanel port 465 is a legitimate port
+#
+# Author: Gabriel Serafini gserafini@gmail.com
+#
+# 
+
+cd /usr/local/src/chkrootkit; ./chkrootkit -q | sed 's/INFECTED (PORTS:  465)//' 
+
