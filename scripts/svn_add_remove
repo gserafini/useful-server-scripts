@@ -39,13 +39,14 @@ then
   echo
 fi
 
-echo "svn st | grep ?"
+echo "Searching for unknown files..."
+echo "svn st | grep ? #excluding /cache/ files"
 
-TOTAL_COUNT=(`svn st | grep ? | wc -l`)
+TOTAL_COUNT=(`svn st | grep ? | grep -v ".*cache.*" | grep -v error_log | wc -l`)
 
 if [ "$TOTAL_COUNT" -gt 0 ]
 then
-  svn st | grep ?
+  svn st | grep ? | grep -v ".*cache.*" | grep -v error_log
   echo "----------------------------------------------------"
   echo "TOTAL UNKNOWN FILES: $TOTAL_COUNT"
   echo
@@ -63,6 +64,7 @@ then
 
 fi
 
+echo "Searching for missing files..."
 echo "svn st | grep !"
 
 TOTAL_COUNT=(`svn st | grep ! | wc -l`)
@@ -86,34 +88,38 @@ then
 
 fi
 
-# echo "svn st | grep ~"
+echo "Searching for replaced files..."
+echo "svn st | grep ~"
 
-# TOTAL_COUNT=(`svn st | grep \~ | wc -l`)
-# 
-# if [ "$TOTAL_COUNT" -gt '0' ]
-# then
-# 
-#   svn st | grep ~
-#   echo "----------------------------------------------------"
-#   echo "TOTAL REPLACED RESOURCES: $TOTAL_COUNT"
-#   echo
-#   echo "Check in the new versions? (This will svn rm the old versions and svn add and commit the new ones) [y]/n"
-#   read -e t2
-# 
-#   if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]];
-#   then
-#     svn st | grep \~ | sed 's/\~ *//' | while read line
-# 		do
-# 			mv $line "$line-tmp"
-# 			svn rm --force $line
-# 			mv "$line-tmp" $line
-# 		done
-# 
-#     #echo "$TOTAL_COUNT files scheduled for deletion. Don't forget to commit your changes. ;)"
-#     echo
-#   fi
-# 
-# fi
+ TOTAL_COUNT=(`svn st | grep \~ | wc -l`)
+ 
+ if [ "$TOTAL_COUNT" -gt '0' ]
+ then
+ 
+   svn st | grep \~
+   echo "----------------------------------------------------"
+   echo "TOTAL REPLACED RESOURCES: $TOTAL_COUNT"
+   echo
+   echo "Check in the new versions? (This will svn rm the old versions and svn add and commit the new ones and you'll need to enter your svn password 3 times - up > rm > add) [y]/n"
+   read -e t2
+ 
+   if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]];
+   then
+     svn st | grep \~ | sed 's/\~ *//' | while read line
+ 		do
+ 			mv $line "$line-tmp"
+			svn up $line
+ 			svn rm $line
+			svn ci $line -m "Deleting old file(s)"
+ 			mv "$line-tmp" $line
+			svn add $line
+			svn ci $line -m "Adding new version of file(s)"
+ 		done
+ 
+     echo
+   fi
+ 
+ fi
 
 
 exit 0
