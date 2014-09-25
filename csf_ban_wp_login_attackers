@@ -2,8 +2,8 @@
 # Designed to run in cron job, and check for any IP addresses that have been detected trying to access wp-login.php
 # repeatedly and that have received a 500 or 403 error more than 10 times
 
-grep "wp-login.*500" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 10 {system("csf -d " $2 " Blocked because accessed wp-login.php and got 500 error code " $1 " times in last 24 hours")}'
+grep "wp-login.*500" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 10 {system("/usr/sbin/csf -d " $2 " Blocked because accessed wp-login.php and got 500 error code " $1 " times in last 24 hours")}'
 
-grep "wp-login.*403" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 10 {system("csf -d " $2 " Blocked because accessed wp-login.php and got 403 error code " $1 " times in last 24 hours")}'
+grep "wp-login.*403" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 10 {system("/usr/sbin/csf -d " $2 " Blocked because accessed wp-login.php and got 403 error code " $1 " times in last 24 hours")}'
 
 
