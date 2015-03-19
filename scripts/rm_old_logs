@@ -1,0 +1,4 @@
+#!/bin/bash
+
+find /usr/local/apache/logs/archive -name "*.gz" -mtime +45 -exec rm {} \;
+
