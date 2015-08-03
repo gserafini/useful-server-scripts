@@ -26,7 +26,7 @@ grep "/oldwp/wp-login.php?action=register" /usr/local/apache/logs/apache_mainlog
 grep "wp-login" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 300 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried to access wp-login.php " $1 " times in last 24 hours")}'
 
 # WHITELIST any allowed IPs in CSF Allow
-grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' /etc/csf/csf.allow | sed 's/^/Allow from /' > /root/csf_whitelist_ips.conf
-grep -o '^[^ |#].*' /etc/csf/csf.dyndns | sed 's/^/Allow from /' >> /root/csf_whitelist_ips.conf
+grep -o '^[^ |#].*' /etc/csf/csf.dyndns | sed 's/^/Allow from /' > /root/csf_whitelist_ips.conf
+grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' /etc/csf/csf.allow | sed 's/^/Allow from /' >> /root/csf_whitelist_ips.conf
 
 
