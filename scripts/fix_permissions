@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# Fix file and directory permissions
+
+if [[ -n $1 ]]; then
+    dir=$1
+else
+    dir=$(pwd)
+fi
+
+echo "Fixing permissions for" $dir
+
+find $dir -type d -exec chmod 755 {} \;
+find $dir -name "*.php" -exec chmod 644 {} \;
+
+echo "Done!"
