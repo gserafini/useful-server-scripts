@@ -6,9 +6,6 @@
 # /scripts/restartsrv_chkservd
 
 while true; do
-  inotifywait -e modify /home/serafini/public_html/version-checker/requested_ips_for_whitelisting.txt && echo 'Got whitelist request from WhitelistMyIP.com'; /bin/bash /home/serafini/public_html/version-checker/requested_ips_for_whitelisting.txt
-done &
-while true; do
   inotifywait -e modify /etc/csf/csf.allow && echo 'Restarting Apache...'; service httpd restart
 done
 

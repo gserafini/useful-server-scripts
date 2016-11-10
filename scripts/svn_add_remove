@@ -20,24 +20,25 @@
 USER=(`whoami`)
 DIR_OWNER=(`ls -al | awk 'NR==2{print $3}'`)
 
-if [[ "$USER" == 'root' ]];
-then
-  echo
-  echo "**** WARNING: You are operating as root user. ****"
-  echo "It is strongly recommended to NOT schedule or check in files as root due to permissions issues with .svn directories."
-  echo
-  echo "Would you like to su to the current directory's owner ($DIR_OWNER)? [y]/n"
-  read -e su
-  if [[ "$su" == 'y' || "$su" == "" ]]
-  then
-    echo "Changing user to $DIR_OWNER for svn operations, will exit back to root when done..."
-    su $DIR_OWNER -c svn_add_remove
-    exit 0
-  else
-    echo "Proceed as root user... but keep in mind you may have to do some cleanup afterwards..."
-  fi
-  echo
-fi
+#if [[ "$USER" == 'root' ]];
+#then
+#  echo
+#  echo "**** WARNING: You are operating as root user. ****"
+#  echo "It is strongly recommended to NOT schedule or check in files as root due to permissions issues with .svn directories."
+#  echo
+#  echo "Would you like to su to the current directory's owner ($DIR_OWNER)? [y]/n"
+#  read -e su
+#  if [[ "$su" == 'y' || "$su" == "" ]]
+#  then
+#    echo "Changing user to $DIR_OWNER for svn operations, will exit back to root when done..."
+#    su $DIR_OWNER -c svn_add_remove
+#    exit 0
+#  else
+#    echo "Proceed as root user... but keep in mind you may have to do some cleanup afterwards..."
+#  fi
+#  echo
+#fi
+
 
 echo "Searching for unknown files..."
 echo "svn st | grep ? #excluding /cache/ files"
@@ -121,6 +122,24 @@ echo "svn st | grep ~"
  
  fi
 
+if [[ "$USER" == 'root' ]];
+then
+  echo "Cleaning changing all .svn files back to correct user / group..."
+  LOCALDIROWNER=`stat -c "%U" .`; find . -user root | grep ".svn" | xargs -d '\n' chown $LOCALDIROWNER:$LOCALDIROWNER
+  echo "Checking for any final files owned by root..."
+  MOREFILES=`find . -user root`
+    if [ "$MOREFILES" != '' ];
+      then
+        echo "Found file(s) owned by root.  Fix? [y]/n"
+        find . -user root -exec ls -al {} \;
+        read -e t2
+        if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]];
+        then
+          find . -user root | xargs -d '\n' chown $LOCALDIROWNER:$LOCALDIROWNER
+        fi
+    fi
+  echo "Done!"
+fi
 
 exit 0
 
