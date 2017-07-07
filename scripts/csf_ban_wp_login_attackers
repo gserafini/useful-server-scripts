@@ -22,6 +22,9 @@ grep "/wordpresshp/wp-login.php?action=register" /usr/local/apache/logs/apache_m
 # Check for honeypot attack attempts
 grep "/oldwp/wp-login.php?action=register" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 "  because trying to access honeypot fake WordPress registration " $1 " times in last 24 hours")}'
 
+# Check for people looking for vi swap files (.wp-config.php.swp)
+grep ".*\.swp" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 "  because trying to access *.swp file " $1 " times in last 24 hours")}'
+
 # Check for excessive wp-login access attempts, more than 300 in 24 hours probably bad
 grep "wp-login" /usr/local/apache/logs/apache_mainlog | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 300 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried to access wp-login.php " $1 " times in last 24 hours")}'
 
