@@ -43,11 +43,11 @@ DIR_OWNER=(`ls -al | awk 'NR==2{print $3}'`)
 echo "Searching for unknown files..."
 echo "svn st | grep ? #excluding /cache/ files"
 
-TOTAL_COUNT=(`svn st | grep ? | grep -v ".*cache.*" | grep -v error_log | wc -l`)
+TOTAL_COUNT=(`svn st | grep ? | grep -v ".*cache.*" | grep -v error_log | grep -v ftpquota | wc -l`)
 
 if [ "$TOTAL_COUNT" -gt 0 ]
 then
-  svn st | grep ? | grep -v ".*cache.*" | grep -v error_log
+  svn st | grep ? | grep -v ".*cache.*" | grep -v error_log | grep -v ftpquota
   echo "----------------------------------------------------"
   echo "TOTAL UNKNOWN FILES: $TOTAL_COUNT"
   echo
@@ -57,7 +57,7 @@ then
 
   if [[ "$t1" == 'y' || "$t1" == 'yes' || "$t1" == "" ]];
   then
-    svn st | grep ? | grep -v ".*cache.*" | grep -v error_log |  sed 's/? *//' | xargs svn add
+    svn st | grep ? | grep -v ".*cache.*" | grep -v error_log | grep -v ftpquota |  sed 's/? *//' | xargs svn add
     echo
     echo "$TOTAL_COUNT files scheduled for addition. Don't forget to commit your changes. ;)"
     echo
