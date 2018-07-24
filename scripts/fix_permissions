@@ -10,7 +10,7 @@ fi
 
 echo "Fixing permissions for" $dir
 
+find $dir -type f -regex ".*\(php\|js\|png\|jpg\|jpeg\|txt\|css\)" -exec chmod 644 {} \;
 find $dir -type d -exec chmod 755 {} \;
-find $dir -name "*.php" -exec chmod 644 {} \;
 
 echo "Done!"

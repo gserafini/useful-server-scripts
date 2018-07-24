@@ -6,7 +6,7 @@
 # /scripts/restartsrv_chkservd
 
 while true; do
-  inotifywait -e modify /etc/csf/csf.allow && echo 'Restarting Apache...'; service httpd restart
+  inotifywait -e modify /etc/csf/csf.allow; logger -s 'Restarting Apache...'; service httpd restart; logger -s 'Apache restarted!'
 done
 
 
