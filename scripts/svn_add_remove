@@ -57,7 +57,7 @@ then
 
   if [[ "$t1" == 'y' || "$t1" == 'yes' || "$t1" == "" ]];
   then
-    svn st | grep ^? | grep -v ".*/wp-content/cache.*" | grep -v error_log | grep -v ftpquota |  sed 's/? *//' | sed 's| |\\ |g' | awk '{print $1"@"}' |  xargs svn add
+    svn st | grep ^? | grep -v ".*/wp-content/cache.*" | grep -v error_log | grep -v ftpquota |  sed 's/? *//' | sed 's| |\\ |g' | awk '{print $1"@"}' |  xargs -I % svn add '%'
     echo
     echo "$TOTAL_COUNT files scheduled for addition. Don't forget to commit your changes. ;)"
     echo
@@ -82,7 +82,7 @@ then
 
   if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]];
   then
-    svn st | grep ^! | sed 's/! *//' | sed 's| |\\ |g' | awk '{print $1"@"}' |  xargs svn rm
+    svn st | grep ^! | sed 's/! *//' | sed 's| |\\ |g' | awk '{print $1"@"}' |  xargs -I % svn rm '%'
     echo "$TOTAL_COUNT files scheduled for deletion. Don't forget to commit your changes. ;)"
     echo
   fi
