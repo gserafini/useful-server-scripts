@@ -4,6 +4,167 @@
 # more than 10 times, or that are using "tools.ua.random()" as their user agent,
 # or other bad behavior
 
+declare -A keywords
+declare -A keywords_test
+
+# number of times it needs to hit to trigger block | what to search for
+keywords_test=(
+  ["5 security2.*CRITICAL"]="error_log ModSecurity CRITICAL"
+  ["200 wp-login"]="tried to access wp-login"
+  ["5 AH01797"]="error_log ModSecurity AH01797: client denied by server configuration"
+  ["5 AH10244"]="error_log ModSecurity AH10244: invalid URI path"
+)
+
+keywords=(
+  ["5 AH01797"]="error_log ModSecurity AH01797: client denied by server configuration"
+  ["5 AH10244"]="error_log ModSecurity AH10244: invalid URI path"
+  ["5 AH01071"]="error_log ModSecurity AH01071: Got error Primary script unknown - requesting missing php file"
+  ["1 1234123440"]="error_log ModSecurity 1234123440: Access denied with code 406 - URL Encoding Abuse Attack Attempt"
+  ["1 1234123438"]="error_log ModSecurity 1234123438: Access denied with code 400 - Proxy access attempt"
+  ["1 941120"]="error_log ModSecurity 941120: Warning. Pattern match - XSS Filter - Category 2: Event Handler Vector"
+  ["1 941130"]="error_log ModSecurity 941130: Warning. Pattern match - XSS Filter - Category 3: Attribute Vector"
+  ["1 941160"]="error_log ModSecurity 941160: Pattern match - NoScript XSS InjectionChecker: HTML Injection"
+  ["1 942270"]="error_log ModSecurity 942270: Pattern match - Looking for basic sql injection. Common attack string for mysql, oracle and others."
+  ["1 933160"]="error_log ModSecurity 933160: Pattern match - PHP Injection Attack: High-Risk PHP Function Call Found"
+  ["1 933150"]="error_log ModSecurity 933150: Pattern match - PHP Injection Attack: High-Risk PHP Function Name Found"
+  ["5 1234123429"]="error_log ModSecurity 1234123429: Warning. Pattern match - Request Indicates an automated program explored the site"
+  ["1 1234123443"]="error_log ModSecurity 1234123443: Access denied with code 400 - GET or HEAD requests with bodies"
+  ["1 1234123415"]="error_log ModSecurity 1234123415: Access denied with code 406 - SQL Injection Attack"
+  ["1 1234123448"]="error_log ModSecurity 1234123448: Access denied with code 501 - Remote File Access Attempt"
+  ["5 security2.*CRITICAL"]="error_log ModSecurity CRITICAL"
+  ["1 \.env"]=".env"
+  ["1 \.git"]=".git"
+  ["1 \.swp"]=".swp"
+  ["1 /config.json"]="/config.json"
+  ["1 /0.php"]="/0.php"
+  ["1 /sidwsi.php"]="/sidwsi.php"
+  ["1 /wp-includes/css/chosen.php"]="/wp-includes/css/chosen.php"
+  ["1 /wp-admin/css/colors/install.php"]="/wp-admin/css/colors/install.php"
+  ["1 /h.php"]="/h.php"
+  ["1 /wp-includes/mani.php"]="/wp-includes/mani.php"
+  ["1 /components/lig.php"]="/components/lig.php"
+  ["1 /worksec.php"]="/worksec.php"
+  ["1 /wp-content.php"]="/wp-content.php"
+  ["1 /wp-admin/maint/min.php"]="/wp-admin/maint/min.php"
+  ["1 /wp-content/uploads/chosen.php"]="/wp-content/uploads/chosen.php"
+  ["1 /wp-content/plugins/fix/fai.php"]="/wp-content/plugins/fix/fai.php"
+  ["1 /wp-admin/luuf.php"]="/wp-admin/luuf.php"
+  ["1 /update/gely.php"]="/update/gely.php"
+  ["1 /bc"]="/bc"
+  ["1 alfacgiapi"]="alfacgiapi"
+  ["1 shell.php.*404"]="shell.php and got 404 error code"
+  ["1 upfile.php.*404"]="upfile.php and got 404 error code"
+  ["1 mah.php"]="mah.php"
+  ["1 minishell.php"]="minishell.php"
+  ["1 alfashell.php"]="alfashell.php"
+  ["1 mar.php"]="mar.php"
+  ["1 /xp.php"]="/xp.php"
+  ["1 /goods.php"]="/goods.php"
+  ["1 /webdb.php"]="/webdb.php"
+  ["1 byp.php"]="byp.php"
+  ["1 gffbgfe.php"]="tried to access gffbgfe.php"
+  ["1 install.php.*404"]="install.php and got 404 error code"
+  ["1 ee.php.*404"]="ee.php and got 404 error code"
+  ["1 /w.php"]="/w.php"
+  ["1 /r.php"]="/r.php"
+  ["1 /as.php"]="/as.php"
+  ["1 ini.php.*404"]="ini.php and got 404 error code"
+  ["1 /rk2.php"]="rk2.php"
+  ["1 /bx.php"]="/bx.php"
+  ["1 /commpilot/"]="/commpilot/"
+  ["1 /PhoneBackup/"]="/PhoneBackup/"
+  ["1 /webtools/control/main"]="/webtools/control/main"
+  ["1 /goform/formping"]="/goform/formping"
+  ["1 wp-cXjq2.php"]="wp-cXjq2.php"
+  ["1 UEP.php"]="UEP.php"
+  ["1 old.rar.*404"]="old.rar and got 404 error code"
+  ["1 old.jar.*404"]="old.jar and got 404 error code"
+  ["1 old.7z.*404"]="old.7z and got 404 error code"
+  ["1 tools.ua.random"]="tools.ua.random user agent"
+  ["1 /wordpresshp/wp-login.php?action=register"]="tried to register on our WordPress honeypot"
+  ["100 wp-login"]="tried to access wp-login"
+  ["5 wp-login.*500"]="wp-login and got 500 error code"
+  ["20 wp-login.*403"]="wp-login and got 403 error code"
+  ["5 wp-login.*404"]="wp-login and got 404 error code"
+  ["5 xmlrpc.php.*404"]="xmlrpc.php and got 404 error code"
+)
+
+echo " "
+date
+echo " "
+echo "Beginning to scan /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log for keywords..."
+echo " "
+
+
+for key in "${!keywords[@]}"; do
+
+  frequency=$(( $( echo ${key} | cut -d" " -f1) )) #expression to conver to integer
+  keyword=$( echo ${key} | cut -d" " -f2)
+  description=${keywords[${key}]}
+
+  echo "***************************"
+  echo "Searching logs for \"$keyword\" repeated at least $frequency times..."
+  echo "***************************"
+  echo " "
+
+  grep -r $keyword /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log |
+  egrep -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
+  sed 's/://' |
+  sort | 
+  uniq -c |
+  awk -v frequency=$frequency -v description="$description" '{ if ($1 >= frequency ) {
+       cmd="geoiplookup " $2 " | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
+       cmd | getline country
+       close(cmd) 
+       message="Blocking " $2 " for accessing " description " " $1 " times. [" country "]" 
+       print message
+       check_ip_not_in_deny_file = system("grep -q " $2 " /etc/csf/csf.deny")
+
+       if (check_ip_not_in_deny_file) {
+         system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: " message " ")
+       }
+       else {
+         print "IP is already in /etc/csf/csf.deny."
+       }
+
+       print " "
+       }
+     }'
+
+echo " "
+
+done
+
+echo "Whitelisting IPs..."
+
+# WHITELIST any allowed IPs in CSF Allow
+grep -o '^[^ |#].*' /etc/csf/csf.dyndns | sed 's/^/Allow from /' > /root/csf_whitelist_ips.conf
+grep -o '^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' /etc/csf/csf.allow | sed 's/^/Allow from /' >> /root/csf_whitelist_ips.conf
+
+echo "Done whitelisting IPs, completed!"
+
+echo " "
+echo "Restarting csf firewall..."
+
+/usr/sbin/csf -r
+
+echo " "
+echo "Restarting Apache..."
+
+release=$(rpm -q --queryformat '%{RELEASE}' rpm | grep -o [[:digit:]]*\$)
+
+if [[ $release -lt 7 ]]; then
+  /etc/rc.d/init.d/httpd restart
+else
+ /usr/bin/systemctl restart httpd.service
+fi
+
+
+echo "Done!"
+
+exit 1
+
+
 
 # Check for 500 errors (Usually BruteProtect plugin)
 grep -r "wp-login.*500" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 5 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed wp-login.php and got 500 error code " $1 " times in last 24 hours")}'
@@ -15,22 +176,28 @@ grep -r "wp-login.*403" /usr/local/apache/logs/apache_mainlog /usr/local/apache/
 grep -r "wp-login.*404" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 10 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed wp-login* and got 404 error code " $1 " times in last 24 hours")}'
 
 # Check for 404 errors in XMLRPC
-grep -r "xmlrpc.php.*404" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 5 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed xmlrpc* and got 404 error code " $1 " times in last 24 hours")}'
+grep -r "shell.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing shell.php " $1 " times in last 24 hours")}'
 
-# Check for 301 errors in XMLRPC
-grep -r "xmlrpc.php.*301" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 5 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed xmlrpc* and got 301 error code " $1 " times in last 24 hours")}'
+# Check for upfile.php
+grep -r "upfile.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing upfile.php " $1 " times in last 24 hours")}'
 
-# Check for 520=1
-grep -r "520=1" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing 520=1 " $1 " times in last 24 hours")}'
-
-# Check for bala.php
-grep -r "bala.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing bala.php " $1 " times in last 24 hours")}'
+# Check for mah.php
+grep -r "mah.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing mah.php " $1 " times in last 24 hours")}'
 
 # Check for install.php
 grep -r "/install.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 2 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing install.php " $1 " times in last 24 hours")}'
 
 # Check for ee.php
 grep -r "ee.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing ee.php " $1 " times in last 24 hours")}'
+
+# Check for old.rar
+grep -r "old.rar" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing old.rar " $1 " times in last 24 hours")}'
+
+# Check for old.jar
+grep -r "old.jar" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing old.jar " $1 " times in last 24 hours")}'
+
+# Check for old.7z
+grep -r "old.7z" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing old.7z " $1 " times in last 24 hours")}'
 
 # Check for /.env
 grep -r "/\.env" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing /.env " $1 " times in last 24 hours")}'
