@@ -50,7 +50,6 @@ keywords=(
   ["1 /wp-content/plugins/fix/fai.php"]="/wp-content/plugins/fix/fai.php"
   ["1 /wp-admin/luuf.php"]="/wp-admin/luuf.php"
   ["1 /update/gely.php"]="/update/gely.php"
-  ["1 /bc"]="/bc"
   ["1 alfacgiapi"]="alfacgiapi"
   ["1 shell.php.*404"]="shell.php and got 404 error code"
   ["1 upfile.php.*404"]="upfile.php and got 404 error code"
