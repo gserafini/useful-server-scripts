@@ -31,7 +31,7 @@ keywords=(
   ["1 1234123443"]="error_log ModSecurity 1234123443: Access denied with code 400 - GET or HEAD requests with bodies"
   ["1 1234123415"]="error_log ModSecurity 1234123415: Access denied with code 406 - SQL Injection Attack"
   ["1 1234123448"]="error_log ModSecurity 1234123448: Access denied with code 501 - Remote File Access Attempt"
-  ["5 security2.*CRITICAL"]="error_log ModSecurity CRITICAL"
+  #["5 security2.*CRITICAL"]="error_log ModSecurity CRITICAL"
   ["1 \.env"]=".env"
   ["1 \.git"]=".git"
   ["1 \.swp"]=".swp"
@@ -55,6 +55,7 @@ keywords=(
   ["1 shell.php.*404"]="shell.php and got 404 error code"
   ["1 upfile.php.*404"]="upfile.php and got 404 error code"
   ["1 mah.php"]="mah.php"
+  ["1 /alfa-rex.php"]="/alfa-rex.php"
   ["1 minishell.php"]="minishell.php"
   ["1 alfashell.php"]="alfashell.php"
   ["1 mar.php"]="mar.php"
@@ -87,6 +88,7 @@ keywords=(
   ["20 wp-login.*403"]="wp-login and got 403 error code"
   ["5 wp-login.*404"]="wp-login and got 404 error code"
   ["5 xmlrpc.php.*404"]="xmlrpc.php and got 404 error code"
+  ["30 /calendar/action~"]="Spidering calendars too hard when blocked by robots"
 )
 
 echo " "
