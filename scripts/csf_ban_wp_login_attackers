@@ -1,21 +1,409 @@
 #!/bin/bash
-# Designed to run in cron job, and check for any IP addresses that have been detected 
-# trying to access wp-login.php repeatedly and that have received a 500 or 403 error 
-# more than 10 times, or that are using "tools.ua.random()" as their user agent,
-# or other bad behavior
+# High-Performance IP Banning Script using IPSET and CSF.
+# This script is designed for deployment via cron job to automate Web Application Firewall (WAF) 
+# actions. It scans web server logs for a comprehensive set of malicious keywords and excessive 
+# access attempts (e.g., failed wp-login, ModSecurity violations, shell file probing). 
+# It utilizes IPSET for high-capacity, kernel-level blocking and manages a persistent, 
+# rotatable ban list synchronized with the CSF firewall rules via csfpost.sh.
+#
+# NOTE: This script is intended to be run with root privileges (e.g., via root's cron job) 
+#       and no longer contains redundant 'sudo' calls.
 
+# --- Author and Repository ---
+# Author: Gabriel Serafini / gserafini@gmail.com
+# Repository: https://github.com/gserafini/useful-server-scripts
+# -----------------------------
+
+# --- Command Line Options ---
+# The script can be run with the following utility flags instead of its default log-scanning mode:
+# 1. --init: Initializes the IPSET table and adds the necessary firewall rules to /etc/csf/csfpost.sh. 
+#    This must be run once before the cron job is activated.
+# 2. --whitelist <IP>: Adds the specified IP address to /etc/csf/csf.allow, removes it from the 
+#    IPSET ban list, and reloads CSF. (Requires setup)
+# 3. --blacklist <IP>: Immediately adds the specified IP address to the IPSET ban list 
+#    and the tracking file. It skips whitelisted IPs. (Requires setup)
+# 4. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 5. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+# ----------------------------
+
+# --- Script Collaboration Credit ---
+# This script was collaboratively developed and refined with Gemini Advanced.
+# For historical context and feature additions (--init, --whitelist, --logs),
+# please refer to the following chat:
+# [https://gemini.google.com/app/44e88278aba578b0](https://gemini.google.com/app/44e88278aba578b0)
+# -----------------------------------
+
+# --- CONFIGURATION VARIABLES ---
+IP_SET_NAME="high_volume_bans"
+# Tracking file includes the IP_SET_NAME for clarity
+IP_TRACKING_FILE="/etc/csf/ipset_tracking_${IP_SET_NAME}.log" 
+CSF_ALLOW_FILE="/etc/csf/csf.allow" 
+CSF_DENY_FILE="/etc/csf/csf.deny" 
+CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
+MAX_BANS=50000 
+# 🟢 UPDATED: Increased permanent ban capacity to 5000
+MAX_PERMANENT_BANS=5000
+MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, now based on aggregated hits.
+
+# DEFAULT LOG FILES: These are used if no --logs argument is provided.
+DEFAULT_LOG_PATHS="/usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log"
+LOG_PATHS="" 
+
+# Temporary file for IP aggregation across all keywords
+TEMP_AGGREGATE_FILE=$(mktemp)
+# -------------------------------
+
+# Function to safely validate an IP address format
+validate_ip() {
+    local ip=$1
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        return 0 
+    else
+        return 1 
+    fi
+}
+
+# Function to check if the high-volume ban system is fully set up
+is_setup_complete() {
+    # 1. Check if the tracking file exists
+    if [ ! -f "$IP_TRACKING_FILE" ]; then
+        return 1
+    fi
+    
+    # 2. Check if the IPSET exists 
+    if ! ipset list "$IP_SET_NAME" &> /dev/null; then
+        return 1
+    fi
+
+    # 3. Check if the iptables DROP rule is in csfpost.sh
+    local iptables_rule_line="\$IPTABLES -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
+    if [ ! -f "$CSF_POST_FILE" ] || ! grep -q "$iptables_rule_line" "$CSF_POST_FILE"; then
+        return 1
+    fi
+
+    return 0
+}
+
+# Function to enforce setup or offer to initialize
+ensure_setup() {
+    if is_setup_complete; then
+        return 0 # Setup is good, proceed
+    fi
+
+    echo " "
+    echo "====================================================================="
+    echo "⚠️  CRITICAL SETUP WARNING"
+    echo "====================================================================="
+    echo "The High-Volume Ban system is not properly initialized."
+    echo "The required IPSET table ('$IP_SET_NAME') or configuration is missing."
+    
+    # Check if run interactively (tty check)
+    if [ -t 0 ]; then
+        echo " "
+        echo "Do you want to run the initialization (./csf_ban_wp_login_attackers --init) now?"
+        read -r -p "Type 'yes' to initialize, or 'no' to exit: " response
+        
+        if [[ "$response" =~ ^[Yy][Ee][Ss]$ ]]; then
+            echo "Running initialization..."
+            perform_init # This function exits upon completion
+        else
+            echo "Initialization skipped. Exiting. Please run the script with the --init flag manually."
+            exit 1
+        fi
+    else
+        echo " "
+        echo "ACTION REQUIRED: Run the script manually with the --init flag:"
+        echo "  $0 --init"
+        echo " "
+        echo "This script is running in a non-interactive environment (cron) and cannot proceed."
+        exit 1
+    fi
+}
+
+
+# Function to report the current ban counts
+# NOTE: Accepts optional second argument for the number of IPs added in the current run
+report_ban_counts() {
+    local report_title="$1"
+    local new_bans_count="${2:-0}"
+    echo "--- 📊 $report_title ---"
+    
+    # 1. Count IPSET Bans (from the synchronized tracking file)
+    local ipset_count=$(grep -v '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null | wc -l)
+
+    # 2. Count CSF.DENY Bans (excluding comments and blank lines)
+    local csf_deny_count=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
+
+    echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
+    echo "Total IPs in CSF Deny File '$CSF_DENY_FILE': $csf_deny_count"
+    
+    # Display the count for the current run if provided
+    if [ "$new_bans_count" -gt 0 ]; then
+        echo "New IPs added to blacklist: $new_bans_count"
+    fi
+    echo "----------------------"
+}
+
+# Function to perform the blacklist action (Manual Ban)
+perform_blacklist() {
+    ensure_setup # Check for setup before executing
+    
+    local ip=$1
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local country=""
+
+    echo "--- 🔴 Blacklist Action: $ip ---"
+
+    # 1. IP Validation
+    if ! validate_ip "$ip"; then
+        echo "Error: Invalid IP address format: $ip"
+        exit 1
+    fi
+
+    # 2. Whitelist Check (Do not ban whitelisted IPs)
+    if grep -q "^$ip[[:space:]]*" "$CSF_ALLOW_FILE"; then
+        echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Skipping blacklist action."
+        exit 0
+    fi
+
+    # 3. IPSET Status Check (Do not re-ban already banned IPs)
+    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
+        echo "IP $ip is already in ipset: $IP_SET_NAME. Skipping insertion."
+        report_ban_counts "Post-Blacklist Report" 0 # Pass 0 new bans
+        exit 0
+    fi
+    
+    # 4. GEOIP Lookup 
+    cmd="geoiplookup $ip 2>/dev/null | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
+    country=$(eval "$cmd")
+
+    # 5. Message Construction and Limit Check
+    local message="Manually blacklisted via --blacklist at $timestamp"
+    
+    local current_ban_count=$(wc -l < "$IP_TRACKING_FILE")
+    if [ "$current_ban_count" -ge "$MAX_BANS" ]; then
+        echo "WARNING: Ban limit ($MAX_BANS) reached. IP $ip will be added, but the oldest rotatable IP will be removed on the next cron run."
+    fi
+
+    message="$message ($country)"
+
+    # 6. Add to IPSET (kernel-level blocking)
+    if ipset add "$IP_SET_NAME" "$ip" -exist; then
+        echo "Added $ip to ipset: $IP_SET_NAME."
+    else
+        echo "ERROR: Failed to add $ip to ipset. Check ipset utility and permissions."
+        exit 1
+    fi
+
+    # 7. Add to Tracking File (for persistence and rotation)
+    echo "$ip # $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
+    echo "Added $ip to tracking file: $IP_TRACKING_FILE."
+    
+    report_ban_counts "Post-Blacklist Report" 1 # Pass 1 new ban
+    exit 0
+}
+
+
+# Function to perform the whitelist action
+perform_whitelist() {
+    ensure_setup # Check for setup before executing
+    
+    local ip=$1
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local comment="# Added via script at $timestamp"
+
+    echo "--- 🟢 Whitelist Action: $ip ---"
+
+    # 1. Add to CSF.ALLOW (requires CSF reload)
+    if ! grep -q "^$ip[[:space:]]*" "$CSF_ALLOW_FILE"; then
+        echo "$ip $comment" | tee -a "$CSF_ALLOW_FILE" > /dev/null
+        echo "Added $ip to $CSF_ALLOW_FILE."
+    else
+        echo "$ip is already present in $CSF_ALLOW_FILE."
+    fi
+
+    # 2. Remove from IPSET (instant effect)
+    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
+        ipset del "$IP_SET_NAME" "$ip"
+        echo "Removed $ip from ipset: $IP_SET_NAME."
+    else
+        echo "$ip was not found in ipset: $IP_SET_NAME (no action taken)."
+    fi
+
+    # 3. Remove from IPSET Tracking File
+    local line_number=$(grep -n "^$ip " "$IP_TRACKING_FILE" 2>/dev/null | cut -d: -f1 | head -1)
+    if [ -n "$line_number" ]; then
+        sed -i "${line_number}d" "$IP_TRACKING_FILE"
+        echo "Removed $ip from tracking file: $IP_TRACKING_FILE (Line: $line_number)."
+    else
+        echo "$ip was not found in tracking file (no action taken)."
+    fi
+
+    # 4. Trigger CSF reload to apply the csf.allow change
+    echo "Reloading CSF to apply $CSF_ALLOW_FILE changes..."
+    /usr/sbin/csf -r
+
+    echo "Whitelist action complete for $ip."
+    
+    report_ban_counts "Post-Whitelist Report" 0 # Pass 0 new bans
+    exit 0
+}
+
+# Function to initialize IPSET and CSF rules
+perform_init() {
+    local ip_set_line="ipset create $IP_SET_NAME hash:ip maxelem $MAX_BANS -exist"
+    local iptables_rule_line="\$IPTABLES -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
+
+    echo "--- 🛠️ Initialization Action ---"
+
+    # 1. Create IPSET
+    echo "1. Creating IPSET table: $IP_SET_NAME with max size $MAX_BANS..."
+    ipset create "$IP_SET_NAME" hash:ip maxelem "$MAX_BANS" -exist
+    if [ $? -eq 0 ]; then
+        echo "IPSET '$IP_SET_NAME' created or already exists."
+    else
+        echo "ERROR: Failed to create ipset '$IP_SET_NAME'. Check ipset utility and permissions."
+        exit 1
+    fi
+
+    # 2. Add IPSET creation command to csfpost.sh (ensures set is recreated on CSF restart)
+    echo "2. Adding IPSET creation command to $CSF_POST_FILE..."
+    if ! grep -q "$ip_set_line" "$CSF_POST_FILE"; then
+        echo -e "\n# Rule added by $0 for high-volume IP banning\n$ip_set_line" | tee -a "$CSF_POST_FILE" > /dev/null
+        echo "Added ipset creation command to $CSF_POST_FILE."
+    else
+        echo "IPSET creation command already exists in $CSF_POST_FILE."
+    fi
+
+    # 3. Add iptables DROP rule to csfpost.sh (ensures traffic is blocked)
+    echo "3. Adding iptables DROP rule for IPSET to $CSF_POST_FILE..."
+    if ! grep -q "$iptables_rule_line" "$CSF_POST_FILE"; then
+        echo "$iptables_rule_line" | tee -a "$CSF_POST_FILE" > /dev/null
+        echo "Added iptables rule to $CSF_POST_FILE."
+    else
+        echo "IPTables rule already exists in $CSF_POST_FILE."
+    fi
+
+    # 4. Create/Touch the tracking file
+    echo "4. Ensuring tracking file $IP_TRACKING_FILE exists..."
+    touch "$IP_TRACKING_FILE" || { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1; }
+    echo "Tracking file is ready."
+
+    # 5. Reload CSF to apply new csfpost.sh rules immediately
+    echo "5. Reloading CSF to apply new rules..."
+    /usr/sbin/csf -r
+    
+    echo "Initialization complete. The system is ready for the high-volume ban script to run."
+    exit 0
+}
+
+# Function to completely flush the IPSET and clear the tracking file
+perform_clear() {
+    ensure_setup # Ensure the ipset is known before trying to flush
+    
+    echo "--- ⚠️  DANGER: FULL IPSET CLEAR ACTION ---"
+    
+    # 1. Flush the IPSET table (Clears kernel-level block list instantly)
+    if ipset flush "$IP_SET_NAME"; then
+        echo "Successfully flushed all entries from ipset: $IP_SET_NAME."
+    else
+        echo "ERROR: Failed to flush ipset '$IP_SET_NAME'. Check ipset utility and permissions."
+        exit 1
+    fi
+    
+    # 2. Clear the persistent tracking file
+    if truncate -s 0 "$IP_TRACKING_FILE"; then
+        echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE."
+    else
+        # Fallback if truncate is not available (e.g., system doesn't have it)
+        > "$IP_TRACKING_FILE"
+        if [ $? -eq 0 ]; then
+            echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE (using redirection)."
+        else
+            echo "ERROR: Failed to clear tracking file '$IP_TRACKING_FILE'."
+            exit 1
+        fi
+    fi
+
+    # 3. Report
+    echo "IPSET '$IP_SET_NAME' is now empty. All prior bans are removed."
+    report_ban_counts "Post-Clear Report" 0
+    exit 0
+}
+
+
+# --- COMMAND LINE ARGUMENT PARSING ---
+TEMP_ARGS=$(getopt -o '' --long init,whitelist:,blacklist:,logs:,clear -n 'csf_ban_wp_login_attackers' -- "$@")
+if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; fi
+eval set -- "$TEMP_ARGS"
+
+while true; do
+  case "$1" in
+    --init )
+      perform_init # Function exits the script upon completion
+      shift 1
+      ;;
+    --whitelist )
+      IP_TO_WHITELIST="$2"
+      if [ -z "$IP_TO_WHITELIST" ]; then
+          echo "Error: --whitelist requires an IP address argument."
+          exit 1
+      fi
+      if ! validate_ip "$IP_TO_WHITELIST"; then
+          echo "Error: Invalid IP address format: $IP_TO_WHITELIST"
+          exit 1
+      fi
+      perform_whitelist "$IP_TO_WHITELIST" # This calls ensure_setup inside
+      shift 2
+      ;;
+    --blacklist )
+      IP_TO_BLACKLIST="$2"
+      if [ -z "$IP_TO_BLACKLIST" ]; then
+          echo "Error: --blacklist requires an IP address argument."
+          exit 1
+      fi
+      perform_blacklist "$IP_TO_BLACKLIST" # This calls ensure_setup inside and exits
+      ;;
+    --logs )
+      LOG_PATHS="$2"
+      shift 2
+      ;;
+    --clear )
+      perform_clear # New function call
+      shift 1
+      ;;
+    -- )
+      shift
+      break
+      ;;
+    * )
+      break
+      ;;
+  esac
+done
+
+# If LOG_PATHS was not set via command line, use the default paths.
+if [ -z "$LOG_PATHS" ]; then
+    LOG_PATHS="$DEFAULT_LOG_PATHS"
+fi
+# --- END ARGUMENT HANDLING ---
+
+# 0. ENSURE SETUP IS COMPLETE FOR MAIN LOGIC
+ensure_setup
+
+# Original keywords remain the same
 declare -A keywords
-declare -A keywords_test
-
-# number of times it needs to hit to trigger block | what to search for
-keywords_test=(
-  ["5 security2.*CRITICAL"]="error_log ModSecurity CRITICAL"
-  ["200 wp-login"]="tried to access wp-login"
-  ["5 AH01797"]="error_log ModSecurity AH01797: client denied by server configuration"
-  ["5 AH10244"]="error_log ModSecurity AH10244: invalid URI path"
-)
-
 keywords=(
+  # --- RCE / LFI / SQL Injection Payload Indicators (New) ---
+  ["1 php://filter"]="attempted Local File Inclusion (LFI) using php://filter wrapper"
+  ["1 /etc/passwd"]="attempted file traversal/read of /etc/passwd"
+  ["1 etc/passwd"]="attempted LFI payload without leading slash"
+  ["1 /proc/self/cmdline"]="attempted read of system process info"
+  ["1 union select"]="attempted SQL injection with UNION SELECT clause"
+  ["1 base64_decode"]="attempted RCE using base64 encoded payload"
+  ["5 wso.php"]="attempted access to a WSO or similar PHP web shell"
+
+  # --- ModSecurity Violations (High Frequency) ---
   ["5 AH01797"]="error_log ModSecurity AH01797: client denied by server configuration"
   ["5 AH10244"]="error_log ModSecurity AH10244: invalid URI path"
   ["5 AH01071"]="error_log ModSecurity AH01071: Got error Primary script unknown - requesting missing php file"
@@ -31,11 +419,14 @@ keywords=(
   ["1 1234123443"]="error_log ModSecurity 1234123443: Access denied with code 400 - GET or HEAD requests with bodies"
   ["1 1234123415"]="error_log ModSecurity 1234123415: Access denied with code 406 - SQL Injection Attack"
   ["1 1234123448"]="error_log ModSecurity 1234123448: Access denied with code 501 - Remote File Access Attempt"
-  #["5 security2.*CRITICAL"]="error_log ModSecurity CRITICAL"
+
+  # --- Config/Secret File Probing ---
   ["1 \.env"]=".env"
   ["1 \.git"]=".git"
   ["1 \.swp"]=".swp"
   ["1 /config.json"]="/config.json"
+
+  # --- Known Shell/Backdoor Probing ---
   ["1 /0.php"]="/0.php"
   ["1 /sidwsi.php"]="/sidwsi.php"
   ["1 /wp-includes/css/chosen.php"]="/wp-includes/css/chosen.php"
@@ -78,15 +469,21 @@ keywords=(
   ["1 ini.php.*404"]="ini.php and got 404 error code"
   ["1 /rk2.php"]="rk2.php"
   ["1 /bx.php"]="/bx.php"
+
+  # --- Remote Management Probing ---
   ["1 /commpilot/"]="/commpilot/"
   ["1 /PhoneBackup/"]="/PhoneBackup/"
   ["1 /webtools/control/main"]="/webtools/control/main"
   ["1 /goform/formping"]="/goform/formping"
   ["1 wp-cXjq2.php"]="wp-cXjq2.php"
   ["1 UEP.php"]="UEP.php"
+  
+  # --- Archive/Download Probing ---
   ["1 old.rar.*404"]="old.rar and got 404 error code"
   ["1 old.jar.*404"]="old.jar and got 404 error code"
   ["1 old.7z.*404"]="old.7z and got 404 error code"
+  
+  # --- Brute Force / Scanning ---
   ["1 tools.ua.random"]="tools.ua.random user agent"
   ["1 /wordpresshp/wp-login.php?action=register"]="tried to register on our WordPress honeypot"
   ["100 wp-login"]="tried to access wp-login"
@@ -97,225 +494,232 @@ keywords=(
   ["30 /calendar/action~"]="Spidering calendars too hard when blocked by robots"
 )
 
-MAX_BANS=10000
-MAX_VIOLATION_COUNT=20
-MAX_PERMANENT_BANS=1000
-DENY_FILE="/etc/csf/csf.deny"
+# --- EXECUTION START ---
 
 echo " "
 date
-echo " "
-echo "Beginning to scan /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log for keywords..."
+
+# Ensure temporary file is cleaned up on exit
+trap "rm -f $TEMP_AGGREGATE_FILE" EXIT
+
+# 1. INITIAL REPORTING (Reflects state before any changes in this run)
+report_ban_counts "Pre-Run Ban Report"
+
+echo "--- 🧹 1. START: PROACTIVE WHITELIST CLEANUP (CSF Allow vs. IPSET Ban List) ---"
+
+# The cleanup logic is kept here for the regular cron job run.
+awk -v ip_set_name=$IP_SET_NAME \
+    -v tracking_file=$IP_TRACKING_FILE \
+    -v allow_file=$CSF_ALLOW_FILE '
+    BEGIN {
+        print "Checking all " tracking_file " entries against " allow_file "..."
+    }
+    {
+        ip_to_check = $1
+        # Check if the IP is in csf.allow (Returns 0 if IP IS found)
+        is_whitelisted = system("grep -E \"^" ip_to_check "[[:space:]]*#|^" ip_to_check "[[:space:]]*$\" " allow_file " > /dev/null")
+
+        if (is_whitelisted == 0) {
+            # IP is whitelisted! Remove from ipset and print a message.
+            system("ipset del " ip_set_name " " ip_to_check)
+            print "CLEANED: Removed whitelisted IP " ip_to_check " from ipset."
+        } else {
+            # IP is not whitelisted. Print the line back to stdout for the new tracking file.
+            print $0
+        }
+    }' "$IP_TRACKING_FILE" > /tmp/ipset_tracking_new.log
+
+if [ -f /tmp/ipset_tracking_new.log ]; then
+    mv /tmp/ipset_tracking_new.log "$IP_TRACKING_FILE"
+    echo "Tracking file updated. Whitelisted IPs removed from the blacklist."
+else
+    echo "WARNING: Cleanup failed to produce a new tracking file. Skipping file replacement."
+fi
+
+echo "--- 🧹 1. END: PROACTIVE WHITELIST CLEANUP ---"
 echo " "
 
 
+# --- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---
+echo "--- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---"
+echo "Log paths being scanned: $LOG_PATHS"
+echo "Extracting IP violations into temporary file: $TEMP_AGGREGATE_FILE"
+
+# Phase 1: Scan all logs for all keywords and populate the temporary file.
 for key in "${!keywords[@]}"; do
+    # Frequency is the MINIMUM count to be interested in for this specific keyword
+    frequency=$(( $( echo ${key} | cut -d" " -f1) ))
+    keyword=$( echo ${key} | cut -d" " -f2)
+    description=${keywords[${key}]}
 
-  frequency=$(( $( echo ${key} | cut -d" " -f1) )) #expression to conver to integer
-  keyword=$( echo ${key} | cut -d" " -f2)
-  description=${keywords[${key}]}
+    # Pipe output for the current keyword. Output format: IP<tab>Count<tab>Description
+    eval grep -r "$keyword" $LOG_PATHS 2>/dev/null |
+    egrep -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
+    sed 's/://' |
+    sort | 
+    uniq -c |
+    awk -v frequency=$frequency \
+        -v description="$description" '
+    { 
+      # Only output if the count for this specific keyword meets the minimum threshold
+      if ($1 >= frequency ) {
+        # Format: IP<TAB>Count<TAB>Description (e.g., 1.2.3.4\t20\twp-login)
+        print $2 "\t" $1 "\t" description 
+      }
+    }' | tee -a "$TEMP_AGGREGATE_FILE" > /dev/null
+done
 
-  echo "***************************"
-  echo "Searching logs for \"$keyword\" repeated at least $frequency times..."
-  echo "***************************"
-  echo " "
+if [ ! -s "$TEMP_AGGREGATE_FILE" ]; then
+    echo "No significant violations found that meet minimum frequency thresholds."
+    echo "--- 🛡️ 2. END: LOG SCANNING (EXTRACTION PHASE) ---"
+    echo " "
+    report_ban_counts "Post-Run Ban Report (No Bans)" 0
+    exit 0
+fi
 
-  grep -r $keyword /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log |
-  egrep -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
-  sed 's/://' |
-  sort | 
-  uniq -c |
+echo "All relevant violations recorded. Starting aggregation and execution..."
 
-awk -v max_bans=$MAX_BANS \
-       -v max_perm_bans=$MAX_PERMANENT_BANS \
-       -v max_violation_count=$MAX_VIOLATION_COUNT \
-       -v frequency=$frequency \
-       -v description="$description" \
-       -v deny_file=$DENY_FILE '
-  { 
-    if ($1 >= frequency ) {
+# Phase 2 & 3: Aggregate the data and execute bans
+# LOG_SCAN_OUTPUT captures all messages, including ban/rotation info
+LOG_SCAN_OUTPUT=$(
+    # AWK 1: Aggregation
+    awk '
+    BEGIN { 
+        FS="\t" 
+    } 
+    { 
+        # Sum counts and concatenate descriptions for each IP
+        IPs[$1] += $2; 
+        
+        # Check if description tag already exists before appending
+        if (messages[$1] !~ $3) {
+            messages[$1] = (messages[$1] == "" ? $3 : messages[$1] ", " $3);
+        }
+    } 
+    END { 
+        # Print aggregated results for the next awk block
+        for (ip in IPs) { 
+            # Format: IP<SPACE>Total_Count<SPACE>Concatenated_Message
+            print ip, IPs[ip], messages[ip] 
+        } 
+    }' "$TEMP_AGGREGATE_FILE" |
+
+    # AWK 2: Execution
+    awk -v ip_set_name=$IP_SET_NAME \
+        -v tracking_file=$IP_TRACKING_FILE \
+        -v allow_file=$CSF_ALLOW_FILE \
+        -v max_bans=$MAX_BANS \
+        -v max_perm_bans=$MAX_PERMANENT_BANS \
+        -v max_violation_count=$MAX_VIOLATION_COUNT '
+    {
+      ip=$1
+      total_count=$2
+      message_summary=$3
       
-      # 1. GEOIP Lookup and Message Construction
-      cmd="geoiplookup " $2 " | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
+      # 1. WHITELIST CHECK: (Redundant check but safer)
+      is_whitelisted = system("grep -E \"^" ip "[[:space:]]*#|^" ip "[[:space:]]*$\" " allow_file " > /dev/null")
+      if (is_whitelisted == 0) {
+        print "IP " ip " is WHITELISTED in " allow_file ". Skipping ban (Proactively Cleaned)."
+        print " "
+        next 
+      }
+      
+      # 2. IPSET STATUS CHECK: Check if IP is already in the set
+      is_already_banned = system("ipset test " ip_set_name " " ip " > /dev/null")
+      if (is_already_banned == 0) {
+        print "IP " ip " is already in ipset \047" ip_set_name "\047. Skipping insertion."
+        print " "
+        next 
+      }
+      
+      # 3. GEOIP Lookup and Message Construction
+      cmd="geoiplookup " ip " 2>/dev/null | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
       cmd | getline country
       close(cmd)  
 
-      # Count existing permanent bans
-      "grep \"do not delete\" " deny_file " | wc -l" | getline permanent_ban_count
-      close("grep \"do not delete\" " deny_file " | wc -l")
+      "grep -c \"do not delete\" " tracking_file " | head -1" | getline permanent_ban_count
+      close("grep -c \"do not delete\" " tracking_file " | head -1")
 
-      # Build the base message and determine if the NEW ban is permanent
       is_new_ban_permanent = 0
-      message="Blocking " $2 " for accessing " description " " $1 " times."
-
-      # Condition to apply permanent protection
-      if ($1 >= max_violation_count && permanent_ban_count < max_perm_bans) {
-        # Appending the protection text to the message
+      
+      # The BAN MESSAGE now includes the concatenated summary and total count
+      message="Total Violations: " total_count ". Triggers: " message_summary
+      
+      # PERMANENT BAN LOGIC: Based on TOTAL aggregated count
+      if (total_count >= max_violation_count && permanent_ban_count < max_perm_bans) {
         protection_text = " [More than " max_violation_count " blocks, do not delete ]"
         message = message protection_text
-        is_new_ban_permanent = 1 # Mark flag
+        is_new_ban_permanent = 1
         print "IP qualifies for permanent ban. Current permanent count: " permanent_ban_count
-      } else if ($1 >= max_violation_count) {
+      } else if (total_count >= max_violation_count) {
         print "IP qualifies for permanent ban, but permanent limit (" max_perm_bans ") reached. Appending as rotatable entry."
       }
       
-      # Append country and finish message
       message = message " (" country ")"
+      print "Blocking " ip " because " message
 
-      print message
+      # 4. Check Current Total Ban Count (Rotation Logic)
+      "wc -l < " tracking_file | getline current_ban_count
+      close("wc -l < " tracking_file)
 
-      # 2. Check if IP is already banned
-      check_ip_not_in_deny_file = system("grep -q " $2 " " deny_file)
-
-      if (check_ip_not_in_deny_file) {
+      line_to_delete = 0
+      delete_type = "none"
+      
+      if (current_ban_count >= max_bans) {
+        print "Total ban limit (" max_bans ") reached. Checking for oldest rotatable entry."
         
-        # 3. Check Current Total Ban Count
-        "grep -v \"^#\" " deny_file " | wc -l" | getline current_ban_count
-        close("grep -v \"^#\" " deny_file " | wc -l")
+        "grep -n -v \"do not delete\" " tracking_file " | head -1 | cut -d: -f1" | getline line_to_delete
+        close("grep -n -v \"do not delete\" " tracking_file " | head -1 | cut -d: -f1")
 
-        # --- START OF FAST REPLACEMENT FOR /usr/sbin/csf -d ---
-        
-        # A) DELETION LOGIC
-        line_to_delete = 0 # Reset variable
-        delete_type = "none"
-
-        # CONDITION 1: If we hit the TOTAL limit, delete the OLDEST *ROTATABLE* entry.
-        if (current_ban_count >= max_bans) {
-          print "Total ban limit (" max_bans ") reached. Attempting to delete oldest rotatable entry."
-          
-          # Find oldest NON-protected line number (starting from line 3)
-          "grep -n -v \"^#\" " deny_file " | sed -n -e \"3,\\$\\{/do not delete/! \\{p; q;\\}\\}\" | head -1 | cut -d: -f1" | getline line_to_delete
-          close("grep -n -v \"^#\" " deny_file " | sed -n -e \"3,${/do not delete/! {p; q;}}\" | head -1 | cut -d: -f1")
-          delete_type = "rotatable"
-
-        # CONDITION 2: If we are adding a NEW permanent ban AND the permanent limit is already hit, 
-        # delete the OLDEST *PERMANENT* entry to rotate the permanent list.
-        } else if (is_new_ban_permanent == 1 && permanent_ban_count >= max_perm_bans) {
-            print "Permanent ban limit (" max_perm_bans ") reached. Deleting oldest PERMANENT entry to make room."
-            
-            # Find oldest protected line number (starting from line 3)
-            "grep -n \"do not delete\" " deny_file " | sed -n -e \"3,${/do not delete/ {p; q;}}\" | head -1 | cut -d: -f1" | getline line_to_delete
-            close("grep -n \"do not delete\" " deny_file " | sed -n -e \"3,${/do not delete/ {p; q;}}\" | head -1 | cut -d: -f1")
-            delete_type = "permanent"
-        } 
-        
-        # EXECUTE DELETION if a line number was found
         if (line_to_delete > 0) {
-          print "Deleting " delete_type " line number: " line_to_delete
-          system("sed -i " line_to_delete "d " deny_file)
-        } else if (current_ban_count >= max_bans) {
-             # This means total limit hit, but ALL entries are permanent.
-             print "WARNING: Total ban limit hit and ALL rotatable lines are gone. File will grow beyond limit."
-        } else if (is_new_ban_permanent == 1 && permanent_ban_count >= max_perm_bans) {
-             # This means new permanent ban, but no existing permanent ban was found for deletion (highly unlikely)
-             print "WARNING: New permanent ban added, but could not delete oldest permanent entry."
+          delete_type = "rotatable"
+        } else {
+          if (is_new_ban_permanent == 1 && permanent_ban_count >= max_perm_bans) {
+            print "WARNING: Total ban limit hit and all entries are permanent. Rotating oldest PERMANENT entry to make room."
+            
+            "grep -n \"do not delete\" " tracking_file " | head -1 | cut -d: -f1" | getline line_to_delete
+            close("grep -n \"do not delete\" " tracking_file " | head -1 | cut -d: -f1")
+            delete_type = "permanent"
+          }
         }
-        
-        # B) INSERTION: Always insert the new, correctly formatted deny entry at the bottom
-        system("echo \"" $2 " # " message "\" >> " deny_file)
-        
-        # --- END OF FAST REPLACEMENT ---
       }
-      else {
-        print "IP is already in " deny_file "."
-      }
+
+      # 5. EXECUTE DELETION if a line number was found
+      if (line_to_delete > 0) {
+        cmd_get_ip = "sed -n " line_to_delete "p " tracking_file " | cut -d' ' -f1"
+        cmd_get_ip | getline ip_to_delete
+        close(cmd_get_ip)
+
+        if (ip_to_delete) {
+          system("ipset del " ip_set_name " " ip_to_delete)
+          print "DELETED oldest " delete_type " IP from ipset: " ip_to_delete
+
+          system("sed -i " line_to_delete "d " tracking_file)
+        }
+      } 
+      
+      # 6. INSERTION: Add the new IP to the ipset and tracking file
+      system("ipset add " ip_set_name " " ip " -exist")
+      # Use a unique marker for counting in the final report
+      print "INSERTED new IP to ipset: " ip
+      system("echo \"" ip " # " message "\" >> " tracking_file) 
 
       print " "
-    }
-  }'
+    }'
+)
 
+# Count the number of new IPs inserted from the captured output
+NEW_BANS_COUNT=$(echo "$LOG_SCAN_OUTPUT" | grep -c "INSERTED new IP to ipset:")
+
+# Display the captured output to the user
+echo "$LOG_SCAN_OUTPUT"
+
+echo "--- 🛡️ 2. END: LOG SCANNING AND IPSET BANNING ---"
 echo " "
+echo "--- 🧹 3. FINALIZING ---"
 
-done
-
-echo "Whitelisting IPs..."
-
-# WHITELIST any allowed IPs in CSF Allow
-grep -o '^[^ |#].*' /etc/csf/csf.dyndns | sed 's/^/Allow from /' > /root/csf_whitelist_ips.conf
-grep -o '^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' /etc/csf/csf.allow | sed 's/^/Allow from /' >> /root/csf_whitelist_ips.conf
-
-echo "Done whitelisting IPs, completed!"
-
-echo " "
-echo "Restarting csf firewall..."
-
-/usr/sbin/csf -r
-
-echo " "
-echo "Restarting Apache..."
-
-release=$(rpm -q --queryformat '%{RELEASE}' rpm | grep -o [[:digit:]]*\$)
-
-#if [[ $release -lt 7 ]]; then
-#  /etc/rc.d/init.d/httpd restart
-#else
-# /usr/bin/systemctl restart httpd.service
-#fi
-
-/scripts/restartsrv_httpd
-/scripts/restartsrv_apache_php_fpm
+# 3. FINAL REPORTING (Reflects state after changes in this run)
+report_ban_counts "Post-Run Ban Report" "$NEW_BANS_COUNT"
 
 echo "Done!"
-
-exit 1
-
-
-
-# Check for 500 errors (Usually BruteProtect plugin)
-grep -r "wp-login.*500" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 5 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed wp-login.php and got 500 error code " $1 " times in last 24 hours")}'
-
-# Check for 403 errors
-grep -r "wp-login.*403" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 50 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed wp-login.php and got 403 error code " $1 " times in last 24 hours")}'
-
-# Check for 404 errors
-grep -r "wp-login.*404" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | sort -bg | awk '$1 > 10 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because accessed wp-login* and got 404 error code " $1 " times in last 24 hours")}'
-
-# Check for 404 errors in XMLRPC
-grep -r "shell.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing shell.php " $1 " times in last 24 hours")}'
-
-# Check for upfile.php
-grep -r "upfile.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing upfile.php " $1 " times in last 24 hours")}'
-
-# Check for mah.php
-grep -r "mah.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing mah.php " $1 " times in last 24 hours")}'
-
-# Check for install.php
-grep -r "/install.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 2 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing install.php " $1 " times in last 24 hours")}'
-
-# Check for ee.php
-grep -r "ee.php" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing ee.php " $1 " times in last 24 hours")}'
-
-# Check for old.rar
-grep -r "old.rar" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing old.rar " $1 " times in last 24 hours")}'
-
-# Check for old.jar
-grep -r "old.jar" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing old.jar " $1 " times in last 24 hours")}'
-
-# Check for old.7z
-grep -r "old.7z" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing old.7z " $1 " times in last 24 hours")}'
-
-# Check for /.env
-grep -r "/\.env" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing /.env " $1 " times in last 24 hours")}'
-
-# Check for /.git
-grep -r " /\.git" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried accessing /.git " $1 " times in last 24 hours")}'
-
-# Check for tools.ua.random() in user agent string
-grep -r "tools.ua.random" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because used tools.ua.random as the user agent string " $1 " times in last 24 hours")}'
-
-# Check for honeypot attack attempts
-grep -r "/wordpresshp/wp-login.php?action=register" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because trying to access honeypot fake WordPress registration " $1 " times in last 24 hours")}'
-
-# Check for honeypot attack attempts
-grep -r "/oldwp/wp-login.php?action=register" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 "  because trying to access honeypot fake WordPress registration " $1 " times in last 24 hours")}'
-
-# Check for people looking for vi swap files (.wp-config.php.swp)
-grep -r ".*\.swp" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 0 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 "  because trying to access *.swp file " $1 " times in last 24 hours")}'
-
-# Check for excessive wp-login access attempts, more than 300 in 24 hours probably bad
-grep -r "wp-login" /usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs | egrep -o '[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' | sort | uniq -c | awk '$1 > 300 {system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: Blocked " $2 " because tried to access wp-login.php " $1 " times in last 24 hours")}'
-
-# WHITELIST any allowed IPs in CSF Allow
-grep -o '^[^ |#].*' /etc/csf/csf.dyndns | sed 's/^/Allow from /' > /root/csf_whitelist_ips.conf
-grep -o '^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' /etc/csf/csf.allow | sed 's/^/Allow from /' >> /root/csf_whitelist_ips.conf
-
+exit 0
