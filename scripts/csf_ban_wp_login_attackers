@@ -77,7 +77,7 @@ get_iptables_path() {
             # If still not found, return an empty string to signal failure
             echo ""
             return 1
-        fi
+        }
     fi
     echo "$path"
     return 0
@@ -205,12 +205,12 @@ perform_blacklist() {
     country=$(eval "$cmd")
 
     # 5. Message Construction and Limit Check
-    local message="Manually blacklisted via --blacklist at $timestamp"
+    local message="Manually blacklisted via --blacklist"
     
     local current_ban_count=$(wc -l < "$IP_TRACKING_FILE")
     if [ "$current_ban_count" -ge "$MAX_BANS" ]; then
         echo "WARNING: Ban limit ($MAX_BANS) reached. IP $ip will be added, but the oldest rotatable IP will be removed on the next cron run."
-    fi
+    }
 
     message="$message ($country)"
 
@@ -223,7 +223,8 @@ perform_blacklist() {
     fi
 
     # 7. Add to Tracking File (for persistence and rotation)
-    echo "$ip # $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
+    # 🟢 MODIFIED: Add timestamp to the manually blacklisted entry
+    echo "$ip # [$timestamp] $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     
     report_ban_counts "Post-Blacklist Report" 1 # Pass 1 new ban
@@ -369,7 +370,7 @@ perform_clear() {
 
 # --- COMMAND LINE ARGUMENT PARSING ---
 TEMP_ARGS=$(getopt -o '' --long init,whitelist:,blacklist:,logs:,clear -n 'csf_ban_wp_login_attackers' -- "$@")
-if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; fi
+if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; }
 eval set -- "$TEMP_ARGS"
 
 while true; do
@@ -578,9 +579,10 @@ echo " "
 # --- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---
 echo "--- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---"
 echo "Log paths being scanned: $LOG_PATHS"
-echo "Extracting IP violations into temporary file: $TEMP_AGGREGATE_FILE"
+echo "Extracting IP violations (streaming to screen)..."
 
 # Phase 1: Scan all logs for all keywords and populate the temporary file.
+# 🟢 MODIFIED: Removed > /dev/null from tee to stream output to screen
 for key in "${!keywords[@]}"; do
     # Frequency is the MINIMUM count to be interested in for this specific keyword
     frequency=$(( $( echo ${key} | cut -d" " -f1) ))
@@ -601,8 +603,9 @@ for key in "${!keywords[@]}"; do
         # Format: IP<TAB>Count<TAB>Description (e.g., 1.2.3.4\t20\twp-login)
         print $2 "\t" $1 "\t" description 
       }
-    }' | tee -a "$TEMP_AGGREGATE_FILE" > /dev/null
+    }' | tee -a "$TEMP_AGGREGATE_FILE"
 done
+
 
 if [ ! -s "$TEMP_AGGREGATE_FILE" ]; then
     echo "No significant violations found that meet minimum frequency thresholds."
@@ -640,7 +643,9 @@ LOG_SCAN_OUTPUT=$(
     }' "$TEMP_AGGREGATE_FILE" |
 
     # AWK 2: Execution
-    awk -v ip_set_name=$IP_SET_NAME \
+    # 🟢 MODIFIED: Pass current date into AWK
+    awk -v current_date="$(date '+%Y-%m-%d %H:%M:%S')" \
+        -v ip_set_name=$IP_SET_NAME \
         -v tracking_file=$IP_TRACKING_FILE \
         -v allow_file=$CSF_ALLOW_FILE \
         -v max_bans=$MAX_BANS \
@@ -660,7 +665,8 @@ LOG_SCAN_OUTPUT=$(
       }
       
       # 2. IPSET STATUS CHECK: Check if IP is already in the set
-      is_already_banned = system("ipset test " ip_set_name " " ip " > /dev/null")
+      # 🟢 FIXED: Redirecting stderr (2) to /dev/null to silence the "is NOT in set" message
+      is_already_banned = system("ipset test " ip_set_name " " ip " 2>/dev/null")
       if (is_already_banned == 0) {
         print "IP " ip " is already in ipset \047" ip_set_name "\047. Skipping insertion."
         print " "
@@ -719,9 +725,9 @@ LOG_SCAN_OUTPUT=$(
         }
       }
 
-    # 5. EXECUTE DELETION if a line number was found
+      # 5. EXECUTE DELETION if a line number was found
       if (line_to_delete > 0) {
-        # 🟢 FIXED: Using awk with octal quote (\047) to robustly extract the first field (IP)
+        # FIXED: Using awk with octal quote (\047) to robustly extract the first field (IP)
         cmd_get_ip = "sed -n " line_to_delete "p " tracking_file " | awk \047{print $1}\047"
         cmd_get_ip | getline ip_to_delete
         close(cmd_get_ip)
@@ -732,13 +738,14 @@ LOG_SCAN_OUTPUT=$(
 
           system("sed -i " line_to_delete "d " tracking_file)
         }
-      }
+      } 
       
       # 6. INSERTION: Add the new IP to the ipset and tracking file
       system("ipset add " ip_set_name " " ip " -exist")
       # Use a unique marker for counting in the final report
       print "INSERTED new IP to ipset: " ip
-      system("echo \"" ip " # " message "\" >> " tracking_file) 
+      # 🟢 MODIFIED: Prepend the date to the message when writing to the file
+      system("echo \"" ip " # [" current_date "] " message "\" >> " tracking_file) 
 
       print " "
     }'
@@ -756,6 +763,9 @@ echo "--- 🧹 3. FINALIZING ---"
 
 # 3. FINAL REPORTING (Reflects state after changes in this run)
 report_ban_counts "Post-Run Ban Report" "$NEW_BANS_COUNT"
+
+# 🟢 NEW: Final tracking file message
+echo "Banned IPs recorded in tracking file: $IP_TRACKING_FILE"
 
 echo "Done!"
 exit 0
