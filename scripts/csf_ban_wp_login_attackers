@@ -719,9 +719,10 @@ LOG_SCAN_OUTPUT=$(
         }
       }
 
-      # 5. EXECUTE DELETION if a line number was found
+    # 5. EXECUTE DELETION if a line number was found
       if (line_to_delete > 0) {
-        cmd_get_ip = "sed -n " line_to_delete "p " tracking_file " | cut -d' ' -f1"
+        # 🟢 FIXED: Using awk with octal quote (\047) to robustly extract the first field (IP)
+        cmd_get_ip = "sed -n " line_to_delete "p " tracking_file " | awk \047{print $1}\047"
         cmd_get_ip | getline ip_to_delete
         close(cmd_get_ip)
 
@@ -731,7 +732,7 @@ LOG_SCAN_OUTPUT=$(
 
           system("sed -i " line_to_delete "d " tracking_file)
         }
-      } 
+      }
       
       # 6. INSERTION: Add the new IP to the ipset and tracking file
       system("ipset add " ip_set_name " " ip " -exist")
