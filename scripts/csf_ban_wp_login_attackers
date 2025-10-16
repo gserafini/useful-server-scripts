@@ -568,7 +568,7 @@ awk -v ip_set_name=$IP_SET_NAME \
         
         ip_to_check = $1
         # Check if the IP is in csf.allow (Returns 0 if IP IS found)
-        # We must pipe grep\'s output to /dev/null to ensure a clean exit code for AWK system() call.
+        # We must pipe grep's output to /dev/null to ensure a clean exit code for AWK system() call.
         is_whitelisted = system("grep -E \"^" ip_to_check "[[:space:]]*#|^" ip_to_check "[[:space:]]*$\" " allow_file " > /dev/null 2>&1")
 
         if (is_whitelisted == 0) {
