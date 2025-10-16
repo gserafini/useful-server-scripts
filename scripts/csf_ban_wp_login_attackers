@@ -41,7 +41,7 @@ CSF_ALLOW_FILE="/etc/csf/csf.allow"
 CSF_DENY_FILE="/etc/csf/csf.deny" 
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
 MAX_BANS=50000 
-# 🟢 UPDATED: Increased permanent ban capacity to 5000
+# UPDATED: Increased permanent ban capacity to 5000
 MAX_PERMANENT_BANS=5000
 MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, now based on aggregated hits.
 
@@ -63,6 +63,26 @@ validate_ip() {
     fi
 }
 
+# Function to determine the absolute path of iptables for rule generation
+get_iptables_path() {
+    # 🟢 PORTABLE FIX: Use command -v to find the absolute path, falling back to a common location.
+    # This path is needed to write a reliable rule to csfpost.sh.
+    local path
+    path=$(command -v iptables 2>/dev/null || echo '/usr/sbin/iptables')
+    
+    if [ ! -x "$path" ]; then
+        # If the determined path is not executable, try the secondary common path
+        path=$(command -v iptables 2>/dev/null || echo '/sbin/iptables')
+        if [ ! -x "$path" ]; then
+            # If still not found, return an empty string to signal failure
+            echo ""
+            return 1
+        fi
+    fi
+    echo "$path"
+    return 0
+}
+
 # Function to check if the high-volume ban system is fully set up
 is_setup_complete() {
     # 1. Check if the tracking file exists
@@ -76,7 +96,14 @@ is_setup_complete() {
     fi
 
     # 3. Check if the iptables DROP rule is in csfpost.sh
-    local iptables_rule_line="\$IPTABLES -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
+    local iptables_path
+    iptables_path=$(get_iptables_path)
+    if [ -z "$iptables_path" ]; then
+        # Cannot determine iptables path, so we can't check/initialize the rule.
+        return 1
+    fi
+
+    local iptables_rule_line="$iptables_path -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
     if [ ! -f "$CSF_POST_FILE" ] || ! grep -q "$iptables_rule_line" "$CSF_POST_FILE"; then
         return 1
     fi
@@ -252,11 +279,19 @@ perform_whitelist() {
 # Function to initialize IPSET and CSF rules
 perform_init() {
     local ip_set_line="ipset create $IP_SET_NAME hash:ip maxelem $MAX_BANS -exist"
-    local iptables_rule_line="\$IPTABLES -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
+
+    # 1. Determine the portable iptables path
+    local iptables_path
+    iptables_path=$(get_iptables_path)
+    if [ -z "$iptables_path" ]; then
+        echo "ERROR: Cannot find a valid path for the iptables executable. Initialization cannot proceed."
+        exit 1
+    fi
+    local iptables_rule_line="$iptables_path -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
 
     echo "--- 🛠️ Initialization Action ---"
 
-    # 1. Create IPSET
+    # 2. Create IPSET
     echo "1. Creating IPSET table: $IP_SET_NAME with max size $MAX_BANS..."
     ipset create "$IP_SET_NAME" hash:ip maxelem "$MAX_BANS" -exist
     if [ $? -eq 0 ]; then
@@ -266,7 +301,7 @@ perform_init() {
         exit 1
     fi
 
-    # 2. Add IPSET creation command to csfpost.sh (ensures set is recreated on CSF restart)
+    # 3. Add IPSET creation command to csfpost.sh (ensures set is recreated on CSF restart)
     echo "2. Adding IPSET creation command to $CSF_POST_FILE..."
     if ! grep -q "$ip_set_line" "$CSF_POST_FILE"; then
         echo -e "\n# Rule added by $0 for high-volume IP banning\n$ip_set_line" | tee -a "$CSF_POST_FILE" > /dev/null
@@ -275,8 +310,8 @@ perform_init() {
         echo "IPSET creation command already exists in $CSF_POST_FILE."
     fi
 
-    # 3. Add iptables DROP rule to csfpost.sh (ensures traffic is blocked)
-    echo "3. Adding iptables DROP rule for IPSET to $CSF_POST_FILE..."
+    # 4. Add iptables DROP rule to csfpost.sh (ensures traffic is blocked)
+    echo "3. Adding portable iptables DROP rule ($iptables_path) for IPSET to $CSF_POST_FILE..."
     if ! grep -q "$iptables_rule_line" "$CSF_POST_FILE"; then
         echo "$iptables_rule_line" | tee -a "$CSF_POST_FILE" > /dev/null
         echo "Added iptables rule to $CSF_POST_FILE."
@@ -284,12 +319,12 @@ perform_init() {
         echo "IPTables rule already exists in $CSF_POST_FILE."
     fi
 
-    # 4. Create/Touch the tracking file
+    # 5. Create/Touch the tracking file
     echo "4. Ensuring tracking file $IP_TRACKING_FILE exists..."
     touch "$IP_TRACKING_FILE" || { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1; }
     echo "Tracking file is ready."
 
-    # 5. Reload CSF to apply new csfpost.sh rules immediately
+    # 6. Reload CSF to apply new csfpost.sh rules immediately
     echo "5. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
     
