@@ -97,6 +97,11 @@ keywords=(
   ["30 /calendar/action~"]="Spidering calendars too hard when blocked by robots"
 )
 
+MAX_BANS=10000
+MAX_VIOLATION_COUNT=20
+MAX_PERMANENT_BANS=1000
+DENY_FILE="/etc/csf/csf.deny"
+
 echo " "
 date
 echo " "
@@ -120,24 +125,104 @@ for key in "${!keywords[@]}"; do
   sed 's/://' |
   sort | 
   uniq -c |
-  awk -v frequency=$frequency -v description="$description" '{ if ($1 >= frequency ) {
-       cmd="geoiplookup " $2 " | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
-       cmd | getline country
-       close(cmd) 
-       message="Blocking " $2 " for accessing " description " " $1 " times. [" country "]" 
-       print message
-       check_ip_not_in_deny_file = system("grep -q " $2 " /etc/csf/csf.deny")
 
-       if (check_ip_not_in_deny_file) {
-         system("/usr/sbin/csf -d " $2 " csf_ban_wp_login_attackers: " message " ")
-       }
-       else {
-         print "IP is already in /etc/csf/csf.deny."
-       }
+awk -v max_bans=$MAX_BANS \
+       -v max_perm_bans=$MAX_PERMANENT_BANS \
+       -v max_violation_count=$MAX_VIOLATION_COUNT \
+       -v frequency=$frequency \
+       -v description="$description" \
+       -v deny_file=$DENY_FILE '
+  { 
+    if ($1 >= frequency ) {
+      
+      # 1. GEOIP Lookup and Message Construction
+      cmd="geoiplookup " $2 " | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
+      cmd | getline country
+      close(cmd)  
 
-       print " "
-       }
-     }'
+      # Count existing permanent bans
+      "grep \"do not delete\" " deny_file " | wc -l" | getline permanent_ban_count
+      close("grep \"do not delete\" " deny_file " | wc -l")
+
+      # Build the base message and determine if the NEW ban is permanent
+      is_new_ban_permanent = 0
+      message="Blocking " $2 " for accessing " description " " $1 " times."
+
+      # Condition to apply permanent protection
+      if ($1 >= max_violation_count && permanent_ban_count < max_perm_bans) {
+        # Appending the protection text to the message
+        protection_text = " [More than " max_violation_count " blocks, do not delete ]"
+        message = message protection_text
+        is_new_ban_permanent = 1 # Mark flag
+        print "IP qualifies for permanent ban. Current permanent count: " permanent_ban_count
+      } else if ($1 >= max_violation_count) {
+        print "IP qualifies for permanent ban, but permanent limit (" max_perm_bans ") reached. Appending as rotatable entry."
+      }
+      
+      # Append country and finish message
+      message = message " (" country ")"
+
+      print message
+
+      # 2. Check if IP is already banned
+      check_ip_not_in_deny_file = system("grep -q " $2 " " deny_file)
+
+      if (check_ip_not_in_deny_file) {
+        
+        # 3. Check Current Total Ban Count
+        "grep -v \"^#\" " deny_file " | wc -l" | getline current_ban_count
+        close("grep -v \"^#\" " deny_file " | wc -l")
+
+        # --- START OF FAST REPLACEMENT FOR /usr/sbin/csf -d ---
+        
+        # A) DELETION LOGIC
+        line_to_delete = 0 # Reset variable
+        delete_type = "none"
+
+        # CONDITION 1: If we hit the TOTAL limit, delete the OLDEST *ROTATABLE* entry.
+        if (current_ban_count >= max_bans) {
+          print "Total ban limit (" max_bans ") reached. Attempting to delete oldest rotatable entry."
+          
+          # Find oldest NON-protected line number (starting from line 3)
+          "grep -n -v \"^#\" " deny_file " | sed -n -e \"3,\\$\\{/do not delete/! \\{p; q;\\}\\}\" | head -1 | cut -d: -f1" | getline line_to_delete
+          close("grep -n -v \"^#\" " deny_file " | sed -n -e \"3,${/do not delete/! {p; q;}}\" | head -1 | cut -d: -f1")
+          delete_type = "rotatable"
+
+        # CONDITION 2: If we are adding a NEW permanent ban AND the permanent limit is already hit, 
+        # delete the OLDEST *PERMANENT* entry to rotate the permanent list.
+        } else if (is_new_ban_permanent == 1 && permanent_ban_count >= max_perm_bans) {
+            print "Permanent ban limit (" max_perm_bans ") reached. Deleting oldest PERMANENT entry to make room."
+            
+            # Find oldest protected line number (starting from line 3)
+            "grep -n \"do not delete\" " deny_file " | sed -n -e \"3,${/do not delete/ {p; q;}}\" | head -1 | cut -d: -f1" | getline line_to_delete
+            close("grep -n \"do not delete\" " deny_file " | sed -n -e \"3,${/do not delete/ {p; q;}}\" | head -1 | cut -d: -f1")
+            delete_type = "permanent"
+        } 
+        
+        # EXECUTE DELETION if a line number was found
+        if (line_to_delete > 0) {
+          print "Deleting " delete_type " line number: " line_to_delete
+          system("sed -i " line_to_delete "d " deny_file)
+        } else if (current_ban_count >= max_bans) {
+             # This means total limit hit, but ALL entries are permanent.
+             print "WARNING: Total ban limit hit and ALL rotatable lines are gone. File will grow beyond limit."
+        } else if (is_new_ban_permanent == 1 && permanent_ban_count >= max_perm_bans) {
+             # This means new permanent ban, but no existing permanent ban was found for deletion (highly unlikely)
+             print "WARNING: New permanent ban added, but could not delete oldest permanent entry."
+        }
+        
+        # B) INSERTION: Always insert the new, correctly formatted deny entry at the bottom
+        system("echo \"" $2 " # " message "\" >> " deny_file)
+        
+        # --- END OF FAST REPLACEMENT ---
+      }
+      else {
+        print "IP is already in " deny_file "."
+      }
+
+      print " "
+    }
+  }'
 
 echo " "
 
