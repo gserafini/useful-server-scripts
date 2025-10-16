@@ -77,7 +77,7 @@ get_iptables_path() {
             # If still not found, return an empty string to signal failure
             echo ""
             return 1
-        fi # <-- FIXED: Changed '}' to 'fi' to resolve the syntax error
+        fi # <-- FIXED: This was changed from '}' to 'fi'
     fi
     echo "$path"
     return 0
@@ -370,7 +370,7 @@ perform_clear() {
 
 # --- COMMAND LINE ARGUMENT PARSING ---
 TEMP_ARGS=$(getopt -o '' --long init,whitelist:,blacklist:,logs:,clear -n 'csf_ban_wp_login_attackers' -- "$@")
-if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; }
+if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; fi # <-- CORRECTED: Changed '}' to 'fi'
 eval set -- "$TEMP_ARGS"
 
 while true; do
