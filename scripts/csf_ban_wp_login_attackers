@@ -53,6 +53,9 @@ LOG_PATHS=""
 TEMP_AGGREGATE_FILE=$(mktemp)
 # Temporary file for unique aggregated IPs (used in the new progress logic)
 TEMP_UNIQUE_IPS=$(mktemp)
+
+# --- NEW: TIMING VARIABLE ---
+START_TIME=$(date +%s)
 # -------------------------------
 
 # Function to safely validate an IP address format
@@ -155,21 +158,35 @@ ensure_setup() {
 report_ban_counts() {
     local report_title="$1"
     local new_bans_count="${2:-0}"
+    local end_time="${3:-0}" # New argument for end time
     echo "--- 📊 $report_title ---"
     
     # 1. Count IPSET Bans (from the synchronized tracking file)
     local ipset_count=$(grep -v '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null | wc -l)
 
-    # 2. Count CSF.DENY Bans (excluding comments and blank lines)
+    # 2. Count Permanent Bans (lines containing 'do not delete')
+    local permanent_ban_count=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
+
+    # 3. Count CSF.DENY Bans (excluding comments and blank lines)
     local csf_deny_count=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
 
     echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
+    echo "Permanent IPs ('do not delete'): $permanent_ban_count / $MAX_PERMANENT_BANS"
     echo "Total IPs in CSF Deny File '$CSF_DENY_FILE': $csf_deny_count"
     
     # Display the count for the current run if provided
     if [ "$new_bans_count" -gt 0 ]; then
         echo "New IPs added to blacklist: $new_bans_count"
     fi
+
+    # 🟢 NEW: Elapsed Time Calculation and Reporting
+    if [ "$end_time" -gt "$START_TIME" ]; then
+        local elapsed_time=$((end_time - START_TIME))
+        local minutes=$((elapsed_time / 60))
+        local seconds=$((elapsed_time % 60))
+        echo "Total Elapsed Time: ${minutes}m ${seconds}s"
+    fi
+    
     echo "----------------------"
 }
 
@@ -198,7 +215,8 @@ perform_blacklist() {
     # 3. IPSET Status Check (Do not re-ban already banned IPs)
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
         echo "IP $ip is already in ipset: $IP_SET_NAME. Skipping insertion."
-        report_ban_counts "Post-Blacklist Report" 0 # Pass 0 new bans
+        local end_time=$(date +%s)
+        report_ban_counts "Post-Blacklist Report" 0 "$end_time" # Pass 0 new bans
         exit 0
     fi
     
@@ -229,7 +247,8 @@ perform_blacklist() {
     echo "$ip # [$timestamp] $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     
-    report_ban_counts "Post-Blacklist Report" 1 # Pass 1 new ban
+    local end_time=$(date +%s)
+    report_ban_counts "Post-Blacklist Report" 1 "$end_time" # Pass 1 new ban
     exit 0
 }
 
@@ -275,7 +294,8 @@ perform_whitelist() {
 
     echo "Whitelist action complete for $ip."
     
-    report_ban_counts "Post-Whitelist Report" 0 # Pass 0 new bans
+    local end_time=$(date +%s)
+    report_ban_counts "Post-Whitelist Report" 0 "$end_time" # Pass 0 new bans
     exit 0
 }
 
@@ -332,6 +352,10 @@ perform_init() {
     /usr/sbin/csf -r
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
+    
+    local end_time=$(date +%s)
+    # Don't report full counts, just a final message for init
+    echo "Initialization run time: $((end_time - START_TIME))s" 
     exit 0
 }
 
@@ -339,11 +363,38 @@ perform_init() {
 perform_clear() {
     ensure_setup # Ensure the ipset is known before trying to flush
     
-    echo "--- ⚠️  DANGER: FULL IPSET CLEAR ACTION ---"
+    echo " "
+    echo "====================================================================="
+    echo "⚠️  DANGER: FULL IPSET CLEAR ACTION"
+    echo "====================================================================="
+    echo "This action will immediately and permanently remove ALL IPs from:"
+    echo "1. The live kernel-level IPSET table ('$IP_SET_NAME')."
+    echo "2. The persistent tracking file ('$IP_TRACKING_FILE')."
+    echo "This means ALL current bans will be lifted instantly."
+    echo " "
+    
+    # Check if run interactively (tty check)
+    if [ -t 0 ]; then
+        read -r -p "ARE YOU SURE you want to clear ALL $IP_SET_NAME bans? Type 'YES' to proceed: " response
+        
+        if [[ "$response" != "YES" ]]; then
+            echo "Clear action aborted by user. No changes were made."
+            exit 0
+        fi
+    else
+        echo "ERROR: --clear flag used in a non-interactive environment (cron/script)."
+        echo "This destructive command must be run manually for safety."
+        exit 1
+    fi
+    
+    echo "Proceeding with full IPSET flush and tracking file clear..."
     
     # 1. Flush the IPSET table (Clears kernel-level block list instantly)
     if ipset flush "$IP_SET_NAME"; then
-        echo "Successfully flushed all entries from ipset: $IP_SET_NAME."
+        echo "Successfully flushed all entries from ipset: $IP_SET_NAME. 
+
+[Image of a red trash can]
+"
     else
         echo "ERROR: Failed to flush ipset '$IP_SET_NAME'. Check ipset utility and permissions."
         exit 1
@@ -365,7 +416,8 @@ perform_clear() {
 
     # 3. Report
     echo "IPSET '$IP_SET_NAME' is now empty. All prior bans are removed."
-    report_ban_counts "Post-Clear Report" 0
+    local end_time=$(date +%s)
+    report_ban_counts "Post-Clear Report" 0 "$end_time"
     exit 0
 }
 
@@ -555,7 +607,26 @@ awk -v ip_set_name=$IP_SET_NAME \
     -v total_lines=$TOTAL_TRACKING_LINES \
     '
     BEGIN {
-        print "Checking " total_lines " entries against " allow_file "..." > "/dev/stderr"
+        # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
+        # Read the content of csf.allow into a memory array
+        while ((getline line < allow_file) > 0) {
+            # Extract only the IP, ignoring comments and blank lines
+            if (line !~ /^#/) {
+                match(line, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
+                if (RSTART > 0) {
+                    whitelisted_ips[substr(line, RSTART, RLENGTH)] = 1
+                }
+            }
+        }
+        close(allow_file)
+        
+        # Check if allow list is populated
+        num_allowed = length(whitelisted_ips)
+        if (num_allowed == 0) {
+            print "Allow list is empty. No cleanup needed." > "/dev/stderr"
+        }
+        
+        print "Checking " total_lines " banned entries against " num_allowed " whitelisted IPs..." > "/dev/stderr"
         processed = 0
     }
     {
@@ -567,13 +638,14 @@ awk -v ip_set_name=$IP_SET_NAME \
         }
         
         ip_to_check = $1
-        # Check if the IP is in csf.allow (Returns 0 if IP IS found)
-        is_whitelisted = system("grep -E \"^" ip_to_check "[[:space:]]*#|^" ip_to_check "[[:space:]]*$\" " allow_file " > /dev/null 2>&1")
-
-        if (is_whitelisted == 0) {
+        
+        # 2. CHECK AGAINST AWK ARRAY (fast memory lookup)
+        if (ip_to_check in whitelisted_ips) {
             # IP is whitelisted! Remove from ipset and print a message to stderr.
-            system("ipset del " ip_set_name " " ip_to_check)
+            # system() call is still needed here, but it is now only called for whitelisted IPs, not for every banned IP.
+            system("ipset del " ip_set_name " " ip_to_check " > /dev/null 2>&1")
             print "CLEANED: Removed whitelisted IP " ip_to_check " from ipset." > "/dev/stderr"
+            # DO NOT print $0, which effectively deletes it from the output tracking file.
         } else {
             # IP is not whitelisted. Print the line back to stdout for the new tracking file.
             print $0
@@ -642,7 +714,8 @@ if [ ! -s "$TEMP_AGGREGATE_FILE" ]; then
     echo "No significant violations found that meet minimum frequency thresholds."
     echo "--- 🛡️ 2. END: LOG SCANNING (EXTRACTION PHASE) ---"
     echo " "
-    report_ban_counts "Post-Run Ban Report (No Bans)" 0
+    local end_time=$(date +%s)
+    report_ban_counts "Post-Run Ban Report (No Bans)" 0 "$end_time"
     exit 0
 fi
 
@@ -813,8 +886,11 @@ echo "--- 🛡️ 2. END: LOG SCANNING AND IPSET BANNING ---"
 echo " "
 echo "--- 🧹 3. FINALIZING ---"
 
+# 🟢 NEW: Capture END TIME here for final report
+END_TIME=$(date +%s)
+
 # 3. FINAL REPORTING (Reflects state after changes in this run)
-report_ban_counts "Post-Run Ban Report" "$NEW_BANS_COUNT"
+report_ban_counts "Post-Run Ban Report" "$NEW_BANS_COUNT" "$END_TIME"
 
 # 🟢 NEW: Final tracking file message
 echo "Banned IPs recorded in tracking file: $IP_TRACKING_FILE"
