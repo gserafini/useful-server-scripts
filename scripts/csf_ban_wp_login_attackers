@@ -17,10 +17,10 @@
 # The script can be run with the following utility flags instead of its default log-scanning mode:
 # 1. --init: Initializes the IPSET table and adds the necessary firewall rules to /etc/csf/csfpost.sh.
 #    This must be run once before the cron job is activated.
-# 2. --whitelist <IP>: Adds the specified IP address to /etc/csf/csf.allow, removes it from the 
-#    IPSET ban list, and reloads CSF. (Requires setup)
-# 3. --blacklist <IP>: Immediately adds the specified IP address to the IPSET ban list 
-#    and the tracking file. It skips whitelisted IPs. (Requires setup)
+# 2. --whitelist <IP> [MESSAGE]: Adds the specified IP address to /etc/csf/csf.allow, removes it from the 
+#    IPSET ban list, and reloads CSF. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
+# 3. --blacklist <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list 
+#    and the tracking file. It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
 # 4. --logs "<path1> <path2>": Overrides the default log paths to scan.
 #    (Used in cron job or manual runs).
 # 5. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
@@ -144,7 +144,7 @@ ensure_setup() {
         echo "ACTION REQUIRED: Run the script manually with the --init flag."
         echo "This script is running in a non-interactive environment (cron) and cannot proceed."
         exit 1
-    fi
+    fi 
 }
 
 
@@ -192,9 +192,11 @@ report_ban_counts() {
 }
 
 # Function to perform the blacklist action (Manual Ban)
+# UPDATED to accept an optional message
 perform_blacklist() {
     ensure_setup
-    local ip=$1
+    local ip="$1"
+    local message="$2"
     
     local timestamp_cmd
     timestamp_cmd=$(date "+%Y-%m-%d %H:%M:%S")
@@ -233,7 +235,8 @@ perform_blacklist() {
 
 
  
-    local message="Manually blacklisted via --blacklist"
+    # Use the custom message or a default
+    local ban_reason="Manual Blacklist: ${message:-"Manually blacklisted via --blacklist"}"
     
     local current_ban_count_cmd
     current_ban_count_cmd=$(wc -l < "$IP_TRACKING_FILE")
@@ -243,7 +246,7 @@ perform_blacklist() {
         echo "WARNING: Ban limit ($MAX_BANS) reached. IP $ip will be added, but the oldest rotatable IP will be removed on the next cron run."
     fi
 
-    message="$message ($country)"
+    ban_reason="$ban_reason ($country)"
 
     if ipset add "$IP_SET_NAME" "$ip" -exist; then
         echo "Added $ip to ipset: $IP_SET_NAME."
@@ -252,7 +255,7 @@ perform_blacklist() {
         exit 1
     fi
 
-    echo "$ip # [$timestamp] $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
+    echo "$ip # [$timestamp] $ban_reason" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     local end_time_cmd
     end_time_cmd=$(date +%s)
@@ -262,13 +265,18 @@ perform_blacklist() {
 }
 
 # Function to perform the whitelist action
+# UPDATED to accept an optional message
 perform_whitelist() {
     ensure_setup
-    local ip=$1
+    local ip="$1"
+    local message="$2"
     local timestamp_cmd
     timestamp_cmd=$(date "+%Y-%m-%d %H:%M:%S")
     local timestamp=${timestamp_cmd}
-    local comment="# Added via script at $timestamp"
+    
+    # Use the custom message or a default
+    local reason="${message:-"Manual Whitelist"}"
+    local comment="# Added via script at $timestamp. Reason: $reason"
 
     echo "--- 🟢 Whitelist Action: $ip ---"
 
@@ -421,22 +429,50 @@ while true; do
     --init )
       perform_init
       ;;
+      
     --whitelist )
+      # $1 is --whitelist
       IP_TO_WHITELIST="$2"
+      MESSAGE_TO_USE=""
+
       if [ -z "$IP_TO_WHITELIST" ] || ! validate_ip "$IP_TO_WHITELIST"; then
           echo "Error: --whitelist requires a valid IP address argument."
           exit 1
       fi
-      perform_whitelist "$IP_TO_WHITELIST"
+
+      # FIX: Explicitly check for a message argument.
+      if [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+          MESSAGE_TO_USE="$3"
+          shift 3 # Consume Flag, IP, and Message (3 arguments)
+      else
+          shift 2 # Consume only Flag and IP (2 arguments)
+      fi
+      
+      perform_whitelist "$IP_TO_WHITELIST" "$MESSAGE_TO_USE"
       ;;
+      
     --blacklist )
+      # $1 is --blacklist
       IP_TO_BLACKLIST="$2"
+      MESSAGE_TO_USE=""
+
       if [ -z "$IP_TO_BLACKLIST" ] || ! validate_ip "$IP_TO_BLACKLIST"; then
           echo "Error: --blacklist requires a valid IP address argument."
           exit 1
       fi
-      perform_blacklist "$IP_TO_BLACKLIST"
+
+      # FIX: Explicitly check for a message argument.
+      if [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+          MESSAGE_TO_USE="$3"
+          shift 3 # Consume Flag, IP, and Message (3 arguments)
+      else
+          shift 2 # Consume only Flag and IP (2 arguments)
+      fi
+      
+      perform_blacklist "$IP_TO_BLACKLIST" "$MESSAGE_TO_USE"
+      
       ;;
+      
     --logs )
       LOG_PATHS="$2"
       shift 2
@@ -852,7 +888,6 @@ while read -r ip _; do
     COUNTRY=""
     
     # Check if IP is already known (fast shell array lookup)
-    # FIX: Use braces when expanding arrays: ${existing_ips_map["$ip"]} (applied in previous step)
     if [[ -n ${existing_ips_map["$ip"]} ]]; then
         COUNTRY="${existing_ips_map["$ip"]}"
     else
@@ -1054,7 +1089,6 @@ if [ -s "$TEMP_TRACKING_FILE" ];
 then
     mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
 else
-    # This error message is what you saw in the original output, now it is only printed if the file actually fails to update.
     echo "ERROR: Tracking file update failed. File was empty or not created." >> /dev/stderr
 fi
 # ----------------------------------------
