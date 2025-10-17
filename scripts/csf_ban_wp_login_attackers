@@ -636,7 +636,7 @@ fi
 
 echo "All relevant violations recorded. Starting aggregation and execution..."
 
-# --- 🛡️ 2.1: Aggregation Phase (AWK 1) ---
+# --- 🛡️ 2.1: Aggregation Phase (AWK 1) - OPTIMIZED FOR CPU ---
 # Aggregate the data to a temporary file for counting and unique triggers.
 TOTAL_AGGREGATE_LINES=$(wc -l < "$TEMP_AGGREGATE_FILE")
 echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs..." > /dev/stderr
@@ -649,7 +649,8 @@ BEGIN {
 { 
     # $1=IP, $2=Count, $3=Description
     IPs[$1] += $2;
-    descriptions[$1,$3] = 1; 
+    # 🔑 OPTIMIZATION: Use a true 2D array structure for description list
+    description_list[$1][$3] = 1; 
     
     # 🟢 PROGRESS BAR LOGIC for Aggregation
     processed++;
@@ -662,14 +663,16 @@ END {
          printf "Aggregation Progress: %d of %d (100.00%%) - Complete.\n" , total_lines, total_lines > "/dev/stderr";
     }
     
-    # --- Summary Building ---
+    # --- Summary Building (OPTIMIZED) ---
+    # This loop is now extremely fast, avoiding nested iteration and regex for summary building.
     for (ip in IPs) { 
         summary = ""
-        for (desc_key in descriptions) {
-            if (desc_key ~ ("^" ip SUBSEP)) {
-                desc = substr(desc_key, length(ip) + length(SUBSEP) + 1);
-                summary = (summary == "" ? desc : summary ", " desc);
-            }
+        separator = ""
+        
+        # Iterate directly over the descriptions associated with the current IP
+        for (desc in description_list[ip]) {
+            summary = summary separator desc
+            separator = ", "
         }
         print ip, IPs[ip], summary
     } 
@@ -835,7 +838,6 @@ LOG_SCAN_OUTPUT=$(
         
         # 💾 WRITE THE UPDATED BAN LIST BACK TO THE FILE ONCE (Corrected, Atomic Write)
         # AWK will buffer all these 'print' commands to the file.
-        # This is a safe way to write back the content.
         for (i in ban_list) {
             if (ban_list[i] != "") {
                 print ban_list[i] > tracking_file
