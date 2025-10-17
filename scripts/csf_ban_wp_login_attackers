@@ -687,7 +687,7 @@ for key in "${!keywords[@]}"; do
     
     # SC2086 Fix: Quote command substitutions
     current_keyword=$(echo "${key}" | cut -d" " -f2)
-    echo "[$KEYWORD_COUNT/$TOTAL_KEYWORDS] Scanning logs for keyword: '${current_keyword}'" > /dev/stderr
+    echo "[$KEYWORD_COUNT/$TOTAL_KEYWORDS] 👀 Scanning logs for keyword: '${current_keyword}'" > /dev/stderr
 
     # SC2086 Fix: Quote command substitutions
     frequency=$(( $( echo "${key}" | cut -d" " -f1) ))
@@ -901,8 +901,9 @@ echo "Batch GeoIP lookup complete." > "/dev/stderr"
 
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
 echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
+# NOTE: The outer command block no longer captures stderr (it now prints to console).
+# It only captures stdout (where "INSERTED" and "UPGRADED" messages are printed).
 LOG_SCAN_OUTPUT_CMD=$(
-    # Pass the total IP count as a reliable variable (NEW LINE ADDED HERE)
     gawk -v ip_set_name="$IP_SET_NAME" \
         -v tracking_file="$IP_TRACKING_FILE" \
         -v temp_tracking_file="$TEMP_TRACKING_FILE" \
@@ -940,7 +941,7 @@ LOG_SCAN_OUTPUT_CMD=$(
         processed = 0
         current_date = strftime("%Y-%m-%d %H:%M:%S")
         
-        # FIXED LINE: Use the variable passed from the shell
+        # Use the variable passed from the shell
         total_ips = total_ips_count
         
         print "Processing bans: 0 of " total_ips " (0.00%)" > "/dev/stderr"
@@ -954,7 +955,6 @@ LOG_SCAN_OUTPUT_CMD=$(
         # 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
         if (ip in ban_list) {
             # IP is already in our tracking file, assume it is in the ipset (or will be shortly).
-            # We still need to check if the new violation count meets the permanent threshold.
             
             if (ban_list[ip] !~ /do not delete/ && count >= max_violation_count) {
                 if (permanent_ban_count < max_permanent_bans) {
@@ -967,10 +967,8 @@ LOG_SCAN_OUTPUT_CMD=$(
                 } else {
                     print "NOTICE: Permanent ban limit reached. IP " ip " remains in rotatable list."
                 }
-            } else {
-                # IP is already banned and status is not changing (either already permanent or still rotatable)
-                print "SKIPPED IP already banned: " ip " (Violations: " count ")"
-            }
+            } 
+            # SILENCE SKIPPED MESSAGE: We removed the `print "SKIPPED..."` line here
         } else {
             # 🔑 OPTIMIZATION 2: IPSET ADD (Fast Kernel-level insertion)
             # IP is new. Add to ipset and tracking file.
@@ -1002,6 +1000,7 @@ LOG_SCAN_OUTPUT_CMD=$(
 
         # PROGRESS BAR LOGIC (Prints to stderr in real-time)
         if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
+            # The progress bar is printed to standard error
             printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, (processed / total_ips * 100) > "/dev/stderr"
             fflush("/dev/stderr") # Force immediate display
         }
@@ -1019,8 +1018,9 @@ LOG_SCAN_OUTPUT_CMD=$(
             }
         }
         close(temp_tracking_file)
-    }' "$TEMP_UNIQUE_IPS" 2>&1
-)
+    }' "$TEMP_UNIQUE_IPS" 
+) # The '2>&1' that caused the issue has been removed from here.
+
 LOG_SCAN_OUTPUT=${LOG_SCAN_OUTPUT_CMD}
 
 # --- 💾 FIXED: ATOMIC FILE REPLACEMENT ---
