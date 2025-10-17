@@ -54,7 +54,7 @@ TEMP_AGGREGATE_FILE=$(mktemp)
 # Temporary file for unique aggregated IPs (used in the new progress logic)
 TEMP_UNIQUE_IPS=$(mktemp)
 
-# --- NEW: TIMING VARIABLE ---
+# --- TIMING VARIABLE ---
 START_TIME=$(date +%s)
 # -------------------------------
 
@@ -71,7 +71,6 @@ validate_ip() {
 # Function to determine the absolute path of iptables for rule generation
 get_iptables_path() {
     # 🟢 PORTABLE FIX: Use command -v to find the absolute path, falling back to a common location.
-    # This path is needed to write a reliable rule to csfpost.sh.
     local path
     path=$(command -v iptables 2>/dev/null || echo '/usr/sbin/iptables')
     
@@ -82,7 +81,7 @@ get_iptables_path() {
             # If still not found, return an empty string to signal failure
             echo ""
             return 1
-        fi # <-- Fixed shell syntax
+        fi
     fi
     echo "$path"
     return 0
@@ -104,7 +103,6 @@ is_setup_complete() {
     local iptables_path
     iptables_path=$(get_iptables_path)
     if [ -z "$iptables_path" ]; then
-        # Cannot determine iptables path, so we can't check/initialize the rule.
         return 1
     fi
 
@@ -179,7 +177,7 @@ report_ban_counts() {
         echo "New IPs added to blacklist: $new_bans_count"
     fi
 
-    # 🟢 NEW: Elapsed Time Calculation and Reporting
+    # 🟢 Elapsed Time Calculation and Reporting
     if [ "$end_time" -gt "$START_TIME" ]; then
         local elapsed_time=$((end_time - START_TIME))
         local minutes=$((elapsed_time / 60))
@@ -243,7 +241,7 @@ perform_blacklist() {
     fi
 
     # 7. Add to Tracking File (for persistence and rotation)
-    # 🟢 MODIFIED: Add timestamp to the manually blacklisted entry
+    # MODIFIED: Add timestamp to the manually blacklisted entry
     echo "$ip # [$timestamp] $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     
@@ -391,10 +389,7 @@ perform_clear() {
     
     # 1. Flush the IPSET table (Clears kernel-level block list instantly)
     if ipset flush "$IP_SET_NAME"; then
-        echo "Successfully flushed all entries from ipset: $IP_SET_NAME. 
-
-[Image of a red trash can]
-"
+        echo "Successfully flushed all entries from ipset: $IP_SET_NAME. "
     else
         echo "ERROR: Failed to flush ipset '$IP_SET_NAME'. Check ipset utility and permissions."
         exit 1
@@ -608,9 +603,7 @@ awk -v ip_set_name=$IP_SET_NAME \
     '
     BEGIN {
         # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
-        # Read the content of csf.allow into a memory array
         while ((getline line < allow_file) > 0) {
-            # Extract only the IP, ignoring comments and blank lines
             if (line !~ /^#/) {
                 match(line, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
                 if (RSTART > 0) {
@@ -620,7 +613,6 @@ awk -v ip_set_name=$IP_SET_NAME \
         }
         close(allow_file)
         
-        # Check if allow list is populated
         num_allowed = length(whitelisted_ips)
         if (num_allowed == 0) {
             print "Allow list is empty. No cleanup needed." > "/dev/stderr"
@@ -632,7 +624,7 @@ awk -v ip_set_name=$IP_SET_NAME \
     {
         processed++
         
-        # Print a simple progress bar/counter every 1000 lines (or when starting/finishing) to stderr
+        # Print a simple progress bar/counter to stderr
         if (total_lines > 0 && (processed % 1000 == 0 || processed == total_lines)) {
             printf "Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr"
         }
@@ -641,8 +633,6 @@ awk -v ip_set_name=$IP_SET_NAME \
         
         # 2. CHECK AGAINST AWK ARRAY (fast memory lookup)
         if (ip_to_check in whitelisted_ips) {
-            # IP is whitelisted! Remove from ipset and print a message to stderr.
-            # system() call is still needed here, but it is now only called for whitelisted IPs, not for every banned IP.
             system("ipset del " ip_set_name " " ip_to_check " > /dev/null 2>&1")
             print "CLEANED: Removed whitelisted IP " ip_to_check " from ipset." > "/dev/stderr"
             # DO NOT print $0, which effectively deletes it from the output tracking file.
@@ -673,7 +663,7 @@ echo " "
 echo "--- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---"
 echo "Log paths being scanned: $LOG_PATHS"
 
-# --- NEW: Get the total number of keywords for the progress counter ---
+# --- Get the total number of keywords for the progress counter ---
 TOTAL_KEYWORDS=${#keywords[@]}
 KEYWORD_COUNT=0
 echo "Scanning for $TOTAL_KEYWORDS malicious keywords..."
@@ -682,8 +672,7 @@ echo "Scanning for $TOTAL_KEYWORDS malicious keywords..."
 for key in "${!keywords[@]}"; do
     KEYWORD_COUNT=$((KEYWORD_COUNT + 1))
     
-    # 🟢 NEW: Progress update for the current keyword. Sent to stderr so it does not interrupt the pipeline.
-    # We strip the frequency from the keyword for a cleaner visual status.
+    # Progress update for the current keyword. Sent to stderr
     current_keyword=$(echo "${key}" | cut -d" " -f2)
     echo "[$KEYWORD_COUNT/$TOTAL_KEYWORDS] Scanning logs for keyword: '${current_keyword}'" > /dev/stderr
 
@@ -703,7 +692,7 @@ for key in "${!keywords[@]}"; do
     { 
       # Only output if the count for this specific keyword meets the minimum threshold
       if ($1 >= frequency ) {
-        # Format: IP<TAB>Count<TAB>Description (e.g., 1.2.3.4\t20\twp-login)
+        # Format: IP<TAB>Count<TAB>Description
         print $2 "\t" $1 "\t" description 
       }
     }' | tee -a "$TEMP_AGGREGATE_FILE"
@@ -722,8 +711,7 @@ fi
 echo "All relevant violations recorded. Starting aggregation and execution..."
 
 # --- 🛡️ 2.1: Aggregation Phase (AWK 1) ---
-# Aggregate the data to a temporary file for counting.
-# Format: IP<SPACE>Total_Count<SPACE>Concatenated_Message
+# Aggregate the data to a temporary file for counting and unique triggers.
 echo "Aggregating all violation counts to find unique IPs..." > /dev/stderr
 
 awk '
@@ -731,18 +719,31 @@ BEGIN {
     FS="\t" 
 } 
 { 
-    # Sum counts and concatenate descriptions for each IP
+    # $1=IP, $2=Count, $3=Description
     IPs[$1] += $2; 
     
-    # Check if description tag already exists before appending
-    if (messages[$1] !~ $3) {
-        messages[$1] = (messages[$1] == "" ? $3 : messages[$1] ", " $3);
-    }
+    # Use a multi-dimensional-like array for unique descriptions per IP.
+    descriptions[$1,$3] = 1; 
 } 
 END { 
-    # Print aggregated results for the next awk block
+    # Iterate through all unique IPs
     for (ip in IPs) { 
-        print ip, IPs[ip], messages[ip] 
+        summary = ""
+        
+        # Iterate through the unique descriptions array to build the summary
+        for (desc_key in descriptions) {
+            # Check if the key starts with the current IP
+            if (desc_key ~ ("^" ip SUBSEP)) {
+                # Extract the description part
+                desc = substr(desc_key, length(ip) + length(SUBSEP) + 1);
+                
+                # Append the unique description to the summary
+                summary = (summary == "" ? desc : summary ", " desc);
+            }
+        }
+        
+        # Print aggregated results for the next awk block
+        print ip, IPs[ip], summary
     } 
 }' "$TEMP_AGGREGATE_FILE" > "$TEMP_UNIQUE_IPS"
 
@@ -766,7 +767,7 @@ LOG_SCAN_OUTPUT=$(
     {
       ip=$1
       total_count=$2
-      message_summary=$3
+      message_summary=$3 # Only comma-separated attack triggers
       
       # PROGRESS BAR LOGIC: Update on every 10th IP or at the start/end
       processed++
@@ -784,7 +785,6 @@ LOG_SCAN_OUTPUT=$(
       }
       
       # 2. IPSET STATUS CHECK: Check if IP is already in the set
-      # 🟢 FIXED: Redirecting stderr (2) to /dev/null to silence the "is NOT in set" message
       is_already_banned = system("ipset test " ip_set_name " " ip " 2>/dev/null")
       if (is_already_banned == 0) {
         print "IP " ip " is already in ipset \047" ip_set_name "\047. Skipping insertion."
@@ -802,20 +802,22 @@ LOG_SCAN_OUTPUT=$(
 
       is_new_ban_permanent = 0
       
-      # The BAN MESSAGE now includes the concatenated summary and total count
-      message="Total Violations: " total_count ". Triggers: " message_summary
+      # 🟢 FORMATTING: Wrap message_summary in brackets.
+      message_triggers = "[" message_summary "]"
+      protection_text = ""
       
       # PERMANENT BAN LOGIC: Based on TOTAL aggregated count
       if (total_count >= max_violation_count && permanent_ban_count < max_perm_bans) {
+        # Store the permanent marker separately
         protection_text = " [More than " max_violation_count " blocks, do not delete ]"
-        message = message protection_text
         is_new_ban_permanent = 1
         print "IP qualifies for permanent ban. Current permanent count: " permanent_ban_count
       } else if (total_count >= max_violation_count) {
         print "IP qualifies for permanent ban, but permanent limit (" max_perm_bans ") reached. Appending as rotatable entry."
       }
       
-      message = message " (" country ")"
+      # FINAL MESSAGE CONSTRUCTION: Total Violations . Triggers: [list] [marker] (country)
+      message="Total Violations: " total_count ". Triggers: " message_triggers protection_text " (" country ")"
       print "Blocking " ip " because " message
 
       # 4. Check Current Total Ban Count (Rotation Logic)
@@ -846,7 +848,7 @@ LOG_SCAN_OUTPUT=$(
 
       # 5. EXECUTE DELETION if a line number was found
       if (line_to_delete > 0) {
-        # FIXED: Using awk with octal quote (\047) to robustly extract the first field (IP)
+        # Using awk with octal quote (\047) to robustly extract the first field (IP)
         cmd_get_ip = "sed -n " line_to_delete "p " tracking_file " | awk \047{print $1}\047"
         cmd_get_ip | getline ip_to_delete
         close(cmd_get_ip)
@@ -863,7 +865,7 @@ LOG_SCAN_OUTPUT=$(
       system("ipset add " ip_set_name " " ip " -exist")
       # Use a unique marker for counting in the final report
       print "INSERTED new IP to ipset: " ip
-      # 🟢 MODIFIED: Prepend the date to the message when writing to the file
+      # Prepend the date to the message when writing to the file
       system("echo \"" ip " # [" current_date "] " message "\" >> " tracking_file) 
 
       print " "
@@ -886,13 +888,13 @@ echo "--- 🛡️ 2. END: LOG SCANNING AND IPSET BANNING ---"
 echo " "
 echo "--- 🧹 3. FINALIZING ---"
 
-# 🟢 NEW: Capture END TIME here for final report
+# 🟢 Capture END TIME here for final report
 END_TIME=$(date +%s)
 
 # 3. FINAL REPORTING (Reflects state after changes in this run)
 report_ban_counts "Post-Run Ban Report" "$NEW_BANS_COUNT" "$END_TIME"
 
-# 🟢 NEW: Final tracking file message
+# 🟢 Final tracking file message
 echo "Banned IPs recorded in tracking file: $IP_TRACKING_FILE"
 
 echo "Done!"
