@@ -716,6 +716,7 @@ echo "All relevant violations recorded. Starting aggregation and execution..."
 TOTAL_AGGREGATE_LINES_CMD=$(wc -l < "$TEMP_AGGREGATE_FILE")
 TOTAL_AGGREGATE_LINES=${TOTAL_AGGREGATE_LINES_CMD}
 
+echo "" # Newline added for desired output formatting
 echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs..." > "/dev/stderr"
 
 gawk -v total_lines="$TOTAL_AGGREGATE_LINES" '
@@ -782,6 +783,7 @@ END {
 # Count total unique IPs detected for reporting and progress tracking
 TOTAL_UNIQUE_IPS_CMD=$(wc -l < "$TEMP_UNIQUE_IPS")
 TOTAL_UNIQUE_IPS=${TOTAL_UNIQUE_IPS_CMD}
+echo "" # Newline added for desired output formatting
 echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 
 
@@ -878,10 +880,12 @@ done < "$TEMP_UNIQUE_IPS"
 # Print final status update with a newline
 printf "GeoIP Lookups: %d of %d (100.00%%) - Total New Lookups: %d.\n" "$TOTAL_UNIQUE_IPS" "$TOTAL_UNIQUE_IPS" "$IPS_TO_LOOKUP" > "/dev/stderr"
 echo "Batch GeoIP lookup complete." > "/dev/stderr"
+echo "" # Newline added for desired output formatting
 # --- END BATCH GEOIP LOOKUP ---
 
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
 echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > "/dev/stderr"
+
 # NOTE: The outer command block no longer captures stderr (it now prints to console).
 # It only captures stdout (where "INSERTED" and "UPGRADED" messages are printed).
 LOG_SCAN_OUTPUT_CMD=$(
@@ -927,7 +931,7 @@ LOG_SCAN_OUTPUT_CMD=$(
         # Use the variable passed from the shell
         total_ips = total_ips_count
         
-        print "Processing bans: 0 of " total_ips " (0.00%)" > "/dev/stderr"
+        # Removed the initial print here to fix the double line issue
     }
     {
         
@@ -987,6 +991,8 @@ LOG_SCAN_OUTPUT_CMD=$(
   
         if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
             # The progress bar is printed to standard error
+            # The processed == 1 condition ensures the initial line is printed correctly
+            # without a preceding newline from BEGIN
             printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, (processed / total_ips * 100) > "/dev/stderr"
             fflush("/dev/stderr") # Force immediate display
         }
@@ -1061,9 +1067,11 @@ NEW_BANS_COUNT=${NEW_BANS_COUNT_CMD}
 # Display the captured output to the user
 echo "$LOG_SCAN_OUTPUT"
 
+echo "" # Add blank line after INSERTED messages
 echo "--- 🛡️ 2. END: LOG SCANNING AND IPSET BANNING ---"
 echo " "
 echo "--- 🧹 3. FINALIZING ---"
+echo "" # Add blank line before the Post-Run Ban Report
 
 END_TIME_CMD=$(date +%s)
 END_TIME=${END_TIME_CMD}
