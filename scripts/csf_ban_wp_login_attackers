@@ -51,7 +51,7 @@ TEMP_AGGREGATE_FILE=$(mktemp)
 TEMP_UNIQUE_IPS=$(mktemp)
 # Temporary file for the new, complete tracking list (The fix for the file corruption)
 TEMP_TRACKING_FILE=$(mktemp)
-# NEW: Temporary file to cache the IP -> Country map (The Speed Fix)
+# NEW: Temporary file to cache the IP -> Country map
 TEMP_GEOIP_MAPPING=$(mktemp)
 
 # --- TIMING VARIABLE ---
@@ -704,7 +704,8 @@ echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
 
 # 1. Load existing IPs and their countries from the tracking file into a shell array
 declare -A existing_ips_map
-local total_existing_ips=0
+# CORRECTED: Removed 'local'
+total_existing_ips=0 
 while read -r line; do
     # Extract IP and the country/region from the line: IP # [Date] Message (Country)
     if [[ $line =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})[[:space:]]+.*\(.*\)$ ]]; then
