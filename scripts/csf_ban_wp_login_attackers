@@ -51,6 +51,8 @@ TEMP_AGGREGATE_FILE=$(mktemp)
 TEMP_UNIQUE_IPS=$(mktemp)
 # Temporary file for the new, complete tracking list (The fix for the file corruption)
 TEMP_TRACKING_FILE=$(mktemp)
+# NEW: Temporary file to cache the IP -> Country map (The Speed Fix)
+TEMP_GEOIP_MAPPING=$(mktemp)
 
 # --- TIMING VARIABLE ---
 START_TIME=$(date +%s)
@@ -191,8 +193,11 @@ perform_blacklist() {
         exit 0
     fi
     
-    cmd="geoiplookup $ip 2>/dev/null | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
+    # Use the same lookup method as the batch lookup for consistency
+    cmd="geoiplookup $ip 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | awk -F', ' '{print \$2}' | sed 's/^[[:space:]]*//'"
     country=$(eval "$cmd")
+    country=${country:-"Unknown_Country"}
+
 
     local message="Manually blacklisted via --blacklist"
     
@@ -393,7 +398,7 @@ while true; do
     * )
       break
       ;;
-  esac # CORRECTED: Changed 'end case' to 'esac'
+  esac
 done
 
 if [ -z "$LOG_PATHS" ]; then
@@ -515,7 +520,7 @@ echo " "
 date
 
 # Ensure temporary files are cleaned up on exit
-trap "rm -f $TEMP_AGGREGATE_FILE $TEMP_UNIQUE_IPS $TEMP_TRACKING_FILE" EXIT
+trap "rm -f $TEMP_AGGREGATE_FILE $TEMP_UNIQUE_IPS $TEMP_TRACKING_FILE $TEMP_GEOIP_MAPPING" EXIT
 
 # 1. INITIAL REPORTING (Reflects state before any changes in this run)
 report_ban_counts "Pre-Run Ban Report"
@@ -693,8 +698,68 @@ END {
 TOTAL_UNIQUE_IPS=$(wc -l < "$TEMP_UNIQUE_IPS")
 echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 
-# --- 🛡️ 2.2: Execution Phase (AWK 2) with Progress Bar ---
-# *** HIGHLY OPTIMIZED FOR MEMORY ACCESS AND MINIMAL SYSTEM CALLS ***
+
+# --- 🛡️ 2.15: Batch GeoIP Lookup (THE SPEED FIX + NEW CACHING/PROGRESS) ---
+echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
+
+# 1. Load existing IPs and their countries from the tracking file into a shell array
+declare -A existing_ips_map
+local total_existing_ips=0
+while read -r line; do
+    # Extract IP and the country/region from the line: IP # [Date] Message (Country)
+    if [[ $line =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})[[:space:]]+.*\(.*\)$ ]]; then
+        ip="${BASH_REMATCH[1]}"
+        # Extract the content inside the last parenthesis (the country)
+        country=$(echo "$line" | grep -oP '\(\K[^\)]+(?=\)$)' | tail -1)
+        if [[ -n "$ip" && -n "$country" ]]; then
+            existing_ips_map["$ip"]="$country"
+            total_existing_ips=$((total_existing_ips + 1))
+        fi
+    fi
+done < "$IP_TRACKING_FILE"
+
+echo "Loaded $total_existing_ips existing GeoIP records for caching." > /dev/stderr
+
+# 2. Iterate over all unique IPs from the logs and perform lookups only for new ones
+PROCESSED_COUNT=0
+IPS_TO_LOOKUP=0
+
+while read -r ip total_count message_summary; do
+    PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
+    
+    COUNTRY=""
+    
+    # Check if IP is already known (fast shell array lookup)
+    if [[ -n ${existing_ips_map["$ip"]} ]]; then
+        COUNTRY="${existing_ips_map["$ip"]}"
+    else
+        # IP is new, perform the lookup
+        IPS_TO_LOOKUP=$((IPS_TO_LOOKUP + 1))
+
+        # Progress Bar Update (only prints when an actual lookup is happening)
+        PERCENT=$(( PROCESSED_COUNT * 100 / TOTAL_UNIQUE_IPS ))
+        printf "GeoIP Progress: %d of %d (%.2f%%) - New Lookups: %d - Checking %s\r" "$PROCESSED_COUNT" "$TOTAL_UNIQUE_IPS" "$PERCENT" "$IPS_TO_LOOKUP" "$ip" > "/dev/stderr"
+
+        # Use the installed geoiplookup utility
+        COUNTRY=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | awk -F', ' '{print $2}' | sed 's/^[[:space:]]*//')
+        
+        # Fallback
+        COUNTRY=${COUNTRY:-"Unknown_Country"}
+    fi
+
+    # Output: IP\tCountry to the temporary map file
+    echo -e "$ip\t$COUNTRY" >> "$TEMP_GEOIP_MAPPING"
+    
+done < "$TEMP_UNIQUE_IPS"
+
+# Print final status update with a newline
+printf "GeoIP Progress: %d of %d (100.00%%) - Total New Lookups: %d.\n" "$TOTAL_UNIQUE_IPS" "$TOTAL_UNIQUE_IPS" "$IPS_TO_LOOKUP" > "/dev/stderr"
+echo "Batch GeoIP lookup complete." > "/dev/stderr"
+# --- END BATCH GEOIP LOOKUP ---
+
+
+# --- 🛡️ 2.2: Execution Phase (AWK 2) ---
+# This phase is now incredibly fast as it uses in-memory data.
 LOG_SCAN_OUTPUT=$(
     awk -v total_ips="$TOTAL_UNIQUE_IPS" \
         -v current_date="$(date '+%Y-%m-%d %H:%M:%S')" \
@@ -704,17 +769,15 @@ LOG_SCAN_OUTPUT=$(
         -v temp_tracking_file=$TEMP_TRACKING_FILE \
         -v max_bans=$MAX_BANS \
         -v max_perm_bans=$MAX_PERMANENT_BANS \
-        -v max_violation_count=$MAX_VIOLATION_COUNT '
+        -v max_violation_count=$MAX_VIOLATION_COUNT \
+        -v geoip_map_file=$TEMP_GEOIP_MAPPING '
     BEGIN {
         processed = 0
         current_ban_count = 0
         permanent_ban_count = 0
 
         # 📚 MEMORY OPTIMIZATION 1: Read IP tracking file into memory once
-        # This will read the potentially corrupted file from the last run, 
-        # but the new bans are processed against the live IPSET and the list is rebuilt.
         while ((getline line < tracking_file) > 0) {
-            # Skip empty or comment lines
             if ($0 ~ /^#|^[[:space:]]*$/) { continue }
             
             current_ban_count++
@@ -727,12 +790,19 @@ LOG_SCAN_OUTPUT=$(
         
         # 📚 MEMORY OPTIMIZATION 2: Read csf.allow into memory once
         while ((getline line < allow_file) > 0) {
-            # If the line starts with an IP, use $1 (the IP) for the whitelist array
             if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
                 whitelisted_ips[$1] = 1
             }
         }
         close(allow_file)
+
+        # 📚 NEW MEMORY OPTIMIZATION 3: Load GeoIP data into memory once
+        while ((getline line < geoip_map_file) > 0) {
+            # Line format is: IP\tCountry
+            split(line, parts, "\t")
+            geoip_map[parts[1]] = parts[2]
+        }
+        close(geoip_map_file)
     }
     {
       ip=$1
@@ -750,7 +820,6 @@ LOG_SCAN_OUTPUT=$(
       # =================================================================
       is_already_banned = system("ipset test " ip_set_name " " ip " 2>/dev/null")
       if (is_already_banned == 0) {
-        # IP is already banned. Skip all remaining slow system calls.
         next 
       }
       
@@ -764,11 +833,11 @@ LOG_SCAN_OUTPUT=$(
         next 
       }
       
-      # 2. GEOIP Lookup (RETAINED - runs only for new, non-whitelisted bans)
-      # This is the last remaining slow system call.
-      cmd="geoiplookup " ip " 2>/dev/null | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
-      cmd | getline country
-      close(cmd)  
+      # 2. GEOIP Lookup (FAST ARRAY LOOKUP)
+      country = geoip_map[ip]
+      if (country == "") {
+          country = "Unknown_Country"
+      }
 
       is_new_ban_permanent = 0
       protection_text = ""
@@ -851,22 +920,19 @@ LOG_SCAN_OUTPUT=$(
         }
         
         # 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
-        # The main shell script will then atomically move this file to the final destination.
         for (i in ban_list) {
             if (ban_list[i] != "") {
                 print ban_list[i] > temp_tracking_file
             }
         }
-        close(temp_tracking_file) # Ensure buffer is flushed immediately
+        close(temp_tracking_file)
     }' "$TEMP_UNIQUE_IPS" 2>&1
 )
 
 # --- 💾 FIXED: ATOMIC FILE REPLACEMENT ---
-# Move the complete file created by AWK into the final tracking file location.
 if [ -s "$TEMP_TRACKING_FILE" ]; then
     mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
 else
-    # If the file is empty or missing, log an error but keep the existing file (even if corrupted)
     echo "ERROR: Tracking file update failed. File was empty or not created." >> /dev/stderr
 fi
 # ----------------------------------------
