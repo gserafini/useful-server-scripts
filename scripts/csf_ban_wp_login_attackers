@@ -902,6 +902,7 @@ echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
 echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
 LOG_SCAN_OUTPUT_CMD=$(
+    # Pass the total IP count as a reliable variable (NEW LINE ADDED HERE)
     gawk -v ip_set_name="$IP_SET_NAME" \
         -v tracking_file="$IP_TRACKING_FILE" \
         -v temp_tracking_file="$TEMP_TRACKING_FILE" \
@@ -909,9 +910,11 @@ LOG_SCAN_OUTPUT_CMD=$(
         -v max_permanent_bans="$MAX_PERMANENT_BANS" \
         -v max_violation_count="$MAX_VIOLATION_COUNT" \
         -v temp_geoip_mapping="$TEMP_GEOIP_MAPPING" \
+        -v total_ips_count="$TOTAL_UNIQUE_IPS" \
         '
     BEGIN {
         # 1. READ EXISTING BANS AND GEOIP CACHE
+        permanent_ban_count = 0
         while ((getline line < tracking_file) > 0) {
             if (line !~ /^#/) {
                 split(line, parts, "#")
@@ -936,7 +939,9 @@ LOG_SCAN_OUTPUT_CMD=$(
 
         processed = 0
         current_date = strftime("%Y-%m-%d %H:%M:%S")
-        total_ips = ARGC > 1 ? ARGC[1] : 0 
+        
+        # FIXED LINE: Use the variable passed from the shell
+        total_ips = total_ips_count
         
         print "Processing bans: 0 of " total_ips " (0.00%)" > "/dev/stderr"
     }
