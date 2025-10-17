@@ -216,7 +216,8 @@ perform_blacklist() {
         exit 1
     fi
 
-    if grep -q "^$ip[[:space:]]*" "$CSF_ALLOW_FILE";
+    # FIX: Use braces around simple variable to prevent SC2015 warning
+    if grep -q "^${ip}[[:space:]]*" "$CSF_ALLOW_FILE";
     then
         echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Skipping blacklist action."
         exit 0
@@ -233,10 +234,8 @@ perform_blacklist() {
     fi
     
     # Use the same lookup method as the batch lookup for consistency
-    local cmd='geoiplookup $ip 2>/dev/null | sed -n -e '\''s/GeoIP Country Edition: //p'\'' | awk -F'\'', '\'' '\''{print \$2}'\'' | sed '\''s/^[[:space:]]*//'\'''
-    # SC2155 Fix
     local country_cmd
-    country_cmd=$(eval "$cmd")
+    country_cmd=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | gawk -F', ' '{print $2}' | sed 's/^[[:space:]]*//')
     country=${country_cmd}
     country=${country:-"Unknown_Country"}
 
@@ -284,12 +283,14 @@ perform_whitelist() {
 
     echo "--- 🟢 Whitelist Action: $ip ---"
 
-    if ! grep -q "^$ip[[:space:]]*" "$CSF_ALLOW_FILE"; then
+    # FIX: Use braces around simple variable to prevent SC2015 warning
+    if ! grep -q "^${ip}[[:space:]]*" "$CSF_ALLOW_FILE"; then
         echo "$ip $comment" |
         tee -a "$CSF_ALLOW_FILE" > /dev/null
         echo "Added $ip to $CSF_ALLOW_FILE."
     else
-        echo "$ip is already present in "$CSF_ALLOW_FILE"."
+        # FIX: Corrected quoting to use a single set of double quotes for safety
+        echo "$ip is already present in $CSF_ALLOW_FILE."
     fi
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null;
@@ -448,7 +449,6 @@ do
   case "$1" in
     --init )
       perform_init
-      shift 1
       ;;
     --whitelist )
       IP_TO_WHITELIST="$2"
@@ -457,7 +457,6 @@ do
           exit 1
       fi
       perform_whitelist "$IP_TO_WHITELIST"
-      shift 2
       ;;
     --blacklist )
       IP_TO_BLACKLIST="$2"
@@ -473,7 +472,6 @@ do
       ;;
     --clear )
       perform_clear
-      shift 1
       ;;
     -- )
       shift
@@ -604,7 +602,8 @@ keywords=(
 echo " "
 # SC2155 Fix
 DATE_CMD=$(date)
-echo ${DATE_CMD}
+# FIX: SC2086 Fix: Double quote to prevent globbing and word splitting
+echo "${DATE_CMD}"
 
 # SC2064 Fix: Use single quotes for deferred expansion
 trap 'rm -f "$TEMP_AGGREGATE_FILE" "$TEMP_UNIQUE_IPS" "$TEMP_TRACKING_FILE" "$TEMP_GEOIP_MAPPING" "$TEMP_CACHE_EXTRACTION"' EXIT
@@ -615,14 +614,15 @@ report_ban_counts "Pre-Run Ban Report"
 echo "--- 🧹 1. START: PROACTIVE WHITELIST CLEANUP (CSF Allow vs. IPSET Ban List) ---"
 
 # SC2155 Fix
-TOTAL_TRACKING_LINES_CMD=$(wc -l < "$IP_TRACKING_FILE")
+TOTAL_TRACKING_LINES_CMD=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
 TOTAL_TRACKING_LINES=${TOTAL_TRACKING_LINES_CMD}
 
 # The cleanup logic is kept here for the regular cron job run.
-awk -v ip_set_name=$IP_SET_NAME \
-    -v tracking_file=$IP_TRACKING_FILE \
-    -v allow_file=$CSF_ALLOW_FILE \
-    -v total_lines=$TOTAL_TRACKING_LINES \
+# FIX: Double quote the variable assignments to AWK
+gawk -v ip_set_name="$IP_SET_NAME" \
+    -v tracking_file="$IP_TRACKING_FILE" \
+    -v allow_file="$CSF_ALLOW_FILE" \
+    -v total_lines="$TOTAL_TRACKING_LINES" \
     '
     BEGIN {
         # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
@@ -655,6 +655,7 @@ awk -v ip_set_name=$IP_SET_NAME \
         # Print a simple progress bar/counter to stderr
         if (total_lines > 0 && (processed % 1000 == 0 || processed == total_lines)) {
             printf "Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr"
+            fflush("/dev/stderr") # Force progress bar to show
         }
         
         ip_to_check = $1
@@ -719,7 +720,7 @@ for key in "${!keywords[@]}"; do
     sed 's/://' |
     sort | 
     uniq -c |
-    awk -v frequency=$frequency \
+    gawk -v frequency=$frequency \
         -v description="$description" '
     { 
       if ($1 >= frequency ) {
@@ -734,9 +735,9 @@ if [ ! -s "$TEMP_AGGREGATE_FILE" ]; then
     echo "No significant violations found that meet minimum frequency thresholds."
     echo "--- 🛡️ 2. END: LOG SCANNING (EXTRACTION PHASE) ---"
     echo " "
-    local end_time_cmd
+    # FIX: Removed the incorrect 'local' keyword
     end_time_cmd=$(date +%s)
-    local end_time=${end_time_cmd}
+    end_time=${end_time_cmd}
     report_ban_counts "Post-Run Ban Report (No Bans)" 0 "$end_time"
     exit 0
 fi
@@ -751,7 +752,7 @@ TOTAL_AGGREGATE_LINES=${TOTAL_AGGREGATE_LINES_CMD}
 
 echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs..." > "/dev/stderr"
 
-awk -v total_lines="$TOTAL_AGGREGATE_LINES" '
+gawk -v total_lines="$TOTAL_AGGREGATE_LINES" '
 BEGIN { 
     FS="\t";
     processed = 0; 
@@ -765,6 +766,7 @@ BEGIN {
     processed++;
     if (total_lines > 0 && (processed % 1000 == 0 || processed == 1 || processed == total_lines)) {
         printf "Aggregation Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr";
+        fflush("/dev/stderr") # Force progress bar to show
     }
 } 
 END { 
@@ -827,7 +829,7 @@ echo "Parsing $TOTAL_TRACKING_LINES_FOR_CACHE existing bans for GeoIP caching...
 
 # FIX: Using gensub (GNU AWK feature) for a more robust extraction of the country name 
 # from the end of the log line, which includes the variable [do not delete] flag.
-awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
+gawk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
     -v temp_cache_file="$TEMP_CACHE_EXTRACTION" '
     BEGIN {
         FS="[[:space:]]+";
@@ -837,6 +839,7 @@ awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
         processed++;
         if (total_lines > 0 && (processed % 1000 == 0 || processed == 1 || processed == total_lines)) {
             printf "Parsing Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr";
+            fflush("/dev/stderr") # Force progress bar to show
         }
 
         ip = $1;
@@ -864,6 +867,7 @@ while IFS=$'\t' read -r ip country;
 do
     if [[ -n "$ip" && -n "$country" ]];
     then
+        # FIX: Use braces when expanding arrays: ${existing_ips_map["$ip"]} (applied in previous step)
         existing_ips_map["$ip"]="$country"
         total_existing_ips=$((total_existing_ips + 1))
     fi
@@ -875,13 +879,16 @@ echo "Loaded $total_existing_ips existing GeoIP records for caching." > "/dev/st
 PROCESSED_COUNT=0
 IPS_TO_LOOKUP=0
 
-while read -r ip total_count message_summary;
+# FIX: Changed 'total_count message_summary' to a single underscore '_' 
+# to explicitly mark them as unused in this loop.
+while read -r ip _;
 do
     PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
     
     COUNTRY=""
     
     # Check if IP is already known (fast shell array lookup)
+    # FIX: Use braces when expanding arrays: ${existing_ips_map["$ip"]} (applied in previous step)
     if [[ -n ${existing_ips_map["$ip"]} ]];
     then
         COUNTRY="${existing_ips_map["$ip"]}"
@@ -896,7 +903,7 @@ do
    
         # Use the installed geoiplookup utility
         # SC2155 Fix
-        COUNTRY_CMD=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | awk -F', ' '{print $2}' | sed 's/^[[:space:]]*//')
+        COUNTRY_CMD=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | gawk -F', ' '{print $2}' | sed 's/^[[:space:]]*//')
         COUNTRY=${COUNTRY_CMD}
         
         # Fallback
@@ -920,16 +927,17 @@ echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > 
 # This phase is now incredibly fast as it uses in-memory data.
 # SC2155 Fix
 LOG_SCAN_OUTPUT_CMD=$(
-    awk -v total_ips="$TOTAL_UNIQUE_IPS" \
+    # FIX: Double quote the AWK variables
+    gawk -v total_ips="$TOTAL_UNIQUE_IPS" \
         -v current_date="$(date '+%Y-%m-%d %H:%M:%S')" \
-        -v ip_set_name=$IP_SET_NAME \
-        -v tracking_file=$IP_TRACKING_FILE \
-        -v allow_file=$CSF_ALLOW_FILE \
-        -v temp_tracking_file=$TEMP_TRACKING_FILE \
-        -v max_bans=$MAX_BANS \
-        -v max_perm_bans=$MAX_PERMANENT_BANS \
-        -v max_violation_count=$MAX_VIOLATION_COUNT \
-        -v geoip_map_file=$TEMP_GEOIP_MAPPING '
+        -v ip_set_name="$IP_SET_NAME" \
+        -v tracking_file="$IP_TRACKING_FILE" \
+        -v allow_file="$CSF_ALLOW_FILE" \
+        -v temp_tracking_file="$TEMP_TRACKING_FILE" \
+        -v max_bans="$MAX_BANS" \
+        -v max_perm_bans="$MAX_PERMANENT_BANS" \
+        -v max_violation_count="$MAX_VIOLATION_COUNT" \
+        -v geoip_map_file="$TEMP_GEOIP_MAPPING" '
  
     BEGIN {
         processed = 0
@@ -968,6 +976,7 @@ LOG_SCAN_OUTPUT_CMD=$(
         
         # Ensure the progress bar starts immediately after the BEGIN block finishes
         print "All data loaded. Commencing final IPSET execution." > "/dev/stderr"
+        fflush("/dev/stderr") # Force buffer flush
     }
     {
       ip=$1
@@ -979,6 +988,7 @@ LOG_SCAN_OUTPUT_CMD=$(
       if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
           printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, 
           (processed / total_ips * 100) > "/dev/stderr"
+          fflush("/dev/stderr") # <--- FIX: Force immediate display
       }
 
       # =================================================================
