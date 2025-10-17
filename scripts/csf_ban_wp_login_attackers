@@ -167,10 +167,15 @@ report_ban_counts() {
     csf_deny_count_cmd=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
     local csf_deny_count=${csf_deny_count_cmd}
 
+    local csf_allow_count_cmd
+    csf_allow_count_cmd=$(grep -v '^#' "$CSF_ALLOW_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
+    local csf_allow_count=${csf_allow_count_cmd}
+
 
     echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
     echo "Permanent IPs ('do not delete'): $permanent_ban_count / $MAX_PERMANENT_BANS"
     echo "Total IPs in CSF Deny File '$CSF_DENY_FILE': $csf_deny_count"
+    echo "Total IPs in CSF Allow File '$CSF_ALLOW_FILE': $csf_allow_count"
     
     if [ "$new_bans_count" -gt 0 ]; then
         echo "New IPs added to blacklist: $new_bans_count"
