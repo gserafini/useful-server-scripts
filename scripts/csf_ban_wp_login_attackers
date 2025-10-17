@@ -900,196 +900,121 @@ echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # --- END BATCH GEOIP LOOKUP ---
 
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
-echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > "/dev/stderr"
-
-# --- 🛡️ 2.2: Execution Phase (AWK 2) ---
+echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
 LOG_SCAN_OUTPUT_CMD=$(
-    
-    gawk -v total_ips="$TOTAL_UNIQUE_IPS" \
-        -v current_date="$(date '+%Y-%m-%d %H:%M:%S')" \
-        -v ip_set_name="$IP_SET_NAME" \
+    gawk -v ip_set_name="$IP_SET_NAME" \
         -v tracking_file="$IP_TRACKING_FILE" \
-        -v allow_file="$CSF_ALLOW_FILE" \
         -v temp_tracking_file="$TEMP_TRACKING_FILE" \
         -v max_bans="$MAX_BANS" \
-        -v max_perm_bans="$MAX_PERMANENT_BANS" \
+        -v max_permanent_bans="$MAX_PERMANENT_BANS" \
         -v max_violation_count="$MAX_VIOLATION_COUNT" \
-        -v geoip_map_file="$TEMP_GEOIP_MAPPING" '
- 
+        -v temp_geoip_mapping="$TEMP_GEOIP_MAPPING" \
+        '
     BEGIN {
-        processed = 0
-        current_ban_count = 0
-        permanent_ban_count = 0
-
-        # MEMORY OPTIMIZATION 1: Read IP tracking file into memory once
+        # 1. READ EXISTING BANS AND GEOIP CACHE
         while ((getline line < tracking_file) > 0) {
-            if ($0 ~ /^#|^[[:space:]]*$/) { continue }
-            
-  
-            current_ban_count++
-            ban_list[current_ban_count] = $0 
-            if ($0 ~ /do not delete/) {
-                permanent_ban_count++
+            if (line !~ /^#/) {
+                split(line, parts, "#")
+                ip = parts[1]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+                ban_list[ip] = line
+
+                # Check for permanent ban status
+                if (line ~ /do not delete/) {
+                    permanent_ban_count++
+                }
             }
         }
         close(tracking_file)
         
-     
-        # MEMORY OPTIMIZATION 2: Read csf.allow into memory once
-        while ((getline line < allow_file) > 0) {
-            if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
-                whitelisted_ips[$1] = 1
-            }
-        }
-        close(allow_file)
-
-        # NEW MEMORY OPTIMIZATION 3: Load GeoIP data into memory once
-        while ((getline line < geoip_map_file) > 0) {
-            # Line format is: IP\tCountry
+        # 2. READ GEOIP MAPPING
+        while ((getline line < temp_geoip_mapping) > 0) {
             split(line, parts, "\t")
             geoip_map[parts[1]] = parts[2]
         }
-        close(geoip_map_file)
+        close(temp_geoip_mapping)
+
+        processed = 0
+        current_date = strftime("%Y-%m-%d %H:%M:%S")
+        total_ips = ARGC > 1 ? ARGC[1] : 0 
         
-        // FIX: Remove redirect to stderr so this message is captured in LOG_SCAN_OUTPUT
-        print "All data loaded. Commencing final IPSET execution."
-        fflush("/dev/stderr") # Force buffer flush
+        print "Processing bans: 0 of " total_ips " (0.00%)" > "/dev/stderr"
     }
     {
-      ip=$1
-      total_count=$2
-      message_summary=$3
-      
-      // PROGRESS BAR LOGIC (Prints to stderr in real-time)
-      processed++
-      if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
-          printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, 
-          (processed / total_ips * 100) > "/dev/stderr"
-          fflush("/dev/stderr") // <--- Force immediate display
-      }
+        processed++
+        ip = $1
+        count = $2
+        description = $3
 
-      // =================================================================
-      // 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
-      // =================================================================
-      // Use quoted variables for safety inside AWK '\''s system() call
-      is_already_banned = system("ipset test \"" ip_set_name "\" \"" ip "\" 2>/dev/null")
-      if (is_already_banned == 0) {
-        next 
-      }
-      
-      // =================================================================
-      // The following checks only run for NEW, UNBANNED IPS
-      // =================================================================
-
-      // 🔑 OPTIMIZATION 2: WHITELIST CHECK (FAST Array Lookup)
-      if (ip in whitelisted_ips) {
-        print "IP " ip " is WHITELISTED in " allow_file ". Skipping ban."
-        next 
-      }
-      
-      // 2. GEOIP Lookup (FAST ARRAY LOOKUP)
-      country = geoip_map[ip]
-      if (country == "") {
-          country = "Unknown_Country"
-      }
-
-      is_new_ban_permanent = 0
-      protection_text = ""
-      
-      // PERMANENT BAN LOGIC (Uses in-memory count)
-      if (total_count >= max_violation_count && permanent_ban_count < max_perm_bans) {
-        protection_text = " [More than " max_violation_count " blocks, do not delete ]"
-        is_new_ban_permanent = 1
-        print "IP qualifies for permanent ban. Current permanent count: " permanent_ban_count
-      } else if (total_count >= max_violation_count) {
-        print "IP qualifies for permanent ban, but permanent limit (" max_perm_bans ") reached. Appending as rotatable entry."
-      }
-      
-      message="Total Violations: " total_count ". Triggers: [" message_summary "]" protection_text " (" country ")"
-      print "Blocking " ip " because " message // Prints to stdout (captured)
-
-      // 3. ROTATION LOGIC (IN MEMORY)
-      delete_index = 0
-      delete_type = "none"
-      
-      if (current_ban_count >= max_bans) {
-        print "Total ban limit (" max_bans ") reached. Checking for oldest rotatable entry."
-        
-        // Find the oldest rotatable IP (i.e., first non-"do not delete" line)
-        for(i = 1; i <= current_ban_count; i++) {
-            if (ban_list[i] != "" && ban_list[i] !~ /do not delete/) {
-                delete_index = i
-              
-                delete_type = "rotatable"
-                break
-            }
-        }
-        
-        // If no rotatable IPs, find the oldest permanent IP (only if the new ban is permanent)
-        if (delete_index == 0 && is_new_ban_permanent == 1) {
+        # 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
+        if (ip in ban_list) {
+            # IP is already in our tracking file, assume it is in the ipset (or will be shortly).
+            # We still need to check if the new violation count meets the permanent threshold.
             
-            print "WARNING: Total ban limit hit and all entries are permanent. Rotating oldest PERMANENT entry to make room."
-            for(i = 1; i <= current_ban_count; i++) {
-                if (ban_list[i] != "" && ban_list[i] ~ /do not delete/) {
-                    delete_index = i
-                    delete_type = "permanent"
-     
-                    break
+            if (ban_list[ip] !~ /do not delete/ && count >= max_violation_count) {
+                if (permanent_ban_count < max_permanent_bans) {
+                    message = "UPGRADED to permanent ban (Violations: " count ", " description ")"
+                    permanent_ban_count++
+                    
+                    # Update the line in ban_list to mark as permanent
+                    ban_list[ip] = ip " # [" current_date "] " message " (do not delete)"
+                    print "UPGRADED existing ban for IP: " ip " -> " message
+                } else {
+                    print "NOTICE: Permanent ban limit reached. IP " ip " remains in rotatable list."
                 }
+            } else {
+                # IP is already banned and status is not changing (either already permanent or still rotatable)
+                print "SKIPPED IP already banned: " ip " (Violations: " count ")"
+            }
+        } else {
+            # 🔑 OPTIMIZATION 2: IPSET ADD (Fast Kernel-level insertion)
+            # IP is new. Add to ipset and tracking file.
+            
+            # Check for permanent status first
+            is_new_ban_permanent = 0
+            message = "INSERTED new IP to ipset (Violations: " count ", " description ")"
+            
+            if (count >= max_violation_count && permanent_ban_count < max_permanent_bans) {
+                message = message " (do not delete)"
+                is_new_ban_permanent = 1
+            }
+            
+            # GeoIP Lookup (from map)
+            country = ip in geoip_map ? geoip_map[ip] : "Unknown_Country"
+            message = message " (" country ")"
+
+            # IPSET Insertion
+            system("ipset add \"" ip_set_name "\" \"" ip "\" -exist > /dev/null 2>&1")
+            
+            print "INSERTED new IP to ipset: " ip " -> " message
+
+            # Add to the ban_list array
+            ban_list[ip] = ip " # [" current_date "] " message
+            if (is_new_ban_permanent == 1) {
+                permanent_ban_count++
             }
         }
-      }
 
-      // 4. EXECUTE DELETION (Only runs if a rotating IP was found)
-      if (delete_index > 0) {
-        ip_to_delete_entry = ban_list[delete_index]
-      
-        // Extract IP only from the log entry (assuming IP is the first field)
-        match(ip_to_delete_entry, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)
-        ip_to_delete_only = substr(ip_to_delete_entry, RSTART, RLENGTH)
-
-        // Use quoted variables for safety inside AWK '\''s system() call
-        system("ipset del \"" ip_set_name "\" \"" ip_to_delete_only "\"")
-        print "DELETED oldest " delete_type " IP from ipset: " ip_to_delete_only // Prints to stdout (captured)
-        
-        // Remove the entry from the in-memory list
-        delete ban_list[delete_index]
-        current_ban_count--
-        if (delete_type == "permanent") {
-            permanent_ban_count--
+        # PROGRESS BAR LOGIC (Prints to stderr in real-time)
+        if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
+            printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, (processed / total_ips * 100) > "/dev/stderr"
+            fflush("/dev/stderr") # Force immediate display
         }
-      } 
-      
-      // 5. INSERTION 
-      // Use quoted variables for safety inside AWK '\''s system() call
-      system("ipset add \"" ip_set_name "\" \"" ip "\" -exist")
-      print "INSERTED new IP to ipset: " ip // Prints to stdout (captured)
-      
-     
-      // Add new entry to memory
-      current_ban_count++
-      // Use current_ban_count as the index, as '\''delete'\'' creates non-contiguous indices
-      // The writing logic in END handles this by iterating over the array values.
-      ban_list[current_ban_count] = ip " # [" current_date "] " message
-      if (is_new_ban_permanent == 1) {
-          permanent_ban_count++
-      }
     }
     END {
         if (total_ips > 0) {
-             // Prints to stderr in real-time
-             printf "Processing bans: %d of %d (100.00%%) - Complete.\\n" , total_ips, total_ips > "/dev/stderr"
+             # Prints to stderr in real-time
+             printf "Processing bans: %d of %d (100.00%%) - Complete.\n" , total_ips, total_ips > "/dev/stderr"
         }
         
-  
-        // FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
+        # 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
         for (i in ban_list) {
             if (ban_list[i] != "") {
                 print ban_list[i] > temp_tracking_file
             }
         }
         close(temp_tracking_file)
-    }' "$TEMP_UNIQUE_IPS"
+    }' "$TEMP_UNIQUE_IPS" 2>&1
 )
 LOG_SCAN_OUTPUT=${LOG_SCAN_OUTPUT_CMD}
 
@@ -1098,6 +1023,7 @@ if [ -s "$TEMP_TRACKING_FILE" ];
 then
     mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
 else
+    # This error message is what you saw in the original output, now it is only printed if the file actually fails to update.
     echo "ERROR: Tracking file update failed. File was empty or not created." >> /dev/stderr
 fi
 # ----------------------------------------
