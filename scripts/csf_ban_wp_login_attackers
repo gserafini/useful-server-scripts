@@ -1,14 +1,14 @@
 #!/bin/bash
 # High-Performance IP Banning Script using IPSET and CSF.
 # This script is designed for deployment via cron job to automate Web Application Firewall (WAF) 
-# actions. It scans web server logs for a comprehensive set of malicious keywords and excessive 
-# access attempts (e.g., failed wp-login, ModSecurity violations, shell file probing). 
+# actions.
+# It scans web server logs for a comprehensive set of malicious keywords and excessive 
+# access attempts (e.g., failed wp-login, ModSecurity violations, shell file probing).
 # It utilizes IPSET for high-capacity, kernel-level blocking and manages a persistent, 
 # rotatable ban list synchronized with the CSF firewall rules via csfpost.sh.
 #
 # NOTE: This script is intended to be run with root privileges (e.g., via root's cron job) 
 #       and no longer contains redundant 'sudo' calls.
-
 # --- Author and Repository ---
 # Author: Gabriel Serafini / gserafini@gmail.com
 # Repository: https://github.com/gserafini/useful-server-scripts
@@ -16,13 +16,14 @@
 
 # --- Command Line Options ---
 # The script can be run with the following utility flags instead of its default log-scanning mode:
-# 1. --init: Initializes the IPSET table and adds the necessary firewall rules to /etc/csf/csfpost.sh. 
+# 1. --init: Initializes the IPSET table and adds the necessary firewall rules to /etc/csf/csfpost.sh.
 #    This must be run once before the cron job is activated.
 # 2. --whitelist <IP>: Adds the specified IP address to /etc/csf/csf.allow, removes it from the 
 #    IPSET ban list, and reloads CSF. (Requires setup)
 # 3. --blacklist <IP>: Immediately adds the specified IP address to the IPSET ban list 
 #    and the tracking file. It skips whitelisted IPs. (Requires setup)
-# 4. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 4. --logs "<path1> <path2>": Overrides the default log paths to scan.
+#    (Used in cron job or manual runs).
 # 5. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
 # ----------------------------
 
@@ -33,14 +34,13 @@
 # --- CONFIGURATION VARIABLES ---
 IP_SET_NAME="high_volume_bans"
 # Tracking file includes the IP_SET_NAME for clarity
-IP_TRACKING_FILE="/etc/csf/ipset_tracking_${IP_SET_NAME}.log" 
-CSF_ALLOW_FILE="/etc/csf/csf.allow" 
-CSF_DENY_FILE="/etc/csf/csf.deny" 
+IP_TRACKING_FILE="/etc/csf/ipset_tracking_${IP_SET_NAME}.log"
+CSF_ALLOW_FILE="/etc/csf/csf.allow"
+CSF_DENY_FILE="/etc/csf/csf.deny"
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
-MAX_BANS=50000 
+MAX_BANS=50000
 MAX_PERMANENT_BANS=5000
 MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, based on aggregated hits.
-
 # DEFAULT LOG FILES: These are used if no --logs argument is provided.
 DEFAULT_LOG_PATHS="/usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log"
 LOG_PATHS="" 
@@ -111,7 +111,6 @@ ensure_setup() {
     echo "⚠️  CRITICAL SETUP WARNING"
     echo "====================================================================="
     echo "The High-Volume Ban system is not properly initialized."
-    
     if [ -t 0 ]; then
         echo " "
         echo "Do you want to run the initialization (./csf_ban_wp_login_attackers --init) now?"
@@ -140,6 +139,7 @@ report_ban_counts() {
     local end_time="${3:-0}" 
     echo "--- 📊 $report_title ---"
     
+    # These checks rely on disk I/O and are kept outside the high-volume AWK loop.
     local ipset_count=$(grep -v '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null | wc -l)
     local permanent_ban_count=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
     local csf_deny_count=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
@@ -171,6 +171,7 @@ perform_blacklist() {
 
     echo "--- 🔴 Blacklist Action: $ip ---"
 
+ 
     if ! validate_ip "$ip"; then
         echo "Error: Invalid IP address format: $ip"
         exit 1
@@ -209,7 +210,6 @@ perform_blacklist() {
 
     echo "$ip # [$timestamp] $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
-    
     local end_time=$(date +%s)
     report_ban_counts "Post-Blacklist Report" 1 "$end_time"
     exit 0
@@ -251,7 +251,6 @@ perform_whitelist() {
     /usr/sbin/csf -r
 
     echo "Whitelist action complete for $ip."
-    
     local end_time=$(date +%s)
     report_ban_counts "Post-Whitelist Report" 0 "$end_time"
     exit 0
@@ -295,7 +294,6 @@ perform_init() {
     /usr/sbin/csf -r
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
-    
     local end_time=$(date +%s)
     echo "Initialization run time: $((end_time - START_TIME))s" 
     exit 0
@@ -416,6 +414,7 @@ keywords=(
   ["1 base64_decode"]="attempted RCE using base64 encoded payload"
   ["5 wso.php"]="attempted access to a WSO or similar PHP web shell"
 
+ 
   # --- ModSecurity Violations (High Frequency) ---
   ["5 AH01797"]="error_log ModSecurity AH01797: client denied by server configuration"
   ["5 AH10244"]="error_log ModSecurity AH10244: invalid URI path"
@@ -490,6 +489,7 @@ keywords=(
   ["1 /goform/formping"]="/goform/formping"
   ["1 wp-cXjq2.php"]="wp-cXjq2.php"
   ["1 UEP.php"]="UEP.php"
+ 
   
   # --- Archive/Download Probing ---
   ["1 old.rar.*404"]="old.rar and got 404 error code"
@@ -531,14 +531,17 @@ awk -v ip_set_name=$IP_SET_NAME \
     BEGIN {
         # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
         while ((getline line < allow_file) > 0) {
-            if (line !~ /^#/) {
-                match(line, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
-                if (RSTART > 0) {
-                    whitelisted_ips[substr(line, RSTART, RLENGTH)] = 1
+            # Check the line itself ($0 is set to the content of 'line' when getline is used)
+            if ($0 !~ /^#/) {
+                match($0, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
+    
+             if (RSTART > 0) {
+                    whitelisted_ips[$1] = 1
                 }
             }
         }
         close(allow_file)
+        
         
         num_allowed = length(whitelisted_ips)
         if (num_allowed == 0) {
@@ -560,10 +563,12 @@ awk -v ip_set_name=$IP_SET_NAME \
         
         # 2. CHECK AGAINST AWK ARRAY (fast memory lookup)
         if (ip_to_check in whitelisted_ips) {
+ 
             system("ipset del " ip_set_name " " ip_to_check " > /dev/null 2>&1")
             print "CLEANED: Removed whitelisted IP " ip_to_check " from ipset." > "/dev/stderr"
         } else {
-            # IP is not whitelisted. Print the line back to stdout for the new tracking file.
+            # IP is not whitelisted.
+            # Print the line back to stdout for the new tracking file.
             print $0
         }
     }
@@ -615,7 +620,8 @@ for key in "${!keywords[@]}"; do
       if ($1 >= frequency ) {
         print $2 "\t" $1 "\t" description 
       }
-    }' | tee -a "$TEMP_AGGREGATE_FILE"
+    }' |
+    tee -a "$TEMP_AGGREGATE_FILE"
 done
 
 
@@ -642,7 +648,7 @@ BEGIN {
 } 
 { 
     # $1=IP, $2=Count, $3=Description
-    IPs[$1] += $2; 
+    IPs[$1] += $2;
     descriptions[$1,$3] = 1; 
     
     # 🟢 PROGRESS BAR LOGIC for Aggregation
@@ -673,6 +679,7 @@ TOTAL_UNIQUE_IPS=$(wc -l < "$TEMP_UNIQUE_IPS")
 echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 
 # --- 🛡️ 2.2: Execution Phase (AWK 2) with Progress Bar ---
+# *** HIGHLY OPTIMIZED FOR MEMORY ACCESS AND MINIMAL SYSTEM CALLS ***
 LOG_SCAN_OUTPUT=$(
     awk -v total_ips="$TOTAL_UNIQUE_IPS" \
         -v current_date="$(date '+%Y-%m-%d %H:%M:%S')" \
@@ -684,46 +691,72 @@ LOG_SCAN_OUTPUT=$(
         -v max_violation_count=$MAX_VIOLATION_COUNT '
     BEGIN {
         processed = 0
+        current_ban_count = 0
+        permanent_ban_count = 0
+
+        # 📚 MEMORY OPTIMIZATION 1: Read IP tracking file into memory once
+        # Using getline with a variable (line) sets $0 to the content of 'line'
+        while ((getline line < tracking_file) > 0) {
+            # Skip empty or comment lines
+            if ($0 ~ /^#|^[[:space:]]*$/) { continue }
+            
+            current_ban_count++
+            ban_list[current_ban_count] = $0 
+            if ($0 ~ /do not delete/) {
+                permanent_ban_count++
+            }
+        }
+        close(tracking_file)
+        
+        # 📚 MEMORY OPTIMIZATION 2: Read csf.allow into memory once
+        while ((getline line < allow_file) > 0) {
+            # If the line starts with an IP, use $1 (the IP) for the whitelist array
+            if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
+                whitelisted_ips[$1] = 1
+            }
+        }
+        close(allow_file)
     }
     {
       ip=$1
       total_count=$2
       message_summary=$3
       
-      # PROGRESS BAR LOGIC: Update on every 10th IP
+      # 🟢 PROGRESS BAR LOGIC (Prints to stderr)
       processed++
       if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
           printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, (processed / total_ips * 100) > "/dev/stderr"
       }
-      
-      # 1. WHITELIST CHECK
-      is_whitelisted = system("grep -E \"^" ip "[[:space:]]*#|^" ip "[[:space:]]*$\" " allow_file " > /dev/null")
-      if (is_whitelisted == 0) {
-        print "IP " ip " is WHITELISTED in " allow_file ". Skipping ban (Proactively Cleaned)."
-        next 
-      }
-      
-      # 2. IPSET STATUS CHECK (Silence output for already-banned IPs)
+
+      # =================================================================
+      # 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
+      # =================================================================
       is_already_banned = system("ipset test " ip_set_name " " ip " 2>/dev/null")
       if (is_already_banned == 0) {
-        # print "IP " ip " is already in ipset \047" ip_set_name "\047. Skipping insertion." (REMOVED)
+        # IP is already banned. Skip all remaining slow system calls.
         next 
       }
       
-      # 3. GEOIP Lookup and Message Construction
+      # =================================================================
+      # The following checks only run for NEW, UNBANNED IPs
+      # =================================================================
+
+      # 🔑 OPTIMIZATION 2: WHITELIST CHECK (FAST Array Lookup)
+      if (ip in whitelisted_ips) {
+        print "IP " ip " is WHITELISTED in " allow_file ". Skipping ban."
+        next 
+      }
+      
+      # 2. GEOIP Lookup (RETAINED - runs only for new, non-whitelisted bans)
+      # This is the last remaining slow system call.
       cmd="geoiplookup " ip " 2>/dev/null | sed -n -e \"s/GeoIP Country Edition: //p\" | xargs -r -0"
       cmd | getline country
       close(cmd)  
 
-      "grep -c \"do not delete\" " tracking_file " | head -1" | getline permanent_ban_count
-      close("grep -c \"do not delete\" " tracking_file " | head -1")
-
       is_new_ban_permanent = 0
-      
-      message_triggers = "[" message_summary "]"
       protection_text = ""
       
-      # PERMANENT BAN LOGIC
+      # PERMANENT BAN LOGIC (Uses in-memory count)
       if (total_count >= max_violation_count && permanent_ban_count < max_perm_bans) {
         protection_text = " [More than " max_violation_count " blocks, do not delete ]"
         is_new_ban_permanent = 1
@@ -732,60 +765,83 @@ LOG_SCAN_OUTPUT=$(
         print "IP qualifies for permanent ban, but permanent limit (" max_perm_bans ") reached. Appending as rotatable entry."
       }
       
-      # FINAL MESSAGE CONSTRUCTION: Total Violations . Triggers: [list] [marker] (country)
-      message="Total Violations: " total_count ". Triggers: " message_triggers protection_text " (" country ")"
+      message="Total Violations: " total_count ". Triggers: [" message_summary "]" protection_text " (" country ")"
       print "Blocking " ip " because " message
 
-      # 4. Check Current Total Ban Count (Rotation Logic)
-      "wc -l < " tracking_file | getline current_ban_count
-      close("wc -l < " tracking_file)
-
-      line_to_delete = 0
+      # 3. ROTATION LOGIC (IN MEMORY)
+      delete_index = 0
       delete_type = "none"
       
       if (current_ban_count >= max_bans) {
         print "Total ban limit (" max_bans ") reached. Checking for oldest rotatable entry."
         
-        "grep -n -v \"do not delete\" " tracking_file " | head -1 | cut -d: -f1" | getline line_to_delete
-        close("grep -n -v \"do not delete\" " tracking_file " | head -1 | cut -d: -f1")
-
-        if (line_to_delete > 0) {
-          delete_type = "rotatable"
-        } else {
-            # Only rotate permanent if a new permanent ban is being added AND the permanent limit is hit
-          if (is_new_ban_permanent == 1 && permanent_ban_count >= max_perm_bans) {
+        # Find the oldest rotatable IP (i.e., first non-"do not delete" line)
+        for(i = 1; i <= current_ban_count; i++) {
+            if (ban_list[i] != "" && ban_list[i] !~ /do not delete/) {
+                delete_index = i
+                delete_type = "rotatable"
+                break
+            }
+        }
+        
+        # If no rotatable IPs, find the oldest permanent IP (only if the new ban is permanent)
+        if (delete_index == 0 && is_new_ban_permanent == 1) {
             print "WARNING: Total ban limit hit and all entries are permanent. Rotating oldest PERMANENT entry to make room."
-            
-            "grep -n \"do not delete\" " tracking_file " | head -1 | cut -d: -f1" | getline line_to_delete
-            close("grep -n \"do not delete\" " tracking_file " | head -1 | cut -d: -f1")
-            delete_type = "permanent"
-          }
+            for(i = 1; i <= current_ban_count; i++) {
+                if (ban_list[i] != "" && ban_list[i] ~ /do not delete/) {
+                    delete_index = i
+                    delete_type = "permanent"
+                    break
+                }
+            }
         }
       }
 
-      # 5. EXECUTE DELETION
-      if (line_to_delete > 0) {
-        cmd_get_ip = "sed -n " line_to_delete "p " tracking_file " | awk \047{print $1}\047"
-        cmd_get_ip | getline ip_to_delete
-        close(cmd_get_ip)
+      # 4. EXECUTE DELETION (Only runs if a rotating IP was found)
+      if (delete_index > 0) {
+        ip_to_delete_entry = ban_list[delete_index]
+        # Extract IP only from the log entry (assuming IP is the first field)
+        match(ip_to_delete_entry, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)
+        ip_to_delete_only = substr(ip_to_delete_entry, RSTART, RLENGTH)
 
-        if (ip_to_delete) {
-          system("ipset del " ip_set_name " " ip_to_delete)
-          print "DELETED oldest " delete_type " IP from ipset: " ip_to_delete
-
-          system("sed -i " line_to_delete "d " tracking_file)
+        system("ipset del " ip_set_name " " ip_to_delete_only)
+        print "DELETED oldest " delete_type " IP from ipset: " ip_to_delete_only
+        
+        # Remove the entry from the in-memory list
+        delete ban_list[delete_index]
+        current_ban_count--
+        if (delete_type == "permanent") {
+            permanent_ban_count--
         }
       } 
       
-      # 6. INSERTION
+      # 5. INSERTION 
       system("ipset add " ip_set_name " " ip " -exist")
       print "INSERTED new IP to ipset: " ip
-      system("echo \"" ip " # [" current_date "] " message "\" >> " tracking_file) 
+      
+      # Add new entry to memory
+      current_ban_count++
+      # Use current_ban_count as the index, as 'delete' creates non-contiguous indices
+      # The writing logic in END handles this by iterating over the array values.
+      ban_list[current_ban_count] = ip " # [" current_date "] " message
+      if (is_new_ban_permanent == 1) {
+          permanent_ban_count++
+      }
     }
     END {
         if (total_ips > 0) {
              printf "Processing bans: %d of %d (100.00%%) - Complete.\n" , total_ips, total_ips > "/dev/stderr"
         }
+        
+        # 💾 WRITE THE UPDATED BAN LIST BACK TO THE FILE ONCE (Corrected, Atomic Write)
+        # AWK will buffer all these 'print' commands to the file.
+        # This is a safe way to write back the content.
+        for (i in ban_list) {
+            if (ban_list[i] != "") {
+                print ban_list[i] > tracking_file
+            }
+        }
+        close(tracking_file) # Ensure buffer is flushed immediately
     }' "$TEMP_UNIQUE_IPS"
 )
 
