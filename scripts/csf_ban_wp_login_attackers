@@ -540,7 +540,7 @@ awk -v ip_set_name=$IP_SET_NAME \
     BEGIN {
         # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
         while ((getline line < allow_file) > 0) {
-            # Check the line itself ($0 is set to the content of 'line' when getline is used)
+            # Check the line itself ($0 is set to the content of \'line\' when getline is used)
             if ($0 !~ /^#/) {
                 match($0, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
     
@@ -714,14 +714,13 @@ echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 
 
 # --- 🛡️ 2.15: Batch GeoIP Lookup (ROBUST CACHING FIX) ---
-echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
+echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > "/dev/stderr"
 
 # 1. Load existing IPs and their countries from the tracking file into a temporary file using robust AWK parsing
 TOTAL_TRACKING_LINES_FOR_CACHE=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
-echo "Parsing $TOTAL_TRACKING_LINES_FOR_CACHE existing bans for GeoIP caching..." > /dev/stderr
+echo "Parsing $TOTAL_TRACKING_LINES_FOR_CACHE existing bans for GeoIP caching..." > "/dev/stderr"
 
-# FIX: Using gensub (GNU AWK feature) for a more robust extraction of the country name 
-# from the end of the log line, which includes the variable [do not delete] flag.
+# **FIXED AWK BLOCK** using universally supported 'match' and 'substr' instead of fragile regex functions
 awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
     -v temp_cache_file="$TEMP_CACHE_EXTRACTION" '
     BEGIN {
@@ -736,14 +735,18 @@ awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
 
         ip = $1;
         
-        # gensub matches the entire line ($0) and extracts the content of the first captured group (\1).
-        # Pattern: look for any characters (^.*), followed by a space, then the last '(Country)' group, 
-        # then optional trailing spaces ($). [[:print:]]+ matches any printable character inside the parenthesis.
-        country = gensub(/^.* \(([[:print:]]+)\)[[:space:]]*$/, "\\1", 1, $0);
+        # Pattern: find the last pair of parentheses (Country)
+        # Match a pattern that starts with an opening parenthesis, followed by alphanumeric/space/underscore, 
+        # and ends with a closing parenthesis at the end of the line (with optional trailing space).
+        if (match($0, /\(([A-Za-z0-9_ ]+)\)[[:space:]]*$/)) {
+            # RSTART is the start of the match. RLENGTH is the length.
+            # RSTART + 1 skips the opening parenthesis. RLENGTH - 2 removes both parentheses.
+            country = substr($0, RSTART + 1, RLENGTH - 2);
+        } else {
+            country = "";
+        }
 
-        # Check if extraction was successful (gensub replaces the whole string if successful, 
-        # otherwise returns the original, which will contain 'ip').
-        if (country != $0 && country != "" && country != "Unknown_Country") {
+        if (country != "" && country != "Unknown_Country") {
             print ip "\t" country > temp_cache_file;
         }
     }
@@ -803,7 +806,7 @@ echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # --- END BATCH GEOIP LOOKUP ---
 
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
-echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
+echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > "/dev/stderr"
 
 # --- 🛡️ 2.2: Execution Phase (AWK 2) ---
 # This phase is now incredibly fast as it uses in-memory data.
@@ -911,7 +914,7 @@ LOG_SCAN_OUTPUT=$(
       if (current_ban_count >= max_bans) {
         print "Total ban limit (" max_bans ") reached. Checking for oldest rotatable entry."
         
-        # Find the oldest rotatable IP (i.e., first non-"do not delete" line)
+        # Find the oldest rotatable IP (i.e., first non-\"do not delete\" line)
         for(i = 1; i <= current_ban_count; i++) {
             if (ban_list[i] != "" && ban_list[i] !~ /do not delete/) {
                 delete_index = i
@@ -957,7 +960,7 @@ LOG_SCAN_OUTPUT=$(
       
       # Add new entry to memory
       current_ban_count++
-      # Use current_ban_count as the index, as 'delete' creates non-contiguous indices
+      # Use current_ban_count as the index, as \'delete\' creates non-contiguous indices
       # The writing logic in END handles this by iterating over the array values.
       ban_list[current_ban_count] = ip " # [" current_date "] " message
       if (is_new_ban_permanent == 1) {
