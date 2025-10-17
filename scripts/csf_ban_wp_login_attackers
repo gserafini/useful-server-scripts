@@ -6,9 +6,8 @@
 # access attempts (e.g., failed wp-login, ModSecurity violations, shell file probing).
 # It utilizes IPSET for high-capacity, kernel-level blocking and manages a persistent, 
 # rotatable ban list synchronized with the CSF firewall rules via csfpost.sh.
-#
-# NOTE: This script is intended to be run with root privileges (e.g., via root's cron job) 
-#       and no longer contains redundant 'sudo' calls.
+# NOTE: This script must be run with root privileges (e.g., via root's cron job)
+
 # --- Author and Repository ---
 # Author: Gabriel Serafini / gserafini@gmail.com
 # Repository: https://github.com/gserafini/useful-server-scripts
@@ -64,7 +63,7 @@ START_TIME=${START_TIME_CMD}
 validate_ip() {
     local ip=$1
     if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]];
-    then
+then
         return 0 
     else
         return 1 
@@ -107,8 +106,7 @@ is_setup_complete() {
     path_cmd=$(get_iptables_path)
     iptables_path=${path_cmd}
     
-    if [ -z "$iptables_path" ];
-    then
+    if [ -z "$iptables_path" ]; then
         return 1
     fi
     local iptables_rule_line="$iptables_path -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
@@ -120,8 +118,7 @@ is_setup_complete() {
 
 # Function to enforce setup or offer to initialize
 ensure_setup() {
-    if is_setup_complete;
-    then
+    if is_setup_complete; then
         return 0
     fi
 
@@ -135,8 +132,7 @@ ensure_setup() {
         echo "Do you want to run the initialization (./csf_ban_wp_login_attackers --init) now?"
         read -r -p "Type 'yes' to initialize, or 'no' to exit: " response
         
-        if [[ "$response" =~ ^[Yy][Ee][Ss]$ ]];
-        then
+        if [[ "$response" =~ ^[Yy][Ee][Ss]$ ]]; then
             echo "Running initialization..."
             perform_init
         else
@@ -168,6 +164,7 @@ report_ban_counts() {
     local permanent_ban_count=${permanent_ban_count_cmd}
 
     local csf_deny_count_cmd
+    # FIX: Combined pipeline to a single line to prevent command expansion parsing errors.
     csf_deny_count_cmd=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
     local csf_deny_count=${csf_deny_count_cmd}
 
@@ -176,13 +173,11 @@ report_ban_counts() {
     echo "Permanent IPs ('do not delete'): $permanent_ban_count / $MAX_PERMANENT_BANS"
     echo "Total IPs in CSF Deny File '$CSF_DENY_FILE': $csf_deny_count"
     
-    if [ "$new_bans_count" -gt 0 ];
-    then
+    if [ "$new_bans_count" -gt 0 ]; then
         echo "New IPs added to blacklist: $new_bans_count"
     fi
 
-    if [ "$end_time" -gt "$START_TIME" ];
-    then
+    if [ "$end_time" -gt "$START_TIME" ]; then
         local elapsed_time=$((end_time - START_TIME))
         local minutes=$((elapsed_time / 60))
         local seconds=$((elapsed_time % 60))
@@ -200,7 +195,8 @@ perform_blacklist() {
     local timestamp_cmd
     timestamp_cmd=$(date "+%Y-%m-%d %H:%M:%S")
     local timestamp=${timestamp_cmd}
-    local country=""
+   
+ local country=""
 
     echo "--- 🔴 Blacklist Action: $ip ---"
 
@@ -211,14 +207,12 @@ perform_blacklist() {
     fi
 
     # FIX: Use braces around simple variable to prevent SC2015 warning
-    if grep -q "^${ip}[[:space:]]*" "$CSF_ALLOW_FILE";
-    then
+    if grep -q "^${ip}[[:space:]]*" "$CSF_ALLOW_FILE"; then
         echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Skipping blacklist action."
         exit 0
     fi
 
-    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null;
-    then
+    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
         echo "IP $ip is already in ipset: $IP_SET_NAME. Skipping insertion."
         local end_time_cmd
         end_time_cmd=$(date +%s)
@@ -234,6 +228,7 @@ perform_blacklist() {
     country=${country:-"Unknown_Country"}
 
 
+ 
     local message="Manually blacklisted via --blacklist"
     
     local current_ban_count_cmd
@@ -246,16 +241,14 @@ perform_blacklist() {
 
     message="$message ($country)"
 
-    if ipset add "$IP_SET_NAME" "$ip" -exist;
-    then
+    if ipset add "$IP_SET_NAME" "$ip" -exist; then
         echo "Added $ip to ipset: $IP_SET_NAME."
     else
         echo "ERROR: Failed to add $ip to ipset. Check ipset utility and permissions."
         exit 1
     fi
 
-    echo "$ip # [$timestamp] $message" |
-    tee -a "$IP_TRACKING_FILE" > /dev/null
+    echo "$ip # [$timestamp] $message" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     local end_time_cmd
     end_time_cmd=$(date +%s)
@@ -277,15 +270,13 @@ perform_whitelist() {
 
     # FIX: Use braces around simple variable to prevent SC2015 warning
     if ! grep -q "^${ip}[[:space:]]*" "$CSF_ALLOW_FILE"; then
-        echo "$ip $comment" |
-        tee -a "$CSF_ALLOW_FILE" > /dev/null
+        echo "$ip $comment" | tee -a "$CSF_ALLOW_FILE" > /dev/null
         echo "Added $ip to $CSF_ALLOW_FILE."
     else
         echo "$ip is already present in $CSF_ALLOW_FILE."
     fi
 
-    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null;
-    then
+    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
         ipset del "$IP_SET_NAME" "$ip"
         echo "Removed $ip from ipset: $IP_SET_NAME."
     else
@@ -296,8 +287,7 @@ perform_whitelist() {
     line_number_cmd=$(grep -n "^$ip " "$IP_TRACKING_FILE" 2>/dev/null | cut -d: -f1 | head -1)
     local line_number=${line_number_cmd}
 
-    if [ -n "$line_number" ];
-    then
+    if [ -n "$line_number" ]; then
         sed -i "${line_number}d" "$IP_TRACKING_FILE"
         echo "Removed $ip from tracking file: $IP_TRACKING_FILE (Line: $line_number)."
     else
@@ -325,8 +315,7 @@ perform_init() {
     path_cmd=$(get_iptables_path)
     iptables_path=${path_cmd}
     
-    if [ -z "$iptables_path" ];
-    then
+    if [ -z "$iptables_path" ]; then
         echo "ERROR: Cannot find a valid path for the iptables executable. Initialization cannot proceed."
         exit 1
     fi
@@ -343,20 +332,16 @@ perform_init() {
 
     echo "2. Adding IPSET creation command to $CSF_POST_FILE..."
     if ! grep -q "$ip_set_line" "$CSF_POST_FILE"; then
-        echo -e "\n# Rule added by $0 for high-volume IP banning\n$ip_set_line" |
-        tee -a "$CSF_POST_FILE" > /dev/null
+        echo -e "\n# Rule added by $0 for high-volume IP banning\n$ip_set_line" | tee -a "$CSF_POST_FILE" > /dev/null
     fi
 
     echo "3. Adding portable iptables DROP rule ($iptables_path) for IPSET to $CSF_POST_FILE..."
     if ! grep -q "$iptables_rule_line" "$CSF_POST_FILE"; then
-        echo "$iptables_rule_line" |
-        tee -a "$CSF_POST_FILE" > /dev/null
+        echo "$iptables_rule_line" | tee -a "$CSF_POST_FILE" > /dev/null
     fi
 
     echo "4. Ensuring tracking file $IP_TRACKING_FILE exists..."
-    touch "$IP_TRACKING_FILE" ||
-    { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1;
-    }
+    touch "$IP_TRACKING_FILE" || { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1; }
 
     echo "5. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
@@ -378,12 +363,10 @@ perform_clear() {
     echo "⚠️  DANGER: FULL IPSET CLEAR ACTION"
     echo "====================================================================="
     
-    if [ -t 0 ];
-    then
+    if [ -t 0 ]; then
         read -r -p "ARE YOU SURE you want to clear ALL $IP_SET_NAME bans? Type 'YES' to proceed: " response
         
-        if [[ "$response" != "YES" ]];
-        then
+        if [[ "$response" != "YES" ]]; then
             echo "Clear action aborted by user. No changes were made."
             exit 0
         fi
@@ -394,16 +377,14 @@ perform_clear() {
     
     echo "Proceeding with full IPSET flush and tracking file clear..."
     
-    if ipset flush "$IP_SET_NAME";
-    then
+    if ipset flush "$IP_SET_NAME"; then
         echo "Successfully flushed all entries from ipset: $IP_SET_NAME."
     else
         echo "ERROR: Failed to flush ipset '$IP_SET_NAME'."
         exit 1
     fi
     
-    if truncate -s 0 "$IP_TRACKING_FILE";
-    then
+    if truncate -s 0 "$IP_TRACKING_FILE"; then
         echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE."
     else
         true > "$IP_TRACKING_FILE"
@@ -431,8 +412,7 @@ TEMP_ARGS=${TEMP_ARGS_CMD}
 if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; fi
 eval set -- "$TEMP_ARGS"
 
-while true;
-do
+while true; do
   case "$1" in
     --init )
       perform_init
@@ -470,8 +450,7 @@ do
   esac
 done
 
-if [ -z "$LOG_PATHS" ];
-then
+if [ -z "$LOG_PATHS" ]; then
     LOG_PATHS="$DEFAULT_LOG_PATHS"
 fi
 # --- END ARGUMENT HANDLING ---
@@ -617,6 +596,7 @@ gawk -v ip_set_name="$IP_SET_NAME" \
                 if (RSTART > 0) {
                     whitelisted_ips[$1] = 1
                 }
+     
             }
      
         }
@@ -661,8 +641,7 @@ gawk -v ip_set_name="$IP_SET_NAME" \
         }
     }' "$IP_TRACKING_FILE" > /tmp/ipset_tracking_new.log
 
-if [ -f /tmp/ipset_tracking_new.log ];
-then
+if [ -f /tmp/ipset_tracking_new.log ]; then
     mv /tmp/ipset_tracking_new.log "$IP_TRACKING_FILE"
     echo "Tracking file updated. Whitelisted IPs removed from the blacklist."
 else
@@ -688,7 +667,7 @@ for key in "${!keywords[@]}"; do
     # SC2086 Fix: Quote command substitutions
     current_keyword=$(echo "${key}" | cut -d" " -f2)
     echo " "
-    echo "[$KEYWORD_COUNT/$TOTAL_KEYWORDS] 👀 Scanning logs for keyword: '${current_keyword}'" > /dev/stderr
+    echo "👀 [$KEYWORD_COUNT/$TOTAL_KEYWORDS] Scanning logs for keyword: '${current_keyword}'" > "/dev/stderr"
 
     # SC2086 Fix: Quote command substitutions
     frequency=$(( $( echo "${key}" | cut -d" " -f1) ))
@@ -696,11 +675,11 @@ for key in "${!keywords[@]}"; do
     keyword=$( echo "${key}" | cut -d" " -f2)
     description=${keywords[${key}]}
 
+  
     # shellcheck disable=SC2086 # $LOG_PATHS must be unquoted for intentional word splitting (to scan multiple log paths)
     grep -r "$keyword" $LOG_PATHS 2>/dev/null |
-    # SC2196 Fix: Replace deprecated egrep with grep -E
-    grep -E -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
-    sed 's/://' |
+    # ⬆️ Improvement 1: Use PCRE (grep -P) and positive lookbehind to eliminate the slow 'sed' pipe.
+    grep -P -o '(?<=[ :])\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' |
     sort | 
     uniq -c |
     gawk -v frequency="${frequency}" \
@@ -710,8 +689,7 @@ for key in "${!keywords[@]}"; do
       if ($1 >= frequency ) {
         print $2 "\t" $1 "\t" description 
       }
-    }' |
-    tee -a "$TEMP_AGGREGATE_FILE"
+    }' | tee -a "$TEMP_AGGREGATE_FILE"
 done
 
 
@@ -744,7 +722,6 @@ BEGIN {
     IPs[$1] += $2;
     # Portable single-dimension array with combined key
     description_list[$1, $3] = 1;
-
     # PROGRESS BAR LOGIC for Aggregation
     processed++;
     if (total_lines > 0 && (processed % 1000 == 0 || processed == 1 || processed == total_lines)) {
@@ -786,6 +763,7 @@ END {
                 } else {
                     summary_string = summary_string ", " temp_desc_arr[ip, i] # Subsequent items with separator
                 }
+       
             }
      
             print ip, IPs[ip], summary_string
@@ -802,7 +780,7 @@ echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 
 
 # --- 🛡️ 2.15: Batch GeoIP Lookup (ROBUST CACHING FIX) ---
-echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
+echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > "/dev/stderr"
 
 # 1. Load existing IPs and their countries from the tracking file into a temporary file using robust AWK parsing
 TOTAL_TRACKING_LINES_FOR_CACHE_CMD=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
@@ -845,10 +823,8 @@ gawk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
 # Load the simple IP\tCountry file into the shell array for fast lookup
 declare -A existing_ips_map
 total_existing_ips=0
-while IFS=$'\t' read -r ip country;
-do
-    if [[ -n "$ip" && -n "$country" ]];
-    then
+while IFS=$'\t' read -r ip country; do
+    if [[ -n "$ip" && -n "$country" ]]; then
         existing_ips_map["$ip"]="$country"
         total_existing_ips=$((total_existing_ips + 1))
     fi
@@ -862,16 +838,14 @@ IPS_TO_LOOKUP=0
 
 # FIX: Changed 'total_count message_summary' to a single underscore '_' 
 # to explicitly mark them as unused in this loop.
-while read -r ip _;
-do
+while read -r ip _; do
     PROCESSED_COUNT=$((PROCESSED_COUNT + 1))
     
     COUNTRY=""
     
     # Check if IP is already known (fast shell array lookup)
     # FIX: Use braces when expanding arrays: ${existing_ips_map["$ip"]} (applied in previous step)
-    if [[ -n ${existing_ips_map["$ip"]} ]];
-    then
+    if [[ -n ${existing_ips_map["$ip"]} ]]; then
         COUNTRY="${existing_ips_map["$ip"]}"
     else
         # IP is new, perform the lookup
@@ -901,7 +875,7 @@ echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # --- END BATCH GEOIP LOOKUP ---
 
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
-echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
+echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > "/dev/stderr"
 # NOTE: The outer command block no longer captures stderr (it now prints to console).
 # It only captures stdout (where "INSERTED" and "UPGRADED" messages are printed).
 LOG_SCAN_OUTPUT_CMD=$(
@@ -928,6 +902,7 @@ LOG_SCAN_OUTPUT_CMD=$(
                 if (line ~ /do not delete/) {
                     permanent_ban_count++
                 }
+   
             }
         }
         close(tracking_file)
@@ -937,6 +912,7 @@ LOG_SCAN_OUTPUT_CMD=$(
             split(line, parts, "\t")
             geoip_map[parts[1]] = parts[2]
         }
+    
         close(temp_geoip_mapping)
 
         processed = 0
@@ -948,6 +924,7 @@ LOG_SCAN_OUTPUT_CMD=$(
         print "Processing bans: 0 of " total_ips " (0.00%)" > "/dev/stderr"
     }
     {
+        
         processed++
         ip = $1
         count = $2
@@ -956,15 +933,15 @@ LOG_SCAN_OUTPUT_CMD=$(
         # 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
         if (ip in ban_list) {
             # IP is already in our tracking file, assume it is in the ipset (or will be shortly).
-            
             if (ban_list[ip] !~ /do not delete/ && count >= max_violation_count) {
                 if (permanent_ban_count < max_permanent_bans) {
                     message = "UPGRADED to permanent ban [Violations: " count ", " description "]"
                     permanent_ban_count++
-                    
+                  
                     # Update the line in ban_list to mark as permanent
                     ban_list[ip] = ip " # [" current_date "] " message " (do not delete)"
                     print "UPGRADED existing ban for IP: " ip " -> " message
+     
                 } else {
                     print "NOTICE: Permanent ban limit reached. IP " ip " remains in rotatable list."
                 }
@@ -992,6 +969,7 @@ LOG_SCAN_OUTPUT_CMD=$(
             
             print "INSERTED new IP to ipset: " ip " -> " message
 
+        
             # Add to the ban_list array
             ban_list[ip] = ip " # [" current_date "] " message
             if (is_new_ban_permanent == 1) {
@@ -1000,11 +978,13 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
 
         # PROGRESS BAR LOGIC (Prints to stderr in real-time)
+  
         if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
             # The progress bar is printed to standard error
             printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, (processed / total_ips * 100) > "/dev/stderr"
             fflush("/dev/stderr") # Force immediate display
         }
+    
     }
     END {
         if (total_ips > 0) {
@@ -1013,6 +993,7 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
         
         # 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
+   
         for (i in ban_list) {
             if (ban_list[i] != "") {
                 print ban_list[i] > temp_tracking_file
@@ -1020,17 +1001,15 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
         close(temp_tracking_file)
     }' "$TEMP_UNIQUE_IPS" 
-) # The '2>&1' that caused the issue has been removed from here.
-
+) 
 LOG_SCAN_OUTPUT=${LOG_SCAN_OUTPUT_CMD}
 
 # --- 💾 FIXED: ATOMIC FILE REPLACEMENT ---
-if [ -s "$TEMP_TRACKING_FILE" ];
-then
+if [ -s "$TEMP_TRACKING_FILE" ]; then
     mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
 else
     # This error message is what you saw in the original output, now it is only printed if the file actually fails to update.
-    echo "ERROR: Tracking file update failed. File was empty or not created." >> /dev/stderr
+    echo "ERROR: Tracking file update failed. File was empty or not created." >> "/dev/stderr"
 fi
 # ----------------------------------------
 
