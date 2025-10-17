@@ -53,6 +53,8 @@ TEMP_UNIQUE_IPS=$(mktemp)
 TEMP_TRACKING_FILE=$(mktemp)
 # NEW: Temporary file to cache the IP -> Country map
 TEMP_GEOIP_MAPPING=$(mktemp)
+# NEW: Temporary file to hold the robustly extracted cache
+TEMP_CACHE_EXTRACTION=$(mktemp)
 
 # --- TIMING VARIABLE ---
 START_TIME=$(date +%s)
@@ -520,7 +522,7 @@ echo " "
 date
 
 # Ensure temporary files are cleaned up on exit
-trap "rm -f $TEMP_AGGREGATE_FILE $TEMP_UNIQUE_IPS $TEMP_TRACKING_FILE $TEMP_GEOIP_MAPPING" EXIT
+trap "rm -f $TEMP_AGGREGATE_FILE $TEMP_UNIQUE_IPS $TEMP_TRACKING_FILE $TEMP_GEOIP_MAPPING $TEMP_CACHE_EXTRACTION" EXIT
 
 # 1. INITIAL REPORTING (Reflects state before any changes in this run)
 report_ban_counts "Pre-Run Ban Report"
@@ -711,44 +713,51 @@ TOTAL_UNIQUE_IPS=$(wc -l < "$TEMP_UNIQUE_IPS")
 echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 
 
-# --- 🛡️ 2.15: Batch GeoIP Lookup (THE SPEED FIX + NEW CACHING/PROGRESS) ---
+# --- 🛡️ 2.15: Batch GeoIP Lookup (ROBUST CACHING FIX) ---
 echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
 
-# 1. Load existing IPs and their countries from the tracking file into a shell array
-declare -A existing_ips_map
-total_existing_ips=0 
+# 1. Load existing IPs and their countries from the tracking file into a temporary file using robust AWK parsing
 TOTAL_TRACKING_LINES_FOR_CACHE=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
-CACHE_PROCESSED_COUNT=0
+echo "Parsing $TOTAL_TRACKING_LINES_FOR_CACHE existing bans for GeoIP caching..." > /dev/stderr
 
-echo "Reading existing bans for GeoIP caching (Total lines: $TOTAL_TRACKING_LINES_FOR_CACHE)..." > /dev/stderr
+# Use AWK for robust extraction of IP and Country from the tracking file using standard regex matching.
+awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
+    -v temp_cache_file="$TEMP_CACHE_EXTRACTION" '
+    BEGIN {
+        FS="[[:space:]]+";
+        processed = 0;
+    }
+    {
+        processed++;
+        if (total_lines > 0 && (processed % 1000 == 0 || processed == 1 || processed == total_lines)) {
+            printf "Parsing Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr";
+        }
 
-while read -r line; do
-    
-    CACHE_PROCESSED_COUNT=$((CACHE_PROCESSED_COUNT + 1))
-    
-    # Progress Bar for caching phase
-    if (( TOTAL_TRACKING_LINES_FOR_CACHE > 0 )); then
-        PERCENT=$(( CACHE_PROCESSED_COUNT * 100 / TOTAL_TRACKING_LINES_FOR_CACHE ))
-        # Print to stderr and use \r to overwrite the line
-        printf "Caching Progress: %d of %d (%.2f%%)\r" "$CACHE_PROCESSED_COUNT" "$TOTAL_TRACKING_LINES_FOR_CACHE" "$PERCENT" > "/dev/stderr"
+        ip = $1;
+        # Standard AWK regex for text inside the last parenthesis: \(([^)]+)\)[[:space:]]*$
+        if (match($0, /\(([^)]+)\)[[:space:]]*$/)) {
+            # Extract the content of the captured group (the country)
+            country = substr($0, RSTART + 1, RLENGTH - 2);
+            if (country != "") {
+                print ip "\t" country > temp_cache_file;
+            }
+        }
+    }
+    END {
+        if (total_lines > 0) {
+            printf "Parsing Progress: %d of %d (100.00%%) - Complete.\n" , total_lines, total_lines > "/dev/stderr";
+        }
+    }' "$IP_TRACKING_FILE"
+
+# Load the simple IP\tCountry file into the shell array for fast lookup
+declare -A existing_ips_map
+total_existing_ips=0
+while IFS=$'\t' read -r ip country; do
+    if [[ -n "$ip" && -n "$country" ]]; then
+        existing_ips_map["$ip"]="$country"
+        total_existing_ips=$((total_existing_ips + 1))
     fi
-
-    # Extract IP and the country/region from the line: IP # [Date] Message (Country)
-    if [[ $line =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})[[:space:]]+.*\(.*\)$ ]]; then
-        ip="${BASH_REMATCH[1]}"
-        # Extract the content inside the last parenthesis (the country)
-        country=$(echo "$line" | grep -oP '\(\K[^\)]+(?=\)$)' | tail -1)
-        if [[ -n "$ip" && -n "$country" ]]; then
-            existing_ips_map["$ip"]="$country"
-            total_existing_ips=$((total_existing_ips + 1))
-        fi
-    fi
-done < "$IP_TRACKING_FILE"
-
-# Final update for the caching phase to ensure a clean line after the \r progress
-if (( TOTAL_TRACKING_LINES_FOR_CACHE > 0 )); then
-    printf "Caching Progress: %d of %d (100.00%%) - Complete.\n" "$TOTAL_TRACKING_LINES_FOR_CACHE" "$TOTAL_TRACKING_LINES_FOR_CACHE" > "/dev/stderr"
-fi
+done < "$TEMP_CACHE_EXTRACTION"
 
 echo "Loaded $total_existing_ips existing GeoIP records for caching." > "/dev/stderr"
 
@@ -770,7 +779,7 @@ while read -r ip total_count message_summary; do
 
         # Progress Bar Update (only prints when an actual lookup is happening)
         PERCENT=$(( PROCESSED_COUNT * 100 / TOTAL_UNIQUE_IPS ))
-        printf "GeoIP Progress: %d of %d (%.2f%%) - New Lookups: %d - Checking %s\r" "$PROCESSED_COUNT" "$TOTAL_UNIQUE_IPS" "$PERCENT" "$IPS_TO_LOOKUP" "$ip" > "/dev/stderr"
+        printf "GeoIP Lookups: %d of %d (%.2f%%) - New Lookups: %d - Checking %s\r" "$PROCESSED_COUNT" "$TOTAL_UNIQUE_IPS" "$PERCENT" "$IPS_TO_LOOKUP" "$ip" > "/dev/stderr"
 
         # Use the installed geoiplookup utility
         COUNTRY=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | awk -F', ' '{print $2}' | sed 's/^[[:space:]]*//')
@@ -785,7 +794,7 @@ while read -r ip total_count message_summary; do
 done < "$TEMP_UNIQUE_IPS"
 
 # Print final status update with a newline
-printf "GeoIP Progress: %d of %d (100.00%%) - Total New Lookups: %d.\n" "$TOTAL_UNIQUE_IPS" "$TOTAL_UNIQUE_IPS" "$IPS_TO_LOOKUP" > "/dev/stderr"
+printf "GeoIP Lookups: %d of %d (100.00%%) - Total New Lookups: %d.\n" "$TOTAL_UNIQUE_IPS" "$TOTAL_UNIQUE_IPS" "$IPS_TO_LOOKUP" > "/dev/stderr"
 echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # --- END BATCH GEOIP LOOKUP ---
 
