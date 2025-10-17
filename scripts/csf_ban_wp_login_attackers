@@ -720,7 +720,8 @@ echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
 TOTAL_TRACKING_LINES_FOR_CACHE=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
 echo "Parsing $TOTAL_TRACKING_LINES_FOR_CACHE existing bans for GeoIP caching..." > /dev/stderr
 
-# Use AWK for robust extraction of IP and Country from the tracking file using standard regex matching.
+# FIX: Using gensub (GNU AWK feature) for a more robust extraction of the country name 
+# from the end of the log line, which includes the variable [do not delete] flag.
 awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
     -v temp_cache_file="$TEMP_CACHE_EXTRACTION" '
     BEGIN {
@@ -734,13 +735,16 @@ awk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
         }
 
         ip = $1;
-        # Standard AWK regex for text inside the last parenthesis: \(([^)]+)\)[[:space:]]*$
-        if (match($0, /\(([^)]+)\)[[:space:]]*$/)) {
-            # Extract the content of the captured group (the country)
-            country = substr($0, RSTART + 1, RLENGTH - 2);
-            if (country != "") {
-                print ip "\t" country > temp_cache_file;
-            }
+        
+        # gensub matches the entire line ($0) and extracts the content of the first captured group (\1).
+        # Pattern: look for any characters (^.*), followed by a space, then the last '(Country)' group, 
+        # then optional trailing spaces ($). [[:print:]]+ matches any printable character inside the parenthesis.
+        country = gensub(/^.* \(([[:print:]]+)\)[[:space:]]*$/, "\\1", 1, $0);
+
+        # Check if extraction was successful (gensub replaces the whole string if successful, 
+        # otherwise returns the original, which will contain 'ip').
+        if (country != $0 && country != "" && country != "Unknown_Country") {
+            print ip "\t" country > temp_cache_file;
         }
     }
     END {
