@@ -49,11 +49,10 @@ TEMP_AGGREGATE_FILE=$(mktemp)
 TEMP_UNIQUE_IPS=$(mktemp)
 # Temporary file for the new, complete tracking list
 TEMP_TRACKING_FILE=$(mktemp)
-# Temporary file to cache the IP -> Country map
+# NEW: Temporary file to cache the IP -> Country map
 TEMP_GEOIP_MAPPING=$(mktemp)
-# Temporary file to hold the robustly extracted cache
+# NEW: Temporary file to hold the robustly extracted cache
 TEMP_CACHE_EXTRACTION=$(mktemp)
-
 
 # --- TIMING VARIABLE ---
 START_TIME_CMD=$(date +%s)
@@ -165,7 +164,6 @@ report_ban_counts() {
     local permanent_ban_count=${permanent_ban_count_cmd}
 
     local csf_deny_count_cmd
-    # FIX APPLIED HERE: Consolidated the pipeline command to prevent a syntax error from a broken line.
     csf_deny_count_cmd=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
     local csf_deny_count=${csf_deny_count_cmd}
 
@@ -570,8 +568,7 @@ echo " "
 DATE_CMD=$(date)
 echo "${DATE_CMD}"
 
-# Include all temporary files in the cleanup trap
-trap 'rm -f "$TEMP_AGGREGATE_FILE" "$TEMP_UNIQUE_IPS" "$TEMP_TRACKING_FILE" "$TEMP_GEOIP_MAPPING" "$TEMP_CACHE_EXTRACTION" /tmp/ipset_tracking_new.log' EXIT
+trap 'rm -f "$TEMP_AGGREGATE_FILE" "$TEMP_UNIQUE_IPS" "$TEMP_TRACKING_FILE" "$TEMP_GEOIP_MAPPING" "$TEMP_CACHE_EXTRACTION"' EXIT
 
 # 1. INITIAL REPORTING (Reflects state before any changes in this run)
 report_ban_counts "Pre-Run Ban Report"
@@ -590,7 +587,7 @@ gawk -v ip_set_name="$IP_SET_NAME" \
     BEGIN {
         # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
         while ((getline line < allow_file) > 0) {
-            # Check the line itself ($0 is set to the content of line when getline is used)
+            # Check the line itself ($0 is set to the content of '\''line'\'' when getline is used)
          
             if ($0 !~ /^#/) {
                 match($0, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
@@ -607,7 +604,6 @@ gawk -v ip_set_name="$IP_SET_NAME" \
         
         num_allowed = length(whitelisted_ips)
         if (num_allowed == 0) {
-            # FIX APPLIED HERE: Merged print and redirection onto a single line
             print "Allow list is empty. No cleanup needed." > "/dev/stderr"
         }
         
@@ -618,8 +614,7 @@ gawk -v ip_set_name="$IP_SET_NAME" \
         processed++
         
         # Print a simple progress bar/counter to stderr
-        if (total_lines > 0 
- && (processed % 1000 == 0 || processed == total_lines)) {
+        if (total_lines > 0 && (processed % 1000 == 0 || processed == total_lines)) {
             printf "Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr"
             fflush("/dev/stderr") # Force progress bar to show
         }
@@ -669,27 +664,20 @@ for key in "${!keywords[@]}"; do
     KEYWORD_COUNT=$((KEYWORD_COUNT + 1))
     
     # SC2086 Fix: Quote command substitutions
-    current_keyword_cmd=$(echo "${key}" | cut -d" " -f2)
-    current_keyword=${current_keyword_cmd}
+    current_keyword=$(echo "${key}" | cut -d" " -f2)
     echo " "
     echo "👀 [$KEYWORD_COUNT/$TOTAL_KEYWORDS] Scanning logs for keyword: '${current_keyword}'" > /dev/stderr
 
     # SC2086 Fix: Quote command substitutions
-    frequency_cmd=$(( $( echo "${key}" | cut -d" " -f1) ))
-    frequency=${frequency_cmd}
+    frequency=$(( $( echo "${key}" | cut -d" " -f1) ))
     # SC2086 Fix: Quote command substitutions
-    keyword_cmd=$( echo "${key}" | cut -d" " -f2)
-    keyword=${keyword_cmd}
+    keyword=$( echo "${key}" | cut -d" " -f2)
     description=${keywords[${key}]}
 
   
-    # 🔑 FIX: Split LOG_PATHS string into an array safely to ensure correct argument passing to grep
-    # This addresses the "grep isn't working" issue when paths contain spaces or globbing fails.
-    IFS=' ' read -r -a log_file_paths <<< "$LOG_PATHS"
-    
-    # Pass the array elements safely quoted to grep -r
-    grep -r "$keyword" "${log_file_paths[@]}" 2>/dev/null |
-    # SC2196 Fix: Replace deprecated egrep with grep -E
+    # shellcheck disable=SC2086 # $LOG_PATHS must be unquoted for intentional word splitting (to scan multiple log paths)
+    grep -r "$keyword" $LOG_PATHS 2>/dev/null |
+# SC2196 Fix: Replace deprecated egrep with grep -E
     grep -E -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
     sed 's/://' |
     sort | 
@@ -728,7 +716,7 @@ echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs...
 gawk -v total_lines="$TOTAL_AGGREGATE_LINES" '
 BEGIN { 
     FS="\t";
-    processed = 0;
+    processed = 0; 
 } 
 { 
     # $1=IP, $2=Count, $3=Description
@@ -777,7 +765,7 @@ END {
                     summary_string = summary_string ", " temp_desc_arr[ip, i] # Subsequent items with separator
                 }
        
-             }
+            }
      
             print ip, IPs[ip], summary_string
         } else {
@@ -817,12 +805,12 @@ gawk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
 
         ip = $1;
         # gensub matches the entire line ($0) and extracts the content of the first captured group (\1).
-        # Pattern: look for any characters (^.*), followed by a space, then the last "(\1)" group, 
+        # Pattern: look for any characters (^.*), followed by a space, then the last '\''(\1)'\'' group, 
         # then optional trailing spaces ($).
         # [[:print:]]+ matches any printable character inside the parenthesis.
         country = gensub(/^.* \(([[:print:]]+)\)[[:space:]]*$/, "\\1", 1, $0);
         # Check if extraction was successful (gensub replaces the whole string if successful, 
-        # otherwise returns the original, which will contain "ip").
+        # otherwise returns the original, which will contain '\''ip'\'').
         if (country != $0 && country != "" && country != "Unknown_Country") {
             print ip "\t" country > temp_cache_file;
         }
@@ -843,7 +831,6 @@ while IFS=$'\t' read -r ip country; do
     fi
 done < "$TEMP_CACHE_EXTRACTION"
 
-# FIX APPLIED HERE: Moved redirection to the same line as the echo command
 echo "Loaded $total_existing_ips existing GeoIP records for caching." > "/dev/stderr"
 
 # 2. Iterate over all unique IPs from the logs and perform lookups only for new ones
@@ -885,12 +872,11 @@ done < "$TEMP_UNIQUE_IPS"
 
 # Print final status update with a newline
 printf "GeoIP Lookups: %d of %d (100.00%%) - Total New Lookups: %d.\n" "$TOTAL_UNIQUE_IPS" "$TOTAL_UNIQUE_IPS" "$IPS_TO_LOOKUP" > "/dev/stderr"
-# FIX APPLIED HERE: Moved redirection to the same line as the echo command
 echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # --- END BATCH GEOIP LOOKUP ---
 
 # NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
-echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
+echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > "/dev/stderr"
 # NOTE: The outer command block no longer captures stderr (it now prints to console).
 # It only captures stdout (where "INSERTED" and "UPGRADED" messages are printed).
 LOG_SCAN_OUTPUT_CMD=$(
@@ -953,7 +939,6 @@ LOG_SCAN_OUTPUT_CMD=$(
                     message = "UPGRADED to permanent ban [Violations: " count ", " description "]"
                     permanent_ban_count++
                   
-   
                     # Update the line in ban_list to mark as permanent
                     ban_list[ip] = ip " # [" current_date "] " message " (do not delete)"
                     print "UPGRADED existing ban for IP: " ip " -> " message
@@ -962,7 +947,7 @@ LOG_SCAN_OUTPUT_CMD=$(
                     print "NOTICE: Permanent ban limit reached. IP " ip " remains in rotatable list."
                 }
             } 
-            # SILENCE SKIPPED MESSAGE: We removed the print "SKIPPED..." line here
+            # SILENCE SKIPPED MESSAGE: We removed the `print "SKIPPED..."` line here
         } else {
             # 🔑 OPTIMIZATION 2: IPSET ADD (Fast Kernel-level insertion)
             # IP is new. Add to ipset and tracking file.
@@ -1008,8 +993,41 @@ LOG_SCAN_OUTPUT_CMD=$(
              printf "Processing bans: %d of %d (100.00%%) - Complete.\n" , total_ips, total_ips > "/dev/stderr"
         }
         
+        # --- 🧹 START: ROTATION LOGIC ---
+        # NOTE: This simple rotation assumes that IPs remaining in '\''ban_list'\'' that are NOT 
+        # marked '\''do not delete'\'' can be arbitrarily deleted until the limit is met.
+
+        prune_count = 0
+        total_current_bans = length(ban_list)
+        
+        # 1. Calculate how many IPs must be pruned to fit within MAX_BANS
+        if (total_current_bans > max_bans) {
+            prune_count = total_current_bans - max_bans
+            print "WARNING: Total ban count (" total_current_bans ") exceeds MAX_BANS (" max_bans "). Pruning " prune_count " non-permanent entries." > "/dev/stderr"
+        }
+
+        # 2. Prune rotatable IPs: delete oldest non-permanent ban(s).
+        if (prune_count > 0) {
+            delete_count = 0
+            # Iterate over all stored IPs
+            for (ip in ban_list) {
+                # Only delete rotatable IPs
+                if (ban_list[ip] !~ /do not delete/) {
+                    # Check if we are now allowed to upgrade (either because limit was not hit, OR we just pruned one)
+                    if (delete_count < prune_count) {
+                        # Remove from the ipset (real-time action)
+                        system("ipset del \"" ip_set_name "\" \"" ip "\" > /dev/null 2>&1")
+                        delete ban_list[ip] # Remove from final list
+                        delete_count++
+                        print "ROTATED: Removed oldest non-permanent IP: " ip " to comply with max ban limit." > "/dev/stderr"
+                    }
+                }
+            }
+        }
+        
+        # --- 🧹 END: ROTATION LOGIC ---
+        
         # 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
-   
         for (i in ban_list) {
             if (ban_list[i] != "") {
                 print ban_list[i] > temp_tracking_file
@@ -1017,11 +1035,12 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
         close(temp_tracking_file)
     }' "$TEMP_UNIQUE_IPS" 
-) # The '2>&1' that caused the issue has been removed from here.
+) 
 LOG_SCAN_OUTPUT=${LOG_SCAN_OUTPUT_CMD}
 
 # --- 💾 FIXED: ATOMIC FILE REPLACEMENT ---
-if [ -s "$TEMP_TRACKING_FILE" ]; then
+if [ -s "$TEMP_TRACKING_FILE" ];
+then
     mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
 else
     # This error message is what you saw in the original output, now it is only printed if the file actually fails to update.
