@@ -670,25 +670,37 @@ END {
          printf "Aggregation Progress: %d of %d (100.00%%) - Complete.\n" , total_lines, total_lines > "/dev/stderr";
     }
     
-    # --- Summary Building (FIXED and OPTIMIZED) ---
+    # --- Summary Building (FIXED using temporary array and explicit join) ---
+    # 1. First Pass: Consolidate unique descriptions per IP into a temporary array (temp_desc_arr[ip, index])
     for (key in description_list) { 
         # Split the combined key using the built-in Subscript Separator (SUBSEP)
         split(key, parts, SUBSEP);
         ip = parts[1];
         desc = parts[2];
         
-        # Build the summary string for each unique IP
-        if (summaries[ip] == "") {
-            summaries[ip] = desc;
-        } else {
-            summaries[ip] = summaries[ip] ", " desc;
-        }
+        # Ensure description is not empty
+        if (desc == "") { continue } 
+
+        # Add description to a temporary array, indexed by IP and a counter
+        if (!(ip in desc_count)) { desc_count[ip] = 0 }
+        desc_count[ip]++
+        temp_desc_arr[ip, desc_count[ip]] = desc
     } 
     
-    # 2. Iterate over the main IP count array to print the final output.
+    # 2. Second Pass: Iterate over IPs, join the descriptions into a single string.
     for (ip in IPs) {
-        if (ip in summaries) {
-            print ip, IPs[ip], summaries[ip]
+        if (ip in desc_count) {
+            
+            summary_string = ""
+            for (i = 1; i <= desc_count[ip]; i++) {
+                if (summary_string == "") {
+                    summary_string = temp_desc_arr[ip, i] # First item, no separator
+                } else {
+                    summary_string = summary_string ", " temp_desc_arr[ip, i] # Subsequent items with separator
+                }
+            }
+            
+            print ip, IPs[ip], summary_string
         } else {
             print ip, IPs[ip], "Summary creation error"
         }
@@ -738,7 +750,7 @@ if (( TOTAL_TRACKING_LINES_FOR_CACHE > 0 )); then
     printf "Caching Progress: %d of %d (100.00%%) - Complete.\n" "$TOTAL_TRACKING_LINES_FOR_CACHE" "$TOTAL_TRACKING_LINES_FOR_CACHE" > "/dev/stderr"
 fi
 
-echo "Loaded $total_existing_ips existing GeoIP records for caching." > /dev/stderr
+echo "Loaded $total_existing_ips existing GeoIP records for caching." > "/dev/stderr"
 
 # 2. Iterate over all unique IPs from the logs and perform lookups only for new ones
 PROCESSED_COUNT=0
@@ -777,6 +789,8 @@ printf "GeoIP Progress: %d of %d (100.00%%) - Total New Lookups: %d.\n" "$TOTAL_
 echo "Batch GeoIP lookup complete." > "/dev/stderr"
 # --- END BATCH GEOIP LOOKUP ---
 
+# NEW FEEDBACK LINE: This shows the script has moved to the final, heavy processing stage.
+echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > /dev/stderr
 
 # --- 🛡️ 2.2: Execution Phase (AWK 2) ---
 # This phase is now incredibly fast as it uses in-memory data.
@@ -823,6 +837,9 @@ LOG_SCAN_OUTPUT=$(
             geoip_map[parts[1]] = parts[2]
         }
         close(geoip_map_file)
+        
+        # Ensure the progress bar starts immediately after the BEGIN block finishes
+        print "All data loaded. Commencing final IPSET execution." > "/dev/stderr"
     }
     {
       ip=$1
