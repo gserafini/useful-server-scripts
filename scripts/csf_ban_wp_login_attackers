@@ -926,6 +926,9 @@ echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > 
 # --- 🛡️ 2.2: Execution Phase (AWK 2) ---
 # This phase is now incredibly fast as it uses in-memory data.
 # SC2155 Fix
+# FIX: Removed '2>&1' from the end of the command substitution. This allows the progress bar 
+# (which prints to stderr) to stream in real-time, while capturing only the log messages 
+# (which print to stdout).
 LOG_SCAN_OUTPUT_CMD=$(
     # FIX: Double quote the AWK variables
     gawk -v total_ips="$TOTAL_UNIQUE_IPS" \
@@ -974,8 +977,8 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
         close(geoip_map_file)
         
-        # Ensure the progress bar starts immediately after the BEGIN block finishes
-        print "All data loaded. Commencing final IPSET execution." > "/dev/stderr"
+        // FIX: Remove redirect to stderr so this message is captured in LOG_SCAN_OUTPUT
+        print "All data loaded. Commencing final IPSET execution."
         fflush("/dev/stderr") # Force buffer flush
     }
     {
@@ -983,35 +986,35 @@ LOG_SCAN_OUTPUT_CMD=$(
       total_count=$2
       message_summary=$3
       
-      # 🟢 PROGRESS BAR LOGIC (Prints to stderr)
+      // 🟢 PROGRESS BAR LOGIC (Prints to stderr in real-time)
       processed++
       if (total_ips > 0 && (processed % 10 == 0 || processed == 1 || processed == total_ips)) {
           printf "Processing bans: %d of %d (%.2f%%)\r" , processed, total_ips, 
           (processed / total_ips * 100) > "/dev/stderr"
-          fflush("/dev/stderr") # <--- FIX: Force immediate display
+          fflush("/dev/stderr") // <--- Force immediate display
       }
 
-      # =================================================================
-      # 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
-      # =================================================================
-      # Use quoted variables for safety inside AWK '\''s system() call
+      // =================================================================
+      // 🔑 OPTIMIZATION 1: IPSET TEST FIRST (Fast Kernel-level check)
+      // =================================================================
+      // Use quoted variables for safety inside AWK '\''s system() call
       is_already_banned = system("ipset test \"" ip_set_name "\" \"" ip "\" 2>/dev/null")
       if (is_already_banned == 0) {
         next 
       }
       
-      # =================================================================
+      // =================================================================
      
-      # The following checks only run for NEW, UNBANNED IPS
-      # =================================================================
+      // The following checks only run for NEW, UNBANNED IPS
+      // =================================================================
 
-      # 🔑 OPTIMIZATION 2: WHITELIST CHECK (FAST Array Lookup)
+      // 🔑 OPTIMIZATION 2: WHITELIST CHECK (FAST Array Lookup)
       if (ip in whitelisted_ips) {
         print "IP " ip " is WHITELISTED in " allow_file ". Skipping ban."
         next 
       }
       
-      # 2. GEOIP Lookup (FAST ARRAY LOOKUP)
+      // 2. GEOIP Lookup (FAST ARRAY LOOKUP)
       country = geoip_map[ip]
       if (country == "") {
           country = "Unknown_Country"
@@ -1020,7 +1023,7 @@ LOG_SCAN_OUTPUT_CMD=$(
       is_new_ban_permanent = 0
       protection_text = ""
       
-      # PERMANENT BAN LOGIC (Uses in-memory count)
+      // PERMANENT BAN LOGIC (Uses in-memory count)
       if (total_count >= max_violation_count && permanent_ban_count < max_perm_bans) {
         protection_text = " [More than " max_violation_count " blocks, do not delete ]"
         is_new_ban_permanent = 1
@@ -1030,16 +1033,16 @@ LOG_SCAN_OUTPUT_CMD=$(
       }
       
       message="Total Violations: " total_count ". Triggers: [" message_summary "]" protection_text " (" country ")"
-      print "Blocking " ip " because " message
+      print "Blocking " ip " because " message // Prints to stdout (captured)
 
-      # 3. ROTATION LOGIC (IN MEMORY)
+      // 3. ROTATION LOGIC (IN MEMORY)
       delete_index = 0
       delete_type = "none"
       
       if (current_ban_count >= max_bans) {
         print "Total ban limit (" max_bans ") reached. Checking for oldest rotatable entry."
         
-        # Find the oldest rotatable IP (i.e., first non-"do not delete" line)
+        // Find the oldest rotatable IP (i.e., first non-"do not delete" line)
         for(i = 1; i <= current_ban_count; i++) {
             if (ban_list[i] != "" && ban_list[i] !~ /do not delete/) {
                 delete_index = i
@@ -1049,7 +1052,7 @@ LOG_SCAN_OUTPUT_CMD=$(
             }
         }
         
-        # If no rotatable IPs, find the oldest permanent IP (only if the new ban is permanent)
+        // If no rotatable IPs, find the oldest permanent IP (only if the new ban is permanent)
         if (delete_index == 0 && is_new_ban_permanent == 1) {
             
             print "WARNING: Total ban limit hit and all entries are permanent. Rotating oldest PERMANENT entry to make room."
@@ -1064,19 +1067,19 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
       }
 
-      # 4. EXECUTE DELETION (Only runs if a rotating IP was found)
+      // 4. EXECUTE DELETION (Only runs if a rotating IP was found)
       if (delete_index > 0) {
         ip_to_delete_entry = ban_list[delete_index]
       
-        # Extract IP only from the log entry (assuming IP is the first field)
+        // Extract IP only from the log entry (assuming IP is the first field)
         match(ip_to_delete_entry, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/)
         ip_to_delete_only = substr(ip_to_delete_entry, RSTART, RLENGTH)
 
-        # Use quoted variables for safety inside AWK '\''s system() call
+        // Use quoted variables for safety inside AWK '\''s system() call
         system("ipset del \"" ip_set_name "\" \"" ip_to_delete_only "\"")
-        print "DELETED oldest " delete_type " IP from ipset: " ip_to_delete_only
+        print "DELETED oldest " delete_type " IP from ipset: " ip_to_delete_only // Prints to stdout (captured)
         
-        # Remove the entry from the in-memory list
+        // Remove the entry from the in-memory list
         delete ban_list[delete_index]
         current_ban_count--
         if (delete_type == "permanent") {
@@ -1084,16 +1087,16 @@ LOG_SCAN_OUTPUT_CMD=$(
         }
       } 
       
-      # 5. INSERTION 
-      # Use quoted variables for safety inside AWK '\''s system() call
+      // 5. INSERTION 
+      // Use quoted variables for safety inside AWK '\''s system() call
       system("ipset add \"" ip_set_name "\" \"" ip "\" -exist")
-      print "INSERTED new IP to ipset: " ip
+      print "INSERTED new IP to ipset: " ip // Prints to stdout (captured)
       
      
-      # Add new entry to memory
+      // Add new entry to memory
       current_ban_count++
-      # Use current_ban_count as the index, as '\''delete'\'' creates non-contiguous indices
-      # The writing logic in END handles this by iterating over the array values.
+      // Use current_ban_count as the index, as '\''delete'\'' creates non-contiguous indices
+      // The writing logic in END handles this by iterating over the array values.
       ban_list[current_ban_count] = ip " # [" current_date "] " message
       if (is_new_ban_permanent == 1) {
           permanent_ban_count++
@@ -1101,18 +1104,19 @@ LOG_SCAN_OUTPUT_CMD=$(
     }
     END {
         if (total_ips > 0) {
+             // Prints to stderr in real-time
              printf "Processing bans: %d of %d (100.00%%) - Complete.\\n" , total_ips, total_ips > "/dev/stderr"
         }
         
   
-        # 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
+        // 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
         for (i in ban_list) {
             if (ban_list[i] != "") {
                 print ban_list[i] > temp_tracking_file
             }
         }
         close(temp_tracking_file)
-    }' "$TEMP_UNIQUE_IPS" 2>&1
+    }' "$TEMP_UNIQUE_IPS"
 )
 LOG_SCAN_OUTPUT=${LOG_SCAN_OUTPUT_CMD}
 
