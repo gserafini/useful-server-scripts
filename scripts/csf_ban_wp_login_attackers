@@ -49,6 +49,8 @@ LOG_PATHS=""
 TEMP_AGGREGATE_FILE=$(mktemp)
 # Temporary file for unique aggregated IPs 
 TEMP_UNIQUE_IPS=$(mktemp)
+# Temporary file for the new, complete tracking list (The fix for the file corruption)
+TEMP_TRACKING_FILE=$(mktemp)
 
 # --- TIMING VARIABLE ---
 START_TIME=$(date +%s)
@@ -391,7 +393,7 @@ while true; do
     * )
       break
       ;;
-  esac
+  end case
 done
 
 if [ -z "$LOG_PATHS" ]; then
@@ -513,7 +515,7 @@ echo " "
 date
 
 # Ensure temporary files are cleaned up on exit
-trap "rm -f $TEMP_AGGREGATE_FILE $TEMP_UNIQUE_IPS" EXIT
+trap "rm -f $TEMP_AGGREGATE_FILE $TEMP_UNIQUE_IPS $TEMP_TRACKING_FILE" EXIT
 
 # 1. INITIAL REPORTING (Reflects state before any changes in this run)
 report_ban_counts "Pre-Run Ban Report"
@@ -649,7 +651,7 @@ BEGIN {
 { 
     # $1=IP, $2=Count, $3=Description
     IPs[$1] += $2;
-    # 🔑 OPTIMIZATION: Use the portable single-dimension array with combined key to avoid syntax error
+    # Portable single-dimension array with combined key
     description_list[$1, $3] = 1; 
     
     # 🟢 PROGRESS BAR LOGIC for Aggregation
@@ -664,15 +666,13 @@ END {
     }
     
     # --- Summary Building (FIXED and OPTIMIZED) ---
-    # 1. Iterate over the combined-key array once to build the summary strings.
     for (key in description_list) { 
         # Split the combined key using the built-in Subscript Separator (SUBSEP)
         split(key, parts, SUBSEP);
         ip = parts[1];
         desc = parts[2];
         
-        # Build the summary string for each unique IP using a new array `summaries`.
-        # This is a fast, linear operation, replacing the slow nested loop/regex.
+        # Build the summary string for each unique IP
         if (summaries[ip] == "") {
             summaries[ip] = desc;
         } else {
@@ -682,11 +682,9 @@ END {
     
     # 2. Iterate over the main IP count array to print the final output.
     for (ip in IPs) {
-        # Print the IP, the total count, and the constructed summary string
         if (ip in summaries) {
             print ip, IPs[ip], summaries[ip]
         } else {
-            # Fallback
             print ip, IPs[ip], "Summary creation error"
         }
     } 
@@ -703,6 +701,7 @@ LOG_SCAN_OUTPUT=$(
         -v ip_set_name=$IP_SET_NAME \
         -v tracking_file=$IP_TRACKING_FILE \
         -v allow_file=$CSF_ALLOW_FILE \
+        -v temp_tracking_file=$TEMP_TRACKING_FILE \
         -v max_bans=$MAX_BANS \
         -v max_perm_bans=$MAX_PERMANENT_BANS \
         -v max_violation_count=$MAX_VIOLATION_COUNT '
@@ -712,7 +711,8 @@ LOG_SCAN_OUTPUT=$(
         permanent_ban_count = 0
 
         # 📚 MEMORY OPTIMIZATION 1: Read IP tracking file into memory once
-        # Using getline with a variable (line) sets $0 to the content of 'line'
+        # This will read the potentially corrupted file from the last run, 
+        # but the new bans are processed against the live IPSET and the list is rebuilt.
         while ((getline line < tracking_file) > 0) {
             # Skip empty or comment lines
             if ($0 ~ /^#|^[[:space:]]*$/) { continue }
@@ -850,16 +850,27 @@ LOG_SCAN_OUTPUT=$(
              printf "Processing bans: %d of %d (100.00%%) - Complete.\n" , total_ips, total_ips > "/dev/stderr"
         }
         
-        # 💾 WRITE THE UPDATED BAN LIST BACK TO THE FILE ONCE (Corrected, Atomic Write)
-        # AWK will buffer all these 'print' commands to the file.
+        # 💾 FIXED: WRITE THE UPDATED BAN LIST TO THE TEMPORARY FILE ONCE
+        # The main shell script will then atomically move this file to the final destination.
         for (i in ban_list) {
             if (ban_list[i] != "") {
-                print ban_list[i] > tracking_file
+                print ban_list[i] > temp_tracking_file
             }
         }
-        close(tracking_file) # Ensure buffer is flushed immediately
-    }' "$TEMP_UNIQUE_IPS"
+        close(temp_tracking_file) # Ensure buffer is flushed immediately
+    }' "$TEMP_UNIQUE_IPS" 2>&1
 )
+
+# --- 💾 FIXED: ATOMIC FILE REPLACEMENT ---
+# Move the complete file created by AWK into the final tracking file location.
+if [ -s "$TEMP_TRACKING_FILE" ]; then
+    mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
+else
+    # If the file is empty or missing, log an error but keep the existing file (even if corrupted)
+    echo "ERROR: Tracking file update failed. File was empty or not created." >> /dev/stderr
+fi
+# ----------------------------------------
+
 
 # Count the number of new IPs inserted from the captured output
 NEW_BANS_COUNT=$(echo "$LOG_SCAN_OUTPUT" | grep -c "INSERTED new IP to ipset:")
