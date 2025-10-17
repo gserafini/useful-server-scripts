@@ -393,7 +393,7 @@ while true; do
     * )
       break
       ;;
-  end case
+  esac # CORRECTED: Changed 'end case' to 'esac'
 done
 
 if [ -z "$LOG_PATHS" ]; then
@@ -641,7 +641,7 @@ echo "All relevant violations recorded. Starting aggregation and execution..."
 # --- 🛡️ 2.1: Aggregation Phase (AWK 1) - OPTIMIZED and FIXED for portability ---
 # Aggregate the data to a temporary file for counting and unique triggers.
 TOTAL_AGGREGATE_LINES=$(wc -l < "$TEMP_AGGREGATE_FILE")
-echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs..." > /dev/stderr
+echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs..." > "/dev/stderr"
 
 awk -v total_lines="$TOTAL_AGGREGATE_LINES" '
 BEGIN { 
