@@ -236,7 +236,7 @@ perform_whitelist() {
         echo "$ip $comment" | tee -a "$CSF_ALLOW_FILE" > /dev/null
         echo "Added $ip to $CSF_ALLOW_FILE."
     else
-        echo "$ip is already present in $CSF_ALLOW_FILE."
+        echo "$ip is already present in "$CSF_ALLOW_FILE"."
     fi
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
@@ -704,9 +704,23 @@ echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > /dev/stderr
 
 # 1. Load existing IPs and their countries from the tracking file into a shell array
 declare -A existing_ips_map
-# CORRECTED: Removed 'local'
 total_existing_ips=0 
+TOTAL_TRACKING_LINES_FOR_CACHE=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
+CACHE_PROCESSED_COUNT=0
+
+echo "Reading existing bans for GeoIP caching (Total lines: $TOTAL_TRACKING_LINES_FOR_CACHE)..." > /dev/stderr
+
 while read -r line; do
+    
+    CACHE_PROCESSED_COUNT=$((CACHE_PROCESSED_COUNT + 1))
+    
+    # Progress Bar for caching phase
+    if (( TOTAL_TRACKING_LINES_FOR_CACHE > 0 )); then
+        PERCENT=$(( CACHE_PROCESSED_COUNT * 100 / TOTAL_TRACKING_LINES_FOR_CACHE ))
+        # Print to stderr and use \r to overwrite the line
+        printf "Caching Progress: %d of %d (%.2f%%)\r" "$CACHE_PROCESSED_COUNT" "$TOTAL_TRACKING_LINES_FOR_CACHE" "$PERCENT" > "/dev/stderr"
+    fi
+
     # Extract IP and the country/region from the line: IP # [Date] Message (Country)
     if [[ $line =~ ^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})[[:space:]]+.*\(.*\)$ ]]; then
         ip="${BASH_REMATCH[1]}"
@@ -718,6 +732,11 @@ while read -r line; do
         fi
     fi
 done < "$IP_TRACKING_FILE"
+
+# Final update for the caching phase to ensure a clean line after the \r progress
+if (( TOTAL_TRACKING_LINES_FOR_CACHE > 0 )); then
+    printf "Caching Progress: %d of %d (100.00%%) - Complete.\n" "$TOTAL_TRACKING_LINES_FOR_CACHE" "$TOTAL_TRACKING_LINES_FOR_CACHE" > "/dev/stderr"
+fi
 
 echo "Loaded $total_existing_ips existing GeoIP records for caching." > /dev/stderr
 
