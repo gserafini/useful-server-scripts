@@ -636,7 +636,7 @@ fi
 
 echo "All relevant violations recorded. Starting aggregation and execution..."
 
-# --- 🛡️ 2.1: Aggregation Phase (AWK 1) - OPTIMIZED FOR CPU ---
+# --- 🛡️ 2.1: Aggregation Phase (AWK 1) - OPTIMIZED and FIXED for portability ---
 # Aggregate the data to a temporary file for counting and unique triggers.
 TOTAL_AGGREGATE_LINES=$(wc -l < "$TEMP_AGGREGATE_FILE")
 echo "Aggregating $TOTAL_AGGREGATE_LINES violation records to find unique IPs..." > /dev/stderr
@@ -649,8 +649,8 @@ BEGIN {
 { 
     # $1=IP, $2=Count, $3=Description
     IPs[$1] += $2;
-    # 🔑 OPTIMIZATION: Use a true 2D array structure for description list
-    description_list[$1][$3] = 1; 
+    # 🔑 OPTIMIZATION: Use the portable single-dimension array with combined key to avoid syntax error
+    description_list[$1, $3] = 1; 
     
     # 🟢 PROGRESS BAR LOGIC for Aggregation
     processed++;
@@ -663,18 +663,32 @@ END {
          printf "Aggregation Progress: %d of %d (100.00%%) - Complete.\n" , total_lines, total_lines > "/dev/stderr";
     }
     
-    # --- Summary Building (OPTIMIZED) ---
-    # This loop is now extremely fast, avoiding nested iteration and regex for summary building.
-    for (ip in IPs) { 
-        summary = ""
-        separator = ""
+    # --- Summary Building (FIXED and OPTIMIZED) ---
+    # 1. Iterate over the combined-key array once to build the summary strings.
+    for (key in description_list) { 
+        # Split the combined key using the built-in Subscript Separator (SUBSEP)
+        split(key, parts, SUBSEP);
+        ip = parts[1];
+        desc = parts[2];
         
-        # Iterate directly over the descriptions associated with the current IP
-        for (desc in description_list[ip]) {
-            summary = summary separator desc
-            separator = ", "
+        # Build the summary string for each unique IP using a new array `summaries`.
+        # This is a fast, linear operation, replacing the slow nested loop/regex.
+        if (summaries[ip] == "") {
+            summaries[ip] = desc;
+        } else {
+            summaries[ip] = summaries[ip] ", " desc;
         }
-        print ip, IPs[ip], summary
+    } 
+    
+    # 2. Iterate over the main IP count array to print the final output.
+    for (ip in IPs) {
+        # Print the IP, the total count, and the constructed summary string
+        if (ip in summaries) {
+            print ip, IPs[ip], summaries[ip]
+        } else {
+            # Fallback
+            print ip, IPs[ip], "Summary creation error"
+        }
     } 
 }' "$TEMP_AGGREGATE_FILE" > "$TEMP_UNIQUE_IPS"
 
