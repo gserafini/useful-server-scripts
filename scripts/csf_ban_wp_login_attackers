@@ -1180,9 +1180,9 @@ else
         fi
 
         if [ -n "$php_units" ]; then
-            # Deduplicate and restart each
+            # Deduplicate and restart each using process substitution to avoid subshell
             echo "Found php-fpm service units:"
-            echo "$php_units" | sort -u | while read -r svc; do
+            while read -r svc; do
                 if [ -z "$svc" ]; then continue; fi
                 if $systemctl_cmd restart "$svc" 2>/dev/null; then
                     echo "Restarted $svc via systemctl"
@@ -1190,7 +1190,7 @@ else
                 else
                     echo "Failed to restart $svc via systemctl"
                 fi
-            done
+            done < <(echo "$php_units" | sort -u)
         fi
     fi
 
