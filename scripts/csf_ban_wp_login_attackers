@@ -526,6 +526,8 @@ keywords=(
 
   # --- Config/Secret File Probing ---
   ["1 \.env"]=".env"
+  ["1 \.env\.old"]=".env.old"
+  ["1 \.env\.bak"]=".env.bak"
   ["1 \.git"]=".git"
   ["1 \.swp"]=".swp"
   ["1 /config.json"]="/config.json"
@@ -573,6 +575,12 @@ keywords=(
   ["1 ini.php.*404"]="ini.php and got 404 error code"
   ["1 /rk2.php"]="rk2.php"
   ["1 /bx.php"]="/bx.php"
+  ["1 /k.php"]="/k.php"
+  ["1 /nc4.php"]="/nc4.php"
+  ["1 /pi.php"]="/pi.php"
+  ["1 /karak.php"]="/karak.php"
+  ["1 /makeasmtp.php"]="/makeasmtp.php"
+  ["1 /elp.php"]="/elp.php"
 
   # --- Remote Management Probing ---
   ["1 /commpilot/"]="/commpilot/"
