@@ -605,11 +605,7 @@ if [ -z "$LOG_PATHS" ]; then
 fi
 # --- END ARGUMENT HANDLING ---
 
-# If an abuse report was requested, run it immediately (read-only) and exit
-if [ "${ABUSE_RUN:-0}" -eq 1 ]; then
-    assemble_abuse_report "$ABUSE_IP" "${ABUSE_MIN_HITS:-}" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
-    exit 0
-fi
+## ABUSE_RUN handling moved to after function definitions to ensure assemble_abuse_report is defined
 
 # 0. ENSURE SETUP IS COMPLETE FOR MAIN LOGIC
 ensure_setup
@@ -991,6 +987,12 @@ find_top_offenders() {
 
 
 # --- EXECUTION START ---
+
+# If an abuse report was requested, run it now (functions are defined at this point)
+if [ "${ABUSE_RUN:-0}" -eq 1 ]; then
+    assemble_abuse_report "${ABUSE_IP:-}" "${ABUSE_MIN_HITS:-}" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
+    exit 0
+fi
 
 echo " "
 DATE_CMD=$(date)
