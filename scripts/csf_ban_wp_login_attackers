@@ -1085,7 +1085,9 @@ BEGIN {
         # If conntrack-tools is present on the host, delete conntrack entries for this IP
         # so established connections are dropped immediately. Use sh -c guard to avoid
         # errors in environments without conntrack.
-        system("sh -c 'command -v conntrack >/dev/null 2>&1 && conntrack -D -s " ip " >/dev/null 2>&1' 2>/dev/null")
+    # Build the guarded shell command using sprintf to avoid quoting issues
+    cmd = sprintf("sh -c '%s' 2>/dev/null", "command -v conntrack >/dev/null 2>&1 && conntrack -D -s " ip " >/dev/null 2>&1")
+    system(cmd)
     }
 
     # PROGRESS BAR LOGIC (Prints to stderr in real-time)
