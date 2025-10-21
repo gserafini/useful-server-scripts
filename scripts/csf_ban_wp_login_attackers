@@ -185,17 +185,20 @@ report_ban_counts() {
     echo "--- 📊 $report_title ---"
     
     local ipset_count
-    ipset_count=$(grep -cvE '^(\s*)$' "$IP_TRACKING_FILE" 2>/dev/null || echo 0)
+    ipset_count=$(grep -cvE '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null)
+    ipset_count=${ipset_count:-0}
 
-    local permanent_ban_count_cmd
-    permanent_ban_count_cmd=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
-    local permanent_ban_count=${permanent_ban_count_cmd}
+    local permanent_ban_count
+    permanent_ban_count=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
+    permanent_ban_count=${permanent_ban_count:-0}
 
     local csf_deny_count
-    csf_deny_count=$(grep -cvE '^(#|\s*)' "$CSF_DENY_FILE" 2>/dev/null || echo 0)
+    csf_deny_count=$(grep -cvE '^(#|\s*)' "$CSF_DENY_FILE" 2>/dev/null)
+    csf_deny_count=${csf_deny_count:-0}
 
     local csf_allow_count
-    csf_allow_count=$(grep -cvE '^(#|\s*)' "$CSF_ALLOW_FILE" 2>/dev/null || echo 0)
+    csf_allow_count=$(grep -cvE '^(#|\s*)' "$CSF_ALLOW_FILE" 2>/dev/null)
+    csf_allow_count=${csf_allow_count:-0}
 
 
     echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
@@ -462,7 +465,7 @@ perform_clear() {
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -474,6 +477,22 @@ while true; do
     --init )
       perform_init
       ;;
+        --help )
+            echo "Usage: $0 [options]"
+            echo "Options:" 
+            echo "  --init                    Initialize ipset and CSF hooks"
+            echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
+            echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
+            echo "  --logs \"<path1> <path2>\"    Override default log paths to scan"
+            echo "  --clear                   Flush ipset and clear tracking file (interactive)"
+            echo "  --abuse, --abuse-report <IP> [MIN_HITS]   Generate an abuse evidence report for <IP> (read-only)"
+            echo "  --abuse-min <N>           Default minimum matched hits for abuse-report when MIN_HITS omitted"
+            echo "  --abuse-days <N>          Best-effort: restrict search to last N days (depends on log timestamps)"
+            echo "  --abuse-since <STRING>    Simple substring filter for 'since' date token"
+            echo "  --abuse-until <STRING>    Simple substring filter for 'until' date token"
+            echo "  --abuse-email             Attempt minimal whois lookup and print a draft abuse email"
+            exit 0
+            ;;
     --whitelist | --unblock )
       # $1 is --whitelist or --unblock
       IP_TO_WHITELIST="$2"
@@ -558,7 +577,8 @@ while true; do
                     MIN_HITS_TO_USE="${ABUSE_MIN}"
             fi
 
-            assemble_abuse_report "$IP_TO_REPORT" "$MIN_HITS_TO_USE" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
+                            assemble_abuse_report "$IP_TO_REPORT" "$MIN_HITS_TO_USE" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
+                            exit 0
       ;;
     --logs )
       LOG_PATHS="$2"
