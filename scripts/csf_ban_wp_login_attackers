@@ -1129,8 +1129,112 @@ echo "Banned IPs recorded in tracking file: $IP_TRACKING_FILE"
 echo ""
 echo "Restarting Apache..."
 
-/usr/local/cpanel/scripts/restartsrv_httpd
-/usr/local/cpanel/scripts/restartsrv_apache_php_fpm
+# Restart services: use cPanel legacy scripts on CentOS <7, systemctl on CentOS >=7
+centos_major=""
+if [ -f /etc/centos-release ]; then
+    centos_major=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/centos-release)
+elif [ -f /etc/redhat-release ]; then
+    centos_major=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release)
+fi
+
+# fallback to lsb_release if parsing failed
+if ! [[ "$centos_major" =~ ^[0-9]+$ ]] && command -v lsb_release >/dev/null 2>&1; then
+    centos_major=$(lsb_release -sr | cut -d. -f1)
+fi
+
+if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
+    echo "Detected CentOS $centos_major (<7): using cPanel restart scripts..."
+    /scripts/restartsrv_httpd --restart --hard
+    /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
+else
+    echo "Detected CentOS ${centos_major:-unknown} (>=7 or undetermined): using systemctl/service fallback..."
+
+    # Restart Apache/httpd first
+    if /bin/systemctl restart httpd.service 2>/dev/null; then
+        echo "httpd restarted via systemctl"
+    else
+        echo "systemctl unavailable or failed; trying service httpd restart..."
+        service httpd restart 2>/dev/null && echo "httpd restarted via service" || echo "Failed to restart httpd"
+    fi
+
+    # Discover php-fpm services dynamically instead of hard-coding
+    restarted_any_phpfpm=0
+    systemctl_cmd="$(command -v systemctl 2>/dev/null || true)"
+
+    if [ -n "$systemctl_cmd" ]; then
+        # List unit names and match typical php-fpm patterns (ea-php*, php*-fpm, php-fpm)
+        php_units=$($systemctl_cmd list-units --all --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E -i '(^ea-php[0-9]+-php-fpm\.service$|php([0-9]+)?-?fpm(\.service)?$)' || true)
+        # If none found, also check installed unit-files (covers disabled units)
+        if [ -z "$php_units" ]; then
+            php_units=$($systemctl_cmd list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E -i '(^ea-php[0-9]+-php-fpm\.service$|php([0-9]+)?-?fpm(\.service)?$)' || true)
+        fi
+
+        if [ -n "$php_units" ]; then
+            # Deduplicate and restart each
+            echo "Found php-fpm service units:"
+            echo "$php_units" | sort -u | while read -r svc; do
+                if [ -z "$svc" ]; then continue; fi
+                if $systemctl_cmd restart "$svc" 2>/dev/null; then
+                    echo "Restarted $svc via systemctl"
+                    restarted_any_phpfpm=1
+                else
+                    echo "Failed to restart $svc via systemctl"
+                fi
+            done
+        fi
+    fi
+
+    # Fallback for non-systemd systems or if no units were discovered/restarted
+    if [ "$restarted_any_phpfpm" -eq 0 ]; then
+        echo "No php-fpm systemd units restarted (none discovered or systemctl unavailable). Trying service/init.d fallbacks..."
+
+        # Try common vendor names first (ea-php* and php-fpm)
+        for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
+            if command -v /bin/systemctl >/dev/null 2>&1; then
+                if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
+                    echo "Restarted ${svc}.service via systemctl"
+                    restarted_any_phpfpm=1
+                    continue
+                fi
+            fi
+
+            # Try service wrapper
+            if service "$svc" restart 2>/dev/null; then
+                echo "Restarted $svc via service"
+                restarted_any_phpfpm=1
+                continue
+            fi
+
+            # Try direct init script if present
+            if [ -x "/etc/init.d/$svc" ]; then
+                if /etc/init.d/"$svc" restart 2>/dev/null; then
+                    echo "Restarted $svc via /etc/init.d/$svc"
+                    restarted_any_phpfpm=1
+                    continue
+                fi
+            fi
+        done
+
+        # As a last resort, scan /etc/init.d for any php*-fpm scripts and attempt restart
+        if [ "$restarted_any_phpfpm" -eq 0 ]; then
+            for script in /etc/init.d/*php*fpm* /etc/init.d/*php*; do
+                [ -e "$script" ] || continue
+                base=$(basename "$script")
+                if service "$base" restart 2>/dev/null; then
+                    echo "Restarted $base via service (from /etc/init.d scan)"
+                    restarted_any_phpfpm=1
+                elif [ -x "$script" ] && "$script" restart 2>/dev/null; then
+                    echo "Restarted $base via direct init.d script"
+                    restarted_any_phpfpm=1
+                fi
+            done
+        fi
+    fi
+
+    if [ "$restarted_any_phpfpm" -eq 0 ]; then
+        echo "Warning: No php-fpm services were restarted. Please verify php-fpm service names on this host."
+    fi
+fi
 
 echo ""
 echo "Done!"
