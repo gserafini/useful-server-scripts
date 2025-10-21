@@ -577,9 +577,12 @@ while true; do
                     MIN_HITS_TO_USE="${ABUSE_MIN}"
             fi
 
-                            assemble_abuse_report "$IP_TO_REPORT" "$MIN_HITS_TO_USE" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
-                            exit 0
-      ;;
+                            # Record requested abuse report parameters; actual call happens after functions are defined
+                            ABUSE_RUN=1
+                            ABUSE_IP="$IP_TO_REPORT"
+                            ABUSE_MIN_HITS="$MIN_HITS_TO_USE"
+                            shift 0
+                            ;;
     --logs )
       LOG_PATHS="$2"
       shift 2
@@ -601,6 +604,12 @@ if [ -z "$LOG_PATHS" ]; then
     LOG_PATHS="$DEFAULT_LOG_PATHS"
 fi
 # --- END ARGUMENT HANDLING ---
+
+# If an abuse report was requested, run it immediately (read-only) and exit
+if [ "${ABUSE_RUN:-0}" -eq 1 ]; then
+    assemble_abuse_report "$ABUSE_IP" "${ABUSE_MIN_HITS:-}" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
+    exit 0
+fi
 
 # 0. ENSURE SETUP IS COMPLETE FOR MAIN LOGIC
 ensure_setup
