@@ -95,6 +95,14 @@ sudo ./scripts/csf_ban_wp_login_attackers --abuse-days 7 --abuse-email --abuse 1
 sudo ./scripts/csf_ban_wp_login_attackers --abuse-min 50 --abuse 1.2.3.4
 ```
 
+- Run a raw grep/search across configured logs for a string or IP (read-only):
+
+```bash
+sudo ./scripts/csf_ban_wp_login_attackers --raw-grep '47.74.19.210'
+# or using the alias
+sudo ./scripts/csf_ban_wp_login_attackers --raw-search 'wp-login'
+```
+
 Implementation notes
 --------------------
 

@@ -54,6 +54,9 @@
 # - --abuse-email
 #     When present, attempt a minimal whois lookup to discover an abuse contact and print a draft abuse email (To:, Subject:, body with sample evidence).
 #     Always manually verify any auto-discovered contact before sending.
+# - --raw-grep <STRING>
+#     Run a raw grep for the supplied string across all configured log files and print filename:line_num:line results.
+#     This is read-only and will not modify firewall state. Alias: --raw-search
 # ----------------------------
 
 # --- Script Collaboration Credit ---
@@ -465,7 +468,7 @@ perform_clear() {
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -491,6 +494,8 @@ while true; do
             echo "  --abuse-since <STRING>    Simple substring filter for 'since' date token"
             echo "  --abuse-until <STRING>    Simple substring filter for 'until' date token"
             echo "  --abuse-email             Attempt minimal whois lookup and print a draft abuse email"
+            echo "  --raw-grep <STRING>       Run a raw grep for <STRING> across configured log files and print results (read-only)"
+            echo "  --raw-search <STRING>     Alias for --raw-grep"
             exit 0
             ;;
     --whitelist | --unblock )
@@ -583,6 +588,17 @@ while true; do
                             ABUSE_MIN_HITS="$MIN_HITS_TO_USE"
                             shift 0
                             ;;
+                    --raw-grep | --raw-search )
+                      RAW_PATTERN="$2"
+                      if [ -z "$RAW_PATTERN" ]; then
+                          echo "Error: $1 requires a search string argument."
+                          exit 1
+                      fi
+                      # Record requested raw search parameters; actual execution happens after functions are defined
+                      RAW_RUN=1
+                      RAW_PATTERN_ESCAPED="$RAW_PATTERN"
+                      shift 2
+                      ;;
     --logs )
       LOG_PATHS="$2"
       shift 2
@@ -1066,6 +1082,31 @@ find_top_offenders() {
 # If an abuse report was requested, run it now (functions are defined at this point)
 if [ "${ABUSE_RUN:-0}" -eq 1 ]; then
     assemble_abuse_report "${ABUSE_IP:-}" "${ABUSE_MIN_HITS:-}" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
+    exit 0
+fi
+
+# If a raw grep/search was requested, run it now (functions are defined at this point)
+if [ "${RAW_RUN:-0}" -eq 1 ]; then
+    # Ensure LOG_PATHS is set
+    if [ -z "$LOG_PATHS" ]; then
+        LOG_PATHS="$DEFAULT_LOG_PATHS"
+    fi
+
+    # Create a safe temp file to store raw grep results
+    RAW_TMP=$(mktemp -t raw_grep_XXXXXX) || RAW_TMP="/tmp/raw_grep_${RAW_PATTERN_ESCAPED//[^A-Za-z0-9]/_}.log"
+
+    echo "Running raw grep for: '$RAW_PATTERN_ESCAPED' across: $LOG_PATHS"
+    # Use grep -Hn --color=never to show filename:line and line numbers; do not use color codes in output
+    # shellcheck disable=SC2086
+    grep -Hn --color=never -- "${RAW_PATTERN_ESCAPED}" $LOG_PATHS 2>/dev/null | tee "$RAW_TMP" || true
+
+    if [ -s "$RAW_TMP" ]; then
+        echo "Raw grep results saved to: $RAW_TMP"
+    else
+        echo "No matches found for '$RAW_PATTERN_ESCAPED' in: $LOG_PATHS"
+        rm -f "$RAW_TMP" 2>/dev/null || true
+    fi
+
     exit 0
 fi
 
