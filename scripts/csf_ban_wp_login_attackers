@@ -781,6 +781,30 @@ provider_abuse_contact() {
     whois "$ip" 2>/dev/null | awk '/abuse|Abuse|abuse-mailbox|OrgAbuseEmail|OrgAbuse|OrgNOC|Abuse-c/ {print}' | grep -E -o '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | head -1 || true
 }
 
+# provider_network_lookup <ip>
+# Best-effort: return a short netblock or route string from whois output
+provider_network_lookup() {
+    local ip=$1
+    if [ -z "$ip" ]; then
+        echo ""
+        return 0
+    fi
+    if ! command -v whois >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+    # Try common whois fields
+    whois "$ip" 2>/dev/null | awk 'tolower($0) ~ /netrange|inetnum|cidr|route/ {gsub(/^[ \t]+|[ \t]+$/, ""); print; exit}' | sed -n '1p' || true
+}
+
+# get_primary_ip
+# Best-effort: find the primary outbound IPv4 address for this host
+get_primary_ip() {
+    ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}' || \
+    hostname -I 2>/dev/null | awk '{print $1}' || \
+    hostname -i 2>/dev/null || echo ""
+}
+
  # shellcheck disable=SC2329
 assemble_abuse_report() {
     local ip="$1"
@@ -901,9 +925,60 @@ assemble_abuse_report() {
     fi
 
     if [ "$total_matches" -lt "$min_hits" ]; then
-        echo "IP $ip matched $total_matches keyword-related log lines (< $min_hits). No report generated."
-        echo "Raw IP lines: $tmp_all"
-        echo "Filtered matches (if any): $tmp_matches"
+        # Build a concise markdown-style overview even when below threshold
+        now=$(date -u '+%Y-%m-%d %H:%M:%SZ')
+        our_ip=$(get_primary_ip)
+        geo=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | head -1 || true)
+        network=$(provider_network_lookup "$ip" )
+        contact=$(provider_abuse_contact "$ip" ) || contact=""
+
+        # Collect human-readable descriptions from matched keywords
+        descriptions=""
+        for key in "${!keywords[@]}"; do
+            kw=$(echo "$key" | cut -d' ' -f2-)
+            if [ -n "$kw" ] && [ -s "$tmp_matches" ] && grep -qi -E -- "$kw" "$tmp_matches" 2>/dev/null; then
+                # Append description if not already present
+                desc="${keywords[$key]}"
+                if ! echo "$descriptions" | grep -F -x -q "$desc" 2>/dev/null; then
+                    if [ -z "$descriptions" ]; then
+                        descriptions="$desc"
+                    else
+                        descriptions="$descriptions; $desc"
+                    fi
+                fi
+            fi
+        done
+
+        echo "" 
+        echo "# IP Abuse Report generated on $now"
+        echo "- Our server IP: ${our_ip:-'Unknown'}"
+        echo "- Attacking IP: $ip ${geo:+($geo)}"
+        echo "- Network: ${network:-'Not found'}"
+        if [ -n "$contact" ]; then
+            echo "- Abuse contact: $contact"
+        else
+            echo "- Abuse contact: Not found via whois"
+        fi
+        echo ""
+        echo "## Description of abuse"
+        if [ -n "$descriptions" ]; then
+            echo "$descriptions"
+        else
+            echo "No keyword descriptions matched; see examples below." 
+        fi
+        echo ""
+        echo "## Examples of abuse (up to 10 lines)"
+        if [ -s "$tmp_matches" ]; then
+            head -n 10 "$tmp_matches"
+        else
+            head -n 10 "$tmp_all"
+        fi
+        echo ""
+        echo "## Full results (temporary files)"
+        echo "- Raw IP lines: $tmp_all"
+        echo "- Filtered matches: $tmp_matches"
+        echo ""
+        echo "(Threshold was $min_hits; matched $total_matches lines.)"
         return 0
     fi
 
