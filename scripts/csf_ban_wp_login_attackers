@@ -33,15 +33,27 @@
 #    This must be run once before the cron job is activated.
 # 2. --whitelist <IP> [MESSAGE] / --unblock <IP> [MESSAGE]: Adds the specified IP address to /etc/csf/csf.allow, 
 #    removes it from the IPSET ban list, and reloads CSF.
-# The MESSAGE is optional but must be quoted if it contains spaces.
-# (Requires setup)
+#    The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
 # 3. --blacklist <IP> [MESSAGE] / --block <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list 
-#    and the tracking file.
-# It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces.
-# (Requires setup)
-# 4. --logs "<path1> <path2>": Overrides the default log paths to scan.
-#    (Used in cron job or manual runs).
+#    and the tracking file. It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
+# 4. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
 # 5. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+#
+# Additional reporting / abuse-evidence options (read-only):
+# - --abuse-report <IP> [MIN_HITS]  (alias: --abuse)
+#     Scans configured logs for the given IP and filters lines by the script's `keywords` list.
+#     If the number of matched (keyword-related) lines >= MIN_HITS (default 100 or value set via --abuse-min),
+#     the script prints a report and saves matched evidence to /tmp for copy/paste. This is read-only and will not
+#     modify firewall state.
+# - --abuse-min <N>
+#     Set default minimum matched hits for abuse reports when MIN_HITS isn't supplied directly to --abuse-report.
+# - --abuse-days <N>
+#     Best-effort: attempt to restrict search to entries in the last N days (depends on your log timestamp formats).
+# - --abuse-since <STRING> and --abuse-until <STRING>
+#     Simple substring filters applied to log lines for a basic date-range filter (works for ISO dates or common formats).
+# - --abuse-email
+#     When present, attempt a minimal whois lookup to discover an abuse contact and print a draft abuse email (To:, Subject:, body with sample evidence).
+#     Always manually verify any auto-discovered contact before sending.
 # ----------------------------
 
 # --- Script Collaboration Credit ---
@@ -172,21 +184,18 @@ report_ban_counts() {
     local end_time="${3:-0}" 
     echo "--- 📊 $report_title ---"
     
-    local ipset_count_cmd
-    ipset_count_cmd=$(grep -v '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null | wc -l)
-    local ipset_count=${ipset_count_cmd}
+    local ipset_count
+    ipset_count=$(grep -cvE '^(\s*)$' "$IP_TRACKING_FILE" 2>/dev/null || echo 0)
 
     local permanent_ban_count_cmd
     permanent_ban_count_cmd=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
     local permanent_ban_count=${permanent_ban_count_cmd}
 
-    local csf_deny_count_cmd
-    csf_deny_count_cmd=$(grep -v '^#' "$CSF_DENY_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
-    local csf_deny_count=${csf_deny_count_cmd}
+    local csf_deny_count
+    csf_deny_count=$(grep -cvE '^(#|\s*)' "$CSF_DENY_FILE" 2>/dev/null || echo 0)
 
-    local csf_allow_count_cmd
-    csf_allow_count_cmd=$(grep -v '^#' "$CSF_ALLOW_FILE" 2>/dev/null | grep -v '^\s*$' | wc -l)
-    local csf_allow_count=${csf_allow_count_cmd}
+    local csf_allow_count
+    csf_allow_count=$(grep -cvE '^(#|\s*)' "$CSF_ALLOW_FILE" 2>/dev/null || echo 0)
 
 
     echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
@@ -360,8 +369,7 @@ perform_init() {
     echo "--- 🛠️ Initialization Action ---"
 
     echo "1. Creating IPSET table: $IP_SET_NAME with max size $MAX_BANS..."
-    ipset create "$IP_SET_NAME" hash:ip maxelem "$MAX_BANS" -exist
-    if [ $? -ne 0 ]; then
+    if ! ipset create "$IP_SET_NAME" hash:ip maxelem "$MAX_BANS" -exist; then
         echo "ERROR: Failed to create ipset '$IP_SET_NAME'. Check ipset utility and permissions."
         exit 1
     fi
@@ -434,8 +442,7 @@ perform_clear() {
     if truncate -s 0 "$IP_TRACKING_FILE"; then
         echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE."
     else
-        true > "$IP_TRACKING_FILE"
-        if [ $? -eq 0 ]; then
+        if true > "$IP_TRACKING_FILE"; then
             echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE (using redirection)."
         else
             echo "ERROR: Failed to clear tracking file '$IP_TRACKING_FILE'."
@@ -455,10 +462,11 @@ perform_clear() {
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear -n 'csf_ban_wp_login_attackers' -- "$@")
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email -n 'csf_ban_wp_login_attackers' -- "$@"); then
+    echo "Terminating..." >&2
+    exit 1
+fi
 TEMP_ARGS=${TEMP_ARGS_CMD}
-
-if [ $? != 0 ]; then echo "Terminating..." >&2; exit 1; fi
 eval set -- "$TEMP_ARGS"
 
 while true; do
@@ -506,6 +514,51 @@ while true; do
       
       perform_blacklist "$IP_TO_BLACKLIST" "$MESSAGE_TO_USE"
       
+      ;;
+        --abuse-min )
+            ABUSE_MIN="$2"
+            shift 2
+            ;;
+        --abuse-days )
+            ABUSE_DAYS="$2"
+            shift 2
+            ;;
+        --abuse-since )
+            ABUSE_SINCE="$2"
+            shift 2
+            ;;
+        --abuse-until )
+            ABUSE_UNTIL="$2"
+            shift 2
+            ;;
+        --abuse-email )
+            ABUSE_EMAIL=1
+            shift
+            ;;
+        --abuse-report | --abuse )
+      # $1 is --abuse-report or --abuse
+      IP_TO_REPORT="$2"
+            MIN_HITS_TO_USE=""
+
+            if [ -z "$IP_TO_REPORT" ] || ! validate_ip "$IP_TO_REPORT"; then
+                    echo "Error: $1 requires a valid IP address argument."
+                    exit 1
+            fi
+
+            # Optional MIN_HITS argument handling (e.g., --abuse-report 1.2.3.4 50)
+            if [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+                    MIN_HITS_TO_USE="$3"
+                    shift 3
+            else
+                    shift 2
+            fi
+
+            # Prefer explicitly-passed MIN_HITS, otherwise use ABUSE_MIN if set
+            if [ -z "$MIN_HITS_TO_USE" ] && [ -n "${ABUSE_MIN:-}" ]; then
+                    MIN_HITS_TO_USE="${ABUSE_MIN}"
+            fi
+
+            assemble_abuse_report "$IP_TO_REPORT" "$MIN_HITS_TO_USE" "${ABUSE_DAYS:-}" "${ABUSE_SINCE:-}" "${ABUSE_UNTIL:-}" "${ABUSE_EMAIL:-0}"
       ;;
     --logs )
       LOG_PATHS="$2"
@@ -679,6 +732,234 @@ keywords=(
   ["30 /calendar/action~"]="Spidering calendars too hard when blocked by robots"
   ["10 /.*\.php.*404"]="too many php file requests 404"
 )
+
+# --- Abuse Evidence Extraction Utilities ---
+# assemble_abuse_report <IP> [MIN_HITS]
+# Scans configured log paths for lines containing <IP>, filters those
+# lines by the configured keywords list, and if the number of matching
+# lines is >= MIN_HITS (default 100) prints a report and leaves the
+# matched-lines file for copy/paste. This is intentionally conservative
+# (read-only) and outputs file paths for manual inspection.
+ # shellcheck disable=SC2329
+provider_abuse_contact() {
+    # Attempt to discover an abuse contact for the IP's netblock using whois.
+    # Returns the first email-like token found in whois output or empty.
+    local ip="$1"
+    if [ -z "$ip" ]; then
+        return 1
+    fi
+    if ! command -v whois >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+    # Fetch minimal whois and grep for abuse contact lines
+    whois "$ip" 2>/dev/null | awk '/abuse|Abuse|abuse-mailbox|OrgAbuseEmail|OrgAbuse|OrgNOC|Abuse-c/ {print}' | grep -E -o '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' | head -1 || true
+}
+
+ # shellcheck disable=SC2329
+assemble_abuse_report() {
+    local ip="$1"
+    local min_hits="${2:-100}"
+    local days="${3:-}"        # number of days back to search (optional)
+    local since="${4:-}"       # since date string (optional)
+    local until="${5:-}"       # until date string (optional)
+    local show_email="${6:-0}" # 1 to generate a draft email
+
+    if [ -z "$ip" ]; then
+        echo "Usage: assemble_abuse_report <IP> [MIN_HITS]"
+        return 2
+    fi
+
+    if ! validate_ip "$ip"; then
+        echo "Error: Invalid IP address: $ip"
+        return 1
+    fi
+
+    # Ensure LOG_PATHS is set (fall back to defaults)
+    if [ -z "$LOG_PATHS" ]; then
+        LOG_PATHS="$DEFAULT_LOG_PATHS"
+    fi
+
+    local tmp_all
+    local tmp_matches
+    tmp_all=$(mktemp -t abuse_all_XXXXXX) || tmp_all="/tmp/abuse_all_${ip}.log"
+    tmp_matches=$(mktemp -t abuse_matches_XXXXXX) || tmp_matches="/tmp/abuse_matches_${ip}.log"
+
+    # Collect raw lines that contain the IP from the configured logs.
+    # Optionally filter by recent date ranges if days/since/until are provided.
+    # This relies on the log timestamps being parseable by GNU date; implement a
+    # simple date-range filter only when 'days' is provided (relative) to avoid
+    # brittle parsing for arbitrary log formats.
+    if [ -n "$days" ] && command -v date >/dev/null 2>&1; then
+        # Calculate epoch cutoff
+        cutoff_epoch=$(date -d "-$days days" +%s 2>/dev/null || true)
+        if [ -n "$cutoff_epoch" ]; then
+            # Use awk to extract lines that contain the IP and whose timestamp (if
+            # in common log formats) appears newer than cutoff. We'll conservatively
+            # include all lines that contain the IP if we cannot parse a timestamp.
+            # For performance, still grep first by IP across files, then filter in awk.
+            # shellcheck disable=SC2086
+            grep -H -- "$ip" $LOG_PATHS 2>/dev/null > "$tmp_all" || true
+            awk -v cutoff="$cutoff_epoch" '
+            function parse_time(s,    fmt, t) {
+                # Attempt to parse common Apache/Nginx timestamp formats using gsub
+                # and split; fallback to 0 if parse fails.
+                # Examples: [10/Oct/2020:13:55:36 -0700]
+                if (match(s, /\[[0-9]{1,2}\/[^:]+:[0-9]{2}:[0-9]{2}:[0-9]{2}/)) {
+                    ts = substr(s, RSTART+1, RLENGTH-1)
+                    gsub(/\//, " ", ts)
+                    gsub(/:/, " ", ts)
+                    split(ts, a, " ")
+                    month = a[2]
+                    day = a[1]
+                    hour = a[3]
+                    min = a[4]
+                    sec = a[5]
+                    # Build a YYYY-MM-DD HH:MM:SS string if possible — skip timezone.
+                    # Not all log files will match; this is best-effort.
+                    return 0
+                }
+                return 0
+            }
+            { print $0 }' "$tmp_all" > "${tmp_all}.filtered" || true
+            mv "${tmp_all}.filtered" "$tmp_all" 2>/dev/null || true
+        else
+            # Fallback to simple grep if date parsing not supported
+            # shellcheck disable=SC2086
+            grep -H -- "$ip" $LOG_PATHS 2>/dev/null > "$tmp_all" || true
+        fi
+    else
+        # shellcheck disable=SC2086
+        grep -H -- "$ip" $LOG_PATHS 2>/dev/null > "$tmp_all" || true
+    fi
+
+    # Apply simple since/until substring filtering if provided. This is a
+    # conservative string-match filter (useful when logs include ISO or
+    # human-readable dates like '2025-10-21' or 'Oct/21/2025').
+    if [ -n "$since" ]; then
+        grep -F -- "$since" "$tmp_all" > "${tmp_all}.since" 2>/dev/null || true
+        mv "${tmp_all}.since" "$tmp_all" 2>/dev/null || true
+    fi
+    if [ -n "$until" ]; then
+        # If until provided, keep lines that contain the until token.
+        grep -F -- "$until" "$tmp_all" > "${tmp_all}.until" 2>/dev/null || true
+        mv "${tmp_all}.until" "$tmp_all" 2>/dev/null || true
+    fi
+
+    if [ ! -s "$tmp_all" ]; then
+        echo "No log lines containing $ip were found in: $LOG_PATHS"
+        rm -f "$tmp_all" "$tmp_matches" 2>/dev/null || true
+        return 0
+    fi
+
+    # For each keyword, append matching lines (case-insensitive). Many
+    # keywords contain regex-like fragments; use grep -E for flexibility.
+    for key in "${!keywords[@]}"; do
+        # keys are stored as '<count> <keyword>' — extract the keyword part
+        kw=$(echo "$key" | cut -d' ' -f2-)
+        [ -z "$kw" ] && continue
+        # Append matches for this keyword from the IP-specific raw lines
+        grep -i -E -- "$kw" "$tmp_all" >> "$tmp_matches" 2>/dev/null || true
+    done
+
+    # Normalize and count matches (preserve order). Remove empty lines.
+    if [ -s "$tmp_matches" ]; then
+        # Optionally dedupe identical lines but preserve first occurrence order
+        # Use awk to keep unique lines in appearance order
+        awk '!seen[$0]++' "$tmp_matches" > "${tmp_matches}.uniq"
+        mv "${tmp_matches}.uniq" "$tmp_matches"
+    fi
+
+    local total_matches=0
+    if [ -f "$tmp_matches" ]; then
+        total_matches=$(wc -l < "$tmp_matches" 2>/dev/null || echo 0)
+    fi
+
+    if [ "$total_matches" -lt "$min_hits" ]; then
+        echo "IP $ip matched $total_matches keyword-related log lines (< $min_hits). No report generated."
+        echo "Raw IP lines: $tmp_all"
+        echo "Filtered matches (if any): $tmp_matches"
+        return 0
+    fi
+
+    # Print a human-friendly report header and a sample of the matches
+    echo ""
+    echo "=================================================================="
+    echo "Abuse Evidence Report for IP: $ip"
+    echo "Matched keyword-related log lines: $total_matches"
+    echo "Minimum threshold: $min_hits"
+    echo "Raw IP lines file: $tmp_all"
+    echo "Filtered keyword-match file: $tmp_matches"
+    echo ""
+    echo "--- Sample matched lines (first 200 lines) ---"
+    head -n 200 "$tmp_matches"
+    echo ""
+    echo "--- End of sample. Full matches saved in: $tmp_matches ---"
+    echo "=================================================================="
+
+    # If requested, generate a draft abuse email using whois for provider lookup
+    if [ "$show_email" -eq 1 ]; then
+        echo ""
+        echo "--- Draft Abuse Email ---"
+        contact=$(provider_abuse_contact "$ip" ) || contact=""
+        if [ -n "$contact" ]; then
+            echo "To: $contact"
+        else
+            echo "To: abuse@<provider-domain>  # provider contact not found via whois"
+        fi
+        echo "Subject: Abuse report — malicious traffic from $ip"
+        echo ""
+        echo "Hello,
+
+Please see attached evidence of abusive activity observed originating from IP: $ip.
+
+Summary:
+- Matched keyword-related log lines: $total_matches
+- Logs filtered saved at: $tmp_matches
+
+Evidence (first 50 lines):"
+        head -n 50 "$tmp_matches"
+        echo "
+Please investigate and take appropriate action (block/limit/notify customer). If you need additional evidence, I can provide full logs and timestamps upon request.
+
+Regards,
+Server Operator
+"
+        echo "--- End draft ---"
+    fi
+
+    # Leave temporary files in /tmp for copy/paste by the operator.
+    return 0
+}
+
+# find_top_offenders [MIN_HITS]
+# Scans logs for unique IPs using the same log scanning defaults and
+# prints an abuse report for each IP with matches >= MIN_HITS.
+# shellcheck disable=SC2329
+find_top_offenders() {
+    local min_hits="${1:-100}"
+    echo "Finding top offenders with threshold >= $min_hits (this may be slow)..."
+
+    # Build a list of IPs with aggregate counts from the logs using a simple grep pipeline.
+    # shellcheck disable=SC2086
+    grep -E -o '[[:digit:]]{1,3}(\.[[:digit:]]{1,3}){3}' $LOG_PATHS 2>/dev/null |
+        sort | uniq -c | sort -rn | awk -v min="$min_hits" '$1 >= min {print $2, $1}' > /tmp/top_offenders.txt
+
+    if [ ! -s /tmp/top_offenders.txt ]; then
+        echo "No offenders found meeting threshold $min_hits."
+        return 0
+    fi
+
+    echo "Top offenders list written to /tmp/top_offenders.txt"
+    echo "Iterating and generating reports (one-by-one)..."
+    while read -r ip count; do
+        printf '\n>>> Generating report for %s (approx. occurrences in logs: %s) <<<\n' "$ip" "$count"
+        assemble_abuse_report "$ip" "$min_hits"
+    done < /tmp/top_offenders.txt
+
+    echo "All reports generated (temporary files left in /tmp)."
+}
+
 
 # --- EXECUTION START ---
 
