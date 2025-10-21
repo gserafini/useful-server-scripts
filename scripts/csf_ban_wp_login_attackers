@@ -987,7 +987,7 @@ BEGIN {
         
         # Check for permanent status first
         is_new_ban_permanent = 0
-        message = "INSERTED new IP to ipset [Violations: " count ", " description "]"
+        message = "csf_ban_wp_login_attackers inserted IP to ipset [Violations: " count ", " description "]"
         
         if (count >= max_violation_count && permanent_ban_count < max_permanent_bans) {
             message = message " [more than " max_violation_count " do not delete]"
