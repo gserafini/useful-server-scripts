@@ -1096,9 +1096,44 @@ if [ "${RAW_RUN:-0}" -eq 1 ]; then
     RAW_TMP=$(mktemp -t raw_grep_XXXXXX) || RAW_TMP="/tmp/raw_grep_${RAW_PATTERN_ESCAPED//[^A-Za-z0-9]/_}.log"
 
     echo "Running raw grep for: '$RAW_PATTERN_ESCAPED' across: $LOG_PATHS"
-    # Use grep -Hn --color=never to show filename:line and line numbers; do not use color codes in output
+    # Decide whether to use extended regex (-E) if pattern contains '|' (alternation)
+    if [[ "$RAW_PATTERN_ESCAPED" == *"|"* ]]; then
+        GREP_OPTS="-E"
+    else
+        GREP_OPTS=""
+    fi
+
+    # If any entry in LOG_PATHS is a directory, build a file list safely and use xargs -0 grep
+    has_dir=0
+    file_list_tmp=$(mktemp -t raw_grep_files_XXXXXX) || file_list_tmp="/tmp/raw_grep_files.lst"
     # shellcheck disable=SC2086
-    grep -Hn --color=never -- "${RAW_PATTERN_ESCAPED}" $LOG_PATHS 2>/dev/null | tee "$RAW_TMP" || true
+    for p in $LOG_PATHS; do
+        if [ -d "$p" ]; then
+            has_dir=1
+            # Find regular files under the directory and append to file list
+            find "$p" -type f -print0 >> "$file_list_tmp" 2>/dev/null || true
+        elif [ -f "$p" ]; then
+            # Append normal file paths with null separator
+            printf '%s\0' "$p" >> "$file_list_tmp" || true
+        fi
+    done
+
+    if [ "$has_dir" -eq 1 ]; then
+        # Use xargs -0 to handle filenames with spaces/newlines
+        if [ -s "$file_list_tmp" ]; then
+            xargs -0 -a "$file_list_tmp" grep $GREP_OPTS -Hn --color=never -- "${RAW_PATTERN_ESCAPED}" 2>/dev/null | tee "$RAW_TMP" || true
+        else
+            # No files found under directories; fall back to direct grep attempt
+            # shellcheck disable=SC2086
+            grep $GREP_OPTS -Hn --color=never -- "${RAW_PATTERN_ESCAPED}" $LOG_PATHS 2>/dev/null | tee "$RAW_TMP" || true
+        fi
+    else
+        # No directories in LOG_PATHS; safe to call grep directly on files
+        # shellcheck disable=SC2086
+        grep $GREP_OPTS -Hn --color=never -- "${RAW_PATTERN_ESCAPED}" $LOG_PATHS 2>/dev/null | tee "$RAW_TMP" || true
+    fi
+
+    rm -f "$file_list_tmp" 2>/dev/null || true
 
     if [ -s "$RAW_TMP" ]; then
         echo "Raw grep results saved to: $RAW_TMP"
