@@ -8,6 +8,20 @@
 # rotatable ban list synchronized with the CSF firewall rules via csfpost.sh.
 # NOTE: This script must be run with root privileges (e.g., via root's cron job)
 
+# Prerequisites and important notes:
+# - ipset and iptables must be available on the host and the script should be
+#   initialized via the --init flag before enabling in cron (this sets up the
+#   ipset table and the iptables match-set rule via CSF's csfpost.sh).
+# - For immediate termination of already-established TCP sessions when an IP is
+#   banned, install conntrack-tools (provides the `conntrack` command). When
+#   conntrack is present, this script will delete conntrack entries for newly
+#   banned IPs so those sessions are dropped immediately. If conntrack is not
+#   installed, bans still apply to new connections but existing sessions may
+#   persist until closed or timed out.
+#   Example install commands:
+#     RHEL/CentOS: sudo yum install -y conntrack-tools
+#     Debian/Ubuntu: sudo apt-get install -y conntrack
+
 # --- Author and Repository ---
 # Author: Gabriel Serafini / gserafini@gmail.com
 # Repository: https://github.com/gserafini/useful-server-scripts
@@ -255,6 +269,12 @@ perform_blacklist() {
         exit 1
     fi
 
+    # If conntrack-tools is available, delete any conntrack entries for this IP so
+    # established sessions are terminated immediately.
+    if command -v conntrack >/dev/null 2>&1; then
+        conntrack -D -s "$ip" >/dev/null 2>&1 || true
+    fi
+
     echo "$ip # [$timestamp] $ban_reason" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     local end_time_cmd
@@ -305,6 +325,10 @@ perform_whitelist() {
     else
         echo "$ip was not found in tracking file (no action taken)."
     fi
+
+    # Remove any per-IP iptables DROP fallback rule we may have inserted earlier
+    # No per-IP iptables cleanup here — conntrack is preferred. If you want immediate
+    # termination of established connections, install conntrack-tools (see --init message).
 
     echo "Reloading CSF to apply $CSF_ALLOW_FILE changes..."
     /usr/sbin/csf -r
@@ -359,6 +383,17 @@ perform_init() {
     /usr/sbin/csf -r
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
+    # CONNTRACK CHECK: Recommend installing conntrack-tools if you want bans to immediately
+    # terminate established connections. If conntrack is not present, bans still apply to
+    # new connections but existing sessions may persist until closed/timeout.
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "NOTE: 'conntrack' (conntrack-tools) is not installed on this host." 
+        echo "If you want bans to immediately terminate existing TCP sessions, install conntrack-tools."
+        echo "Example (RHEL/CentOS): sudo yum install -y conntrack-tools"
+        echo "Example (Debian/Ubuntu): sudo apt-get install -y conntrack"
+    else
+        echo "conntrack-tools detected: the script can delete conntrack entries to immediately drop existing sessions when an IP is added."
+    fi
     local end_time_cmd
     end_time_cmd=$(date +%s)
     local end_time=${end_time_cmd}
@@ -413,6 +448,8 @@ perform_clear() {
     end_time_cmd=$(date +%s)
     local end_time=${end_time_cmd}
     report_ban_counts "Post-Clear Report" 0 "$end_time"
+    # No per-IP iptables cleanup here — conntrack is preferred. If you want immediate
+    # termination of established connections, install conntrack-tools (see --init message).
     exit 0
 }
 
@@ -1044,6 +1081,11 @@ BEGIN {
         if (is_new_ban_permanent == 1) {
             permanent_ban_count++
         }
+
+        # If conntrack-tools is present on the host, delete conntrack entries for this IP
+        # so established connections are dropped immediately. Use sh -c guard to avoid
+        # errors in environments without conntrack.
+        system("sh -c 'command -v conntrack >/dev/null 2>&1 && conntrack -D -s " ip " >/dev/null 2>&1' 2>/dev/null")
     }
 
     # PROGRESS BAR LOGIC (Prints to stderr in real-time)
