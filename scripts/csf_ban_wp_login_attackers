@@ -662,17 +662,96 @@ MODSEC_EOF
 
         if [[ "$response" =~ ^[Yy][Ee][Ss]$ ]]; then
             echo ""
-            echo "Writing rule to $MODSEC_RULE_FILE..."
 
-            if cp "$TEMP_RULE_FILE" "$MODSEC_RULE_FILE"; then
+            # Check if the config file exists and if our rule is already there
+            local RULE_MARKER="# ModSecurity Instant Ban Integration"
+            local RULE_EXISTS=0
+            local FILE_EXISTS=0
+
+            if [ -f "$MODSEC_RULE_FILE" ]; then
+                FILE_EXISTS=1
+                if grep -q "$RULE_MARKER" "$MODSEC_RULE_FILE"; then
+                    RULE_EXISTS=1
+                fi
+            fi
+
+            if [ $RULE_EXISTS -eq 1 ]; then
+                echo "⚠️  Existing rule detected in $MODSEC_RULE_FILE"
+                echo "Updating rule in place..."
+                echo ""
+
+                # Create backup
+                cp "$MODSEC_RULE_FILE" "${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                echo "Backup created: ${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+                # Remove old rule block (from marker to end of IfModule)
+                # Use awk to remove everything from the marker comment to </IfModule>
+                awk '
+                    /# ============================================================================/ && /ModSecurity Instant Ban/ {
+                        in_block=1
+                    }
+                    !in_block { print }
+                    /<\/IfModule>/ && in_block {
+                        in_block=0
+                        next
+                    }
+                ' "$MODSEC_RULE_FILE" > "${MODSEC_RULE_FILE}.tmp"
+
+                # Append new rule to the temp file
+                echo "" >> "${MODSEC_RULE_FILE}.tmp"
+                cat "$TEMP_RULE_FILE" >> "${MODSEC_RULE_FILE}.tmp"
+
+                # Replace original with updated version
+                mv "${MODSEC_RULE_FILE}.tmp" "$MODSEC_RULE_FILE"
                 chmod 644 "$MODSEC_RULE_FILE"
+
                 echo ""
                 echo "═══════════════════════════════════════════════════════════════════"
-                echo "✅  SUCCESS: ModSecurity Rule Installed"
+                echo "✅  SUCCESS: ModSecurity Rule Updated"
                 echo "═══════════════════════════════════════════════════════════════════"
                 echo ""
-                echo "Rule file written to: $MODSEC_RULE_FILE"
+                echo "Rule updated in: $MODSEC_RULE_FILE"
+                echo "Previous version backed up"
                 echo ""
+
+            elif [ $FILE_EXISTS -eq 1 ]; then
+                echo "Appending rule to existing $MODSEC_RULE_FILE..."
+                echo ""
+
+                # Create backup
+                cp "$MODSEC_RULE_FILE" "${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                echo "Backup created: ${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+                # Append new rule
+                echo "" >> "$MODSEC_RULE_FILE"
+                cat "$TEMP_RULE_FILE" >> "$MODSEC_RULE_FILE"
+                chmod 644 "$MODSEC_RULE_FILE"
+
+                echo ""
+                echo "═══════════════════════════════════════════════════════════════════"
+                echo "✅  SUCCESS: ModSecurity Rule Appended"
+                echo "═══════════════════════════════════════════════════════════════════"
+                echo ""
+                echo "Rule appended to: $MODSEC_RULE_FILE"
+                echo "Previous version backed up"
+                echo ""
+
+            else
+                echo "Creating new $MODSEC_RULE_FILE..."
+                echo ""
+
+                # Create new file
+                cat "$TEMP_RULE_FILE" > "$MODSEC_RULE_FILE"
+                chmod 644 "$MODSEC_RULE_FILE"
+
+                echo ""
+                echo "═══════════════════════════════════════════════════════════════════"
+                echo "✅  SUCCESS: ModSecurity Rule Created"
+                echo "═══════════════════════════════════════════════════════════════════"
+                echo ""
+                echo "Rule file created: $MODSEC_RULE_FILE"
+                echo ""
+            fi
 
                 # Determine if we need sudo prefix for commands
                 local SUDO_PREFIX=""
@@ -718,22 +797,6 @@ MODSEC_EOF
                 fi
                 echo ""
                 echo "═══════════════════════════════════════════════════════════════════"
-            else
-                echo ""
-                echo "❌ ERROR: Failed to write rule file"
-                echo "Could not copy to: $MODSEC_RULE_FILE"
-                echo ""
-                local SUDO_PREFIX=""
-                if [ "$EUID" -ne 0 ]; then
-                    SUDO_PREFIX="sudo "
-                fi
-                echo "Rule content has been saved to: $TEMP_RULE_FILE"
-                echo "You can manually copy it using:"
-                echo "  ${SUDO_PREFIX}cp $TEMP_RULE_FILE $MODSEC_RULE_FILE"
-                echo "  ${SUDO_PREFIX}chmod 644 $MODSEC_RULE_FILE"
-                echo ""
-                return 1
-            fi
         else
             echo ""
             local SUDO_PREFIX=""
