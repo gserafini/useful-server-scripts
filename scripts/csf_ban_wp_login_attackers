@@ -685,18 +685,61 @@ MODSEC_EOF
                 cp "$MODSEC_RULE_FILE" "${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
                 echo "Backup created: ${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
 
-                # Remove old rule block (from marker to end of IfModule)
-                # Use awk to remove everything from the marker comment to </IfModule>
+                # Remove ALL old rule blocks (handles multiple duplicates)
+                # More robust pattern matching to catch all variations
                 awk '
-                    /# ============================================================================/ && /ModSecurity Instant Ban/ {
-                        in_block=1
+                    BEGIN { in_block=0; skip_blank=0 }
+
+                    # Start of our block - multiple possible patterns
+                    /^# =+$/ && /=+$/ {
+                        getline next_line
+                        if (next_line ~ /ModSecurity Instant Ban Integration/) {
+                            in_block=1
+                            next
+                        } else {
+                            print $0
+                            print next_line
+                            next
+                        }
                     }
-                    !in_block { print }
-                    /<\/IfModule>/ && in_block {
-                        in_block=0
+
+                    # Also catch by the comment header
+                    /# ModSecurity Instant Ban Integration/ {
+                        in_block=1
                         next
                     }
+
+                    # Inside block - skip everything
+                    in_block {
+                        # Look for closing tag
+                        if (/<\/IfModule>/) {
+                            in_block=0
+                            skip_blank=1
+                            next
+                        }
+                        next
+                    }
+
+                    # Skip one blank line after block
+                    skip_blank && /^[[:space:]]*$/ {
+                        skip_blank=0
+                        next
+                    }
+                    skip_blank {
+                        skip_blank=0
+                    }
+
+                    # Print everything else
+                    !in_block { print }
                 ' "$MODSEC_RULE_FILE" > "${MODSEC_RULE_FILE}.tmp"
+
+                # Verify the temp file was created and has content
+                if [ ! -s "${MODSEC_RULE_FILE}.tmp" ]; then
+                    echo "❌ ERROR: Rule removal resulted in empty file!"
+                    echo "Original file preserved. Please check manually."
+                    rm -f "${MODSEC_RULE_FILE}.tmp"
+                    return 1
+                fi
 
                 # Append new rule to the temp file
                 echo "" >> "${MODSEC_RULE_FILE}.tmp"
