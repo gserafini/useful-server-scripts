@@ -4,7 +4,9 @@
 #
 # Usage: sudo ./install.sh
 
-set -e  # Exit on error
+# Note: We don't use 'set -e' here because we want to continue
+# processing all scripts even if individual operations fail.
+# Errors are handled explicitly throughout the script.
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then
