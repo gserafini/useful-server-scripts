@@ -510,6 +510,7 @@ perform_install_modsecurity_triggers() {
         "/h.php"
         "/dex.php"
         "gel4y.php"
+        "bu4.php"
     )
 
     # Detect cPanel/WHM vs standard Apache
@@ -1356,6 +1357,7 @@ keywords=(
 ["1 bibil.php.*404"]="bibil.php and got 404 error code"
 ["1 byp.php"]="byp.php"
 ["1 /bx.php"]="bx.php"
+["1 /bu4.php"]="bu4.php"
 ["1 /check.php"]="check.php"
 ["1 /cord.php"]="cord.php"
 ["1 /dex.php"]="dex.php"
