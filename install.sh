@@ -90,9 +90,15 @@ for script in "$SCRIPTS_PATH"/*; do
                 echo "⚠ $script_name (updating symlink)"
                 echo "  Old: $current_target"
                 echo "  New: $script"
-                rm "$target"
-                ln -s "$script" "$target"
-                ((UPDATED++))
+                ERROR_MSG=$(rm "$target" && ln -s "$script" "$target" 2>&1)
+                if [ $? -eq 0 ]; then
+                    echo "  ✓ Updated successfully"
+                    ((UPDATED++))
+                else
+                    echo "  ✗ Failed to update"
+                    echo "  Error: ${ERROR_MSG:-Unknown error}"
+                    ((SKIPPED++))
+                fi
             fi
         elif [ -e "$target" ]; then
             # File exists but is not a symlink
@@ -102,9 +108,17 @@ for script in "$SCRIPTS_PATH"/*; do
             ((SKIPPED++))
         else
             # Create new symlink
-            ln -s "$script" "$target"
-            echo "✓ $script_name (installed)"
-            ((INSTALLED++))
+            ERROR_MSG=$(ln -s "$script" "$target" 2>&1)
+            if [ $? -eq 0 ]; then
+                echo "✓ $script_name (installed)"
+                ((INSTALLED++))
+            else
+                echo "✗ $script_name (FAILED to create symlink)"
+                echo "  Target: $target"
+                echo "  Error: ${ERROR_MSG:-Unknown error}"
+                echo "  Tip: Make sure you're running with sudo and $INSTALL_DIR is writable"
+                ((SKIPPED++))
+            fi
         fi
     fi
 done
