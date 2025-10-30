@@ -21,6 +21,11 @@
 #   Example install commands:
 #     RHEL/CentOS: sudo yum install -y conntrack-tools
 #     Debian/Ubuntu: sudo apt-get install -y conntrack
+# - OPTIONAL: ModSecurity Integration - For INSTANT banning on first malicious request:
+#   Run --install-mod-security-triggers to generate ModSecurity rules that set
+#   the MALICIOUS_IP environment variable, which this script detects and immediately
+#   bans without waiting for cron-based log scanning. This provides real-time
+#   protection against critical threats like shell probes and SQL injection attempts.
 
 # --- Author and Repository ---
 # Author: Gabriel Serafini / gserafini@gmail.com
@@ -31,13 +36,16 @@
 # The script can be run with the following utility flags instead of its default log-scanning mode:
 # 1. --init: Initializes the IPSET table and adds the necessary firewall rules to /etc/csf/csfpost.sh.
 #    This must be run once before the cron job is activated.
-# 2. --whitelist <IP> [MESSAGE] / --unblock <IP> [MESSAGE]: Adds the specified IP address to /etc/csf/csf.allow, 
+# 2. --install-mod-security-triggers: Generates and optionally installs ModSecurity rules that trigger
+#    IMMEDIATE IP banning on first malicious request via MALICIOUS_IP environment variable.
+#    This bypasses the cron-based log scanning for instant protection against critical threats.
+# 3. --whitelist <IP> [MESSAGE] / --unblock <IP> [MESSAGE]: Adds the specified IP address to /etc/csf/csf.allow,
 #    removes it from the IPSET ban list, and reloads CSF.
 #    The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
-# 3. --blacklist <IP> [MESSAGE] / --block <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list 
+# 4. --blacklist <IP> [MESSAGE] / --block <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list
 #    and the tracking file. It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
-# 4. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
-# 5. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+# 5. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 6. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
 #
 # Additional reporting / abuse-evidence options (read-only):
 # - --abuse-report <IP> [MIN_HITS]  (alias: --abuse)
@@ -91,6 +99,15 @@ TEMP_CACHE_EXTRACTION=$(mktemp)
 START_TIME_CMD=$(date +%s)
 START_TIME=${START_TIME_CMD}
 # -------------------------------
+
+# --- MODSECURITY INTEGRATION: CHECK FOR ENVIRONMENT VARIABLE ---
+# If ModSecurity sets MALICIOUS_IP environment variable, immediately ban that IP
+# This allows instant blocking before the cron-based log scan runs
+if [ -n "$MALICIOUS_IP" ]; then
+    # Execute blacklist function with ModSecurity context
+    exec "$0" --blacklist "$MALICIOUS_IP" "ModSecurity triggered ban"
+fi
+# ---------------------------------------------------------------
 
 # Function to safely validate an IP address format
 validate_ip() {
@@ -466,9 +483,266 @@ perform_clear() {
     exit 0
 }
 
+# Function to install/configure ModSecurity integration
+perform_install_modsecurity_triggers() {
+    echo "====================================================================="
+    echo "🔒 ModSecurity Integration Setup"
+    echo "====================================================================="
+    echo ""
+    echo "This will generate ModSecurity rules that trigger IMMEDIATE IP bans"
+    echo "on first malicious request, without waiting for the cron-based log scan."
+    echo ""
+
+    # Define the most critical patterns that should trigger instant bans
+    local CRITICAL_PATTERNS=(
+        "php://filter"
+        "/etc/passwd"
+        "union select"
+        "base64_decode"
+        "wso.php"
+        "/+CSCOE+/logon.html"
+        "alfacgiapi"
+        "alfashell.php"
+        "\.env"
+        "/indo.php"
+        "/as.php"
+        "/0x0x.php"
+        "/h.php"
+        "/dex.php"
+    )
+
+    # Detect cPanel/WHM vs standard Apache
+    local MODSEC_RULE_FILE
+    local IS_CPANEL=0
+    local APACHE_USER="apache"
+
+    if [ -d "/usr/local/cpanel" ] || [ -d "/usr/local/apache/conf" ]; then
+        IS_CPANEL=1
+        APACHE_USER="nobody"  # cPanel uses 'nobody' for Apache
+        # cPanel/WHM: use includes directory that persists across Apache rebuilds
+        MODSEC_RULE_FILE="/usr/local/apache/conf/includes/pre_virtualhost_global.conf"
+    elif [ -d "/etc/httpd/conf.d" ]; then
+        # RHEL/CentOS standard
+        MODSEC_RULE_FILE="/etc/httpd/conf.d/modsecurity_instant_ban.conf"
+    elif [ -d "/etc/apache2/conf.d" ]; then
+        # Debian/Ubuntu
+        MODSEC_RULE_FILE="/etc/apache2/conf.d/modsecurity_instant_ban.conf"
+        APACHE_USER="www-data"
+    else
+        MODSEC_RULE_FILE="/etc/modsecurity_instant_ban.conf"
+    fi
+
+    local SCRIPT_PATH
+    SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+
+    echo "Selected ${#CRITICAL_PATTERNS[@]} high-severity patterns for instant ban:"
+    echo ""
+    for pattern in "${CRITICAL_PATTERNS[@]}"; do
+        echo "  - $pattern"
+    done
+    echo ""
+
+    if [ $IS_CPANEL -eq 1 ]; then
+        echo "🔧 Detected cPanel/WHM system"
+        echo "Rule file location: $MODSEC_RULE_FILE"
+        echo "  (This location persists across Apache rebuilds)"
+        echo "Apache user: $APACHE_USER"
+    else
+        echo "Rule file location: $MODSEC_RULE_FILE"
+        echo "Apache user: $APACHE_USER"
+    fi
+    echo "Ban script location: $SCRIPT_PATH"
+    echo ""
+
+    # Generate the ModSecurity rules
+    local TEMP_RULE_FILE
+    TEMP_RULE_FILE=$(mktemp)
+
+    cat > "$TEMP_RULE_FILE" <<'MODSEC_EOF'
+# ModSecurity Instant Ban Integration
+# Generated by csf_ban_wp_login_attackers --install-mod-security-triggers
+#
+# These rules trigger immediate IP banning on first malicious request
+# instead of waiting for the cron-based log scanning.
+
+MODSEC_EOF
+
+    # Build pattern match list for SecRule
+    local PATTERN_LIST=""
+    for pattern in "${CRITICAL_PATTERNS[@]}"; do
+        if [ -n "$PATTERN_LIST" ]; then
+            PATTERN_LIST="$PATTERN_LIST "
+        fi
+        PATTERN_LIST="$PATTERN_LIST$pattern"
+    done
+
+    # Add the ModSecurity rule
+    cat >> "$TEMP_RULE_FILE" <<MODSEC_EOF
+
+# Rule to detect and ban malicious requests
+SecRule REQUEST_URI|ARGS "@pm $PATTERN_LIST" \\
+    "id:999001,\\
+    phase:2,\\
+    t:none,t:lowercase,t:urlDecode,\\
+    deny,\\
+    status:403,\\
+    log,\\
+    msg:'Critical malicious pattern detected - triggering instant ban',\\
+    logdata:'Matched pattern in: %{MATCHED_VAR_NAME}=%{MATCHED_VAR}',\\
+    tag:'attack/injection',\\
+    severity:'CRITICAL',\\
+    setenv:MALICIOUS_IP=%{REMOTE_ADDR},\\
+    exec:'$SCRIPT_PATH'"
+
+MODSEC_EOF
+
+    # Check if ModSecurity directory exists before showing the rule
+    if [ ! -d "/etc/httpd/conf.d" ] && [ ! -d "/etc/apache2/mods-enabled" ] && [ ! -d "/usr/local/apache/conf" ]; then
+        echo "====================================================================="
+        echo "⚠️  WARNING: Could not detect Apache/ModSecurity installation directory."
+        echo "====================================================================="
+        echo ""
+        echo "Common locations:"
+        echo "  - /usr/local/apache/conf/ (cPanel/WHM)"
+        echo "  - /etc/httpd/conf.d/ (RHEL/CentOS)"
+        echo "  - /etc/apache2/mods-enabled/ (Debian/Ubuntu)"
+        echo ""
+        echo "Generated rule content has been saved to: $TEMP_RULE_FILE"
+        echo ""
+        echo "====================================================================="
+        echo "RULE CONTENT:"
+        echo "====================================================================="
+        cat "$TEMP_RULE_FILE"
+        echo ""
+        echo "====================================================================="
+        echo ""
+        echo "Please manually place this file in your ModSecurity configuration directory."
+        echo ""
+        return 1
+    fi
+
+    # Display the complete rule that will be installed
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo "                   📋 MODSECURITY RULE PREVIEW"
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+    echo "The following rule will be written to:"
+    echo "  👉 $MODSEC_RULE_FILE"
+    echo ""
+    echo "───────────────────────────────────────────────────────────────────"
+    cat "$TEMP_RULE_FILE"
+    echo "───────────────────────────────────────────────────────────────────"
+    echo ""
+    echo "What this rule does:"
+    echo "  • Matches ${#CRITICAL_PATTERNS[@]} critical malicious patterns"
+    echo "  • Denies request with 403 Forbidden"
+    echo "  • Sets MALICIOUS_IP environment variable"
+    echo "  • Executes: $SCRIPT_PATH --blacklist \$IP"
+    echo "  • Triggers INSTANT ban (no cron delay)"
+    echo ""
+    echo "═══════════════════════════════════════════════════════════════════"
+    echo ""
+
+    # Offer to install
+    if [ -t 0 ]; then
+        read -r -p "Write this rule to $MODSEC_RULE_FILE? (yes/no): " response
+
+        if [[ "$response" =~ ^[Yy][Ee][Ss]$ ]]; then
+            echo ""
+            echo "Writing rule to $MODSEC_RULE_FILE..."
+
+            if cp "$TEMP_RULE_FILE" "$MODSEC_RULE_FILE"; then
+                chmod 644 "$MODSEC_RULE_FILE"
+                echo ""
+                echo "═══════════════════════════════════════════════════════════════════"
+                echo "✅  SUCCESS: ModSecurity Rule Installed"
+                echo "═══════════════════════════════════════════════════════════════════"
+                echo ""
+                echo "Rule file written to: $MODSEC_RULE_FILE"
+                echo ""
+
+                if [ $IS_CPANEL -eq 1 ]; then
+                    echo "📋 cPanel/WHM Next Steps:"
+                    echo ""
+                    echo "1. Configure sudo access for Apache user:"
+                    echo "   echo '$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *' | sudo tee /etc/sudoers.d/modsecurity_ban"
+                    echo "   sudo chmod 440 /etc/sudoers.d/modsecurity_ban"
+                    echo ""
+                    echo "2. Verify ModSecurity is enabled in WHM:"
+                    echo "   WHM > Security Center > ModSecurity™ Configuration"
+                    echo ""
+                    echo "3. Restart Apache via WHM or command line:"
+                    echo "   /scripts/restartsrv_httpd"
+                    echo ""
+                    echo "4. Monitor for instant bans:"
+                    echo "   tail -f $IP_TRACKING_FILE"
+                    echo ""
+                    echo "5. Check Apache error log if rules don't trigger:"
+                    echo "   tail -f /usr/local/apache/logs/error_log | grep -i modsec"
+                    echo ""
+                    echo "ℹ️  Note: The rule file location persists across Apache rebuilds via EasyApache."
+                else
+                    echo "Next steps:"
+                    echo ""
+                    echo "1. Configure sudo access:"
+                    echo "   echo '$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *' | sudo tee /etc/sudoers.d/modsecurity_ban"
+                    echo "   sudo chmod 440 /etc/sudoers.d/modsecurity_ban"
+                    echo ""
+                    echo "2. Test Apache configuration:"
+                    echo "   apachectl configtest"
+                    echo ""
+                    echo "3. Restart Apache:"
+                    echo "   systemctl restart httpd  # (or apache2)"
+                    echo ""
+                    echo "4. Monitor for bans:"
+                    echo "   tail -f $IP_TRACKING_FILE"
+                fi
+                echo ""
+                echo "═══════════════════════════════════════════════════════════════════"
+            else
+                echo ""
+                echo "❌ ERROR: Failed to write rule file"
+                echo "Could not copy to: $MODSEC_RULE_FILE"
+                echo ""
+                echo "Rule content has been saved to: $TEMP_RULE_FILE"
+                echo "You can manually copy it using:"
+                echo "  sudo cp $TEMP_RULE_FILE $MODSEC_RULE_FILE"
+                echo "  sudo chmod 644 $MODSEC_RULE_FILE"
+                echo ""
+                return 1
+            fi
+        else
+            echo ""
+            echo "Installation cancelled by user."
+            echo ""
+            echo "Rule content has been saved to: $TEMP_RULE_FILE"
+            echo "To install manually later, run:"
+            echo "  sudo cp $TEMP_RULE_FILE $MODSEC_RULE_FILE"
+            echo "  sudo chmod 644 $MODSEC_RULE_FILE"
+            echo ""
+        fi
+    else
+        echo "═══════════════════════════════════════════════════════════════════"
+        echo "Non-interactive mode detected."
+        echo "═══════════════════════════════════════════════════════════════════"
+        echo ""
+        echo "Rule content has been saved to: $TEMP_RULE_FILE"
+        echo ""
+        echo "To install, run:"
+        echo "  sudo cp $TEMP_RULE_FILE $MODSEC_RULE_FILE"
+        echo "  sudo chmod 644 $MODSEC_RULE_FILE"
+        echo ""
+    fi
+
+    # Don't delete temp file - leave it for manual installation if needed
+    echo "Note: Temporary rule file preserved at: $TEMP_RULE_FILE"
+    exit 0
+}
+
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -480,10 +754,14 @@ while true; do
     --init )
       perform_init
       ;;
+    --install-mod-security-triggers )
+      perform_install_modsecurity_triggers
+      ;;
         --help )
             echo "Usage: $0 [options]"
-            echo "Options:" 
+            echo "Options:"
             echo "  --init                    Initialize ipset and CSF hooks"
+            echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
             echo "  --logs \"<path1> <path2>\"    Override default log paths to scan"

@@ -1,19 +1,8 @@
 # CLAUDE.md
 
----
-
-**📦 This project uses [Agent Success Pack](https://github.com/gserafini/agent-success-pack)**
-
-A framework for structured, AI-optimized project management. Key docs:
-- **[PROGRESS.md](PROGRESS.md)** - Current status & session notes
-- **[IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md)** - Phase breakdown
-- **[ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md)** - Technical decisions (ADRs)
-
-**At session start**: Read PROGRESS.md to understand current state.
-
----
-
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+**Note**: See [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md) for maintenance and enhancement tracking.
 
 ## Project Overview
 

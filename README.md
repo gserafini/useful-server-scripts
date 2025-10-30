@@ -84,15 +84,33 @@ sudo apt-get install -y conntrack ipset
 
 ## Installation
 
-Clone the repository and symlink scripts to `/usr/local/bin/`:
+### Automated Installation (Recommended)
+
+Clone the repository and run the install script:
 
 ```bash
 git clone https://github.com/gserafini/useful-server-scripts.git
 cd useful-server-scripts/
+sudo ./install.sh
+```
+
+The install script will:
+
+- Create symlinks for all scripts in `/usr/local/bin/`
+- Detect and update existing symlinks
+- Provide a summary of what was installed
+- Show next steps for setup
+
+### Manual Installation
+
+Alternatively, you can manually symlink scripts to `/usr/local/bin/`:
+
+```bash
+cd useful-server-scripts/
 for f in `ls scripts/` ; do sudo ln -s $PWD/scripts/$f /usr/local/bin/$f ; done
 ```
 
-This makes all scripts available system-wide as commands (e.g., `sudo csf_ban_wp_login_attackers --init`).
+Both methods make all scripts available system-wide as commands (e.g., `sudo csf_ban_wp_login_attackers --init`).
 
 ## Quick Start
 
