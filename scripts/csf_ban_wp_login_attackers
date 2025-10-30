@@ -753,7 +753,24 @@ MODSEC_EOF
                 echo ""
             fi
 
-                # Determine if we need sudo prefix for commands
+                # Automatically configure sudoers if running as root
+                local SUDOERS_CONFIGURED=0
+                if [ "$EUID" -eq 0 ]; then
+                    echo "Configuring sudo access for Apache user ($APACHE_USER)..."
+                    local SUDOERS_FILE="/etc/sudoers.d/modsecurity_ban"
+                    local SUDOERS_RULE="$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *"
+
+                    if echo "$SUDOERS_RULE" > "$SUDOERS_FILE" 2>/dev/null && chmod 440 "$SUDOERS_FILE" 2>/dev/null; then
+                        echo "✅ Sudoers configured: $SUDOERS_FILE"
+                        SUDOERS_CONFIGURED=1
+                    else
+                        echo "⚠️  Could not write sudoers file (will show manual instructions)"
+                        SUDOERS_CONFIGURED=0
+                    fi
+                    echo ""
+                fi
+
+                # Determine if we need sudo prefix for remaining commands
                 local SUDO_PREFIX=""
                 if [ "$EUID" -ne 0 ]; then
                     SUDO_PREFIX="sudo "
@@ -762,11 +779,17 @@ MODSEC_EOF
                 if [ $IS_CPANEL -eq 1 ]; then
                     echo "📋 cPanel/WHM Next Steps:"
                     echo ""
-                    echo "1. Configure sudo access for Apache user:"
-                    echo "   echo '$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *' | ${SUDO_PREFIX}tee /etc/sudoers.d/modsecurity_ban"
-                    echo "   ${SUDO_PREFIX}chmod 440 /etc/sudoers.d/modsecurity_ban"
-                    echo ""
-                    echo "2. Verify ModSecurity is enabled in WHM:"
+                    if [ $SUDOERS_CONFIGURED -eq 0 ]; then
+                        echo "1. Configure sudo access for Apache user:"
+                        echo "   echo '$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *' | ${SUDO_PREFIX}tee /etc/sudoers.d/modsecurity_ban"
+                        echo "   ${SUDO_PREFIX}chmod 440 /etc/sudoers.d/modsecurity_ban"
+                        echo ""
+                        echo "2. Verify ModSecurity is enabled in WHM:"
+                    else
+                        echo "1. ✅ Sudoers configured (Apache user can execute ban script)"
+                        echo ""
+                        echo "2. Verify ModSecurity is enabled in WHM:"
+                    fi
                     echo "   WHM > Security Center > ModSecurity™ Configuration"
                     echo ""
                     echo "3. Restart Apache via WHM or command line:"
@@ -782,11 +805,17 @@ MODSEC_EOF
                 else
                     echo "Next steps:"
                     echo ""
-                    echo "1. Configure sudo access:"
-                    echo "   echo '$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *' | ${SUDO_PREFIX}tee /etc/sudoers.d/modsecurity_ban"
-                    echo "   ${SUDO_PREFIX}chmod 440 /etc/sudoers.d/modsecurity_ban"
-                    echo ""
-                    echo "2. Test Apache configuration:"
+                    if [ $SUDOERS_CONFIGURED -eq 0 ]; then
+                        echo "1. Configure sudo access:"
+                        echo "   echo '$APACHE_USER ALL=(ALL) NOPASSWD: $SCRIPT_PATH --blacklist *' | ${SUDO_PREFIX}tee /etc/sudoers.d/modsecurity_ban"
+                        echo "   ${SUDO_PREFIX}chmod 440 /etc/sudoers.d/modsecurity_ban"
+                        echo ""
+                        echo "2. Test Apache configuration:"
+                    else
+                        echo "1. ✅ Sudoers configured (Apache user can execute ban script)"
+                        echo ""
+                        echo "2. Test Apache configuration:"
+                    fi
                     echo "   apachectl configtest"
                     echo ""
                     echo "3. Restart Apache:"
