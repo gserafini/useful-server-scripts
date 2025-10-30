@@ -681,9 +681,10 @@ MODSEC_EOF
                 echo "Updating rule in place..."
                 echo ""
 
-                # Create backup
-                cp "$MODSEC_RULE_FILE" "${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-                echo "Backup created: ${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                # Create backup with unique timestamp
+                local BACKUP_FILE="${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                cp "$MODSEC_RULE_FILE" "$BACKUP_FILE"
+                echo "Backup created: $BACKUP_FILE"
 
                 # Remove ALL old rule blocks (handles multiple duplicates)
                 # More robust pattern matching to catch all variations
@@ -762,9 +763,10 @@ MODSEC_EOF
                 echo "Appending rule to existing $MODSEC_RULE_FILE..."
                 echo ""
 
-                # Create backup
-                cp "$MODSEC_RULE_FILE" "${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-                echo "Backup created: ${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                # Create backup with unique timestamp
+                local BACKUP_FILE="${MODSEC_RULE_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+                cp "$MODSEC_RULE_FILE" "$BACKUP_FILE"
+                echo "Backup created: $BACKUP_FILE"
 
                 # Append new rule
                 echo "" >> "$MODSEC_RULE_FILE"
@@ -994,8 +996,102 @@ MODSEC_EOF
                 fi
 
                 echo ""
-                echo "✅ ModSecurity rules are now active!"
-                echo ""
+                echo "Validating Apache configuration..."
+
+                # Test Apache configuration syntax
+                local CONFIG_TEST_RESULT=0
+                if command -v apachectl >/dev/null 2>&1; then
+                    if ! apachectl configtest 2>&1 | grep -q "Syntax OK"; then
+                        CONFIG_TEST_RESULT=1
+                    fi
+                elif command -v /usr/local/apache/bin/httpd >/dev/null 2>&1; then
+                    if ! /usr/local/apache/bin/httpd -t 2>&1 | grep -q "Syntax OK"; then
+                        CONFIG_TEST_RESULT=1
+                    fi
+                fi
+
+                # Check if Apache is actually running after restart
+                local APACHE_RUNNING=0
+                if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
+                    # cPanel old systems
+                    if /scripts/restartsrv_httpd --status 2>/dev/null | grep -q "running"; then
+                        APACHE_RUNNING=1
+                    fi
+                else
+                    # systemctl systems
+                    if systemctl is-active httpd.service >/dev/null 2>&1; then
+                        APACHE_RUNNING=1
+                    elif systemctl is-active apache2.service >/dev/null 2>&1; then
+                        APACHE_RUNNING=1
+                    elif service httpd status 2>/dev/null | grep -q "running"; then
+                        APACHE_RUNNING=1
+                    elif service apache2 status 2>/dev/null | grep -q "running"; then
+                        APACHE_RUNNING=1
+                    fi
+                fi
+
+                # Rollback if Apache failed
+                if [ $CONFIG_TEST_RESULT -ne 0 ] || [ $APACHE_RUNNING -eq 0 ]; then
+                    echo ""
+                    echo "════════════════════════════════════════════════════════════════════"
+                    echo "❌  ERROR: Apache configuration test failed or Apache not running!"
+                    echo "════════════════════════════════════════════════════════════════════"
+                    echo ""
+                    echo "🔄 Rolling back to previous configuration..."
+
+                    # Restore backup
+                    if [ -f "$BACKUP_FILE" ]; then
+                        cp "$BACKUP_FILE" "$MODSEC_RULE_FILE"
+                        echo "✓ Previous configuration restored from: $BACKUP_FILE"
+
+                        # Try to restart Apache with old config
+                        echo ""
+                        echo "Attempting to restart Apache with previous configuration..."
+                        if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
+                            /scripts/restartsrv_httpd --restart --hard 2>&1
+                        else
+                            systemctl restart httpd.service 2>&1 || systemctl restart apache2.service 2>&1 || service httpd restart 2>&1
+                        fi
+
+                        echo ""
+                        echo "════════════════════════════════════════════════════════════════════"
+                        echo "🔍 DEBUG INFORMATION:"
+                        echo "════════════════════════════════════════════════════════════════════"
+                        echo ""
+                        echo "The ModSecurity rule may have syntax errors. Check Apache error log:"
+                        if [ -f /usr/local/apache/logs/error_log ]; then
+                            echo ""
+                            echo "Last 20 lines of Apache error log:"
+                            tail -20 /usr/local/apache/logs/error_log 2>/dev/null || echo "(Could not read error log)"
+                        elif [ -f /var/log/apache2/error.log ]; then
+                            echo ""
+                            echo "Last 20 lines of Apache error log:"
+                            tail -20 /var/log/apache2/error.log 2>/dev/null || echo "(Could not read error log)"
+                        elif [ -f /var/log/httpd/error_log ]; then
+                            echo ""
+                            echo "Last 20 lines of Apache error log:"
+                            tail -20 /var/log/httpd/error_log 2>/dev/null || echo "(Could not read error log)"
+                        fi
+                        echo ""
+                        echo "Generated rule (may contain errors):"
+                        echo "  $TEMP_RULE_FILE"
+                        echo ""
+                        echo "Backup configuration:"
+                        echo "  $BACKUP_FILE"
+                        echo ""
+                        echo "════════════════════════════════════════════════════════════════════"
+                    else
+                        echo "❌ ERROR: Backup file not found! Cannot rollback."
+                        echo "   Previous config should still be at: ${MODSEC_RULE_FILE}.backup.*"
+                    fi
+
+                    exit 1
+                else
+                    echo "✓ Apache configuration valid and service is running"
+                    echo ""
+                    echo "✅ ModSecurity rules are now active!"
+                    echo ""
+                fi
         else
             echo ""
             local SUDO_PREFIX=""
