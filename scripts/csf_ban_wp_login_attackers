@@ -509,6 +509,7 @@ perform_install_modsecurity_triggers() {
         "/0x0x.php"
         "/h.php"
         "/dex.php"
+        "gel4y.php"
     )
 
     # Detect cPanel/WHM vs standard Apache
