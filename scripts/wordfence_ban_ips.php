@@ -32,9 +32,9 @@ $params = "?get_wordfence_blocked_ips=true&format=$format&maxdays=$maxdays&limit
 $csf_deny_file = '/etc/csf/csf.deny';
 $csf_ignore_file = '/etc/csf/csf.ignore';
 $csf_allow_file = '/etc/csf/csf.allow';
+$ban_script = '/usr/local/bin/csf_ban_wp_login_attackers';
 
-$csf_deny_file_for_dashboard = '/home/serafini/public_html/version-checker/csf_deny.txt';
-
+// Check existing IPs in CSF files and IPSET
 $csf_deny_file_contents = file_get_contents($csf_deny_file);
 echo "Lines in $csf_deny_file: " . count( explode(PHP_EOL,$csf_deny_file_contents)). "\n";
 
@@ -44,9 +44,13 @@ echo "Lines in $csf_ignore_file: " . count( explode(PHP_EOL,$csf_ignore_file_con
 $csf_allow_file_contents = file_get_contents($csf_allow_file);
 echo "Lines in $csf_allow_file: " . count( explode(PHP_EOL,$csf_allow_file_contents)). "\n";
 
+// Get IPs already in IPSET (using high_volume_bans set name)
+$ipset_ips = shell_exec('ipset list high_volume_bans 2>/dev/null | grep -E "^[0-9]" || echo ""');
+echo "IPs in IPSET: " . count( explode(PHP_EOL, trim($ipset_ips))). "\n";
+
 echo "\n";
 
-$existing_ips = $csf_ignore_file_contents.$csf_allow_file_contents.$csf_deny_file_contents;
+$existing_ips = $csf_ignore_file_contents.$csf_allow_file_contents.$csf_deny_file_contents.$ipset_ips;
 
 foreach ($sites as $site) {
 	$url = $site . $params;
@@ -68,40 +72,38 @@ foreach ($sites as $site) {
 echo "\n";
 echo "Found total of " . count($ips_to_ban) . " IPs to check! \n";
 
-$lines_to_insert = '';
+$ips_added = 0;
 
 foreach ($ips_to_ban as $IP => $details) {
 	//echo "Checking $IP\n";
 	if (strpos($existing_ips, $IP) === false) {
-		$do_not_delete_limit = 10;
-		$do_not_delete = '';
-		if ($details->blockCount > $do_not_delete_limit) {
-			$do_not_delete = " [More than $do_not_delete_limit blocks, do not delete ] ";
+		// Build reason string for ban
+		$reason = "WordFence: {$details->blockCount} blocks for {$details->blockType} on {$details->site} ({$details->countryCode} {$details->countryName})";
+
+		echo "Banning $IP: $reason\n";
+
+		// Call csf_ban_wp_login_attackers to add to IPSET
+		$cmd = escapeshellcmd($ban_script) . ' --blacklist ' . escapeshellarg($IP) . ' ' . escapeshellarg($reason) . ' 2>&1';
+		$output = shell_exec($cmd);
+
+		if ($output) {
+			echo "  Output: " . trim($output) . "\n";
 		}
-		$lines_to_insert .= "$IP # Bulk banning IPs (/root/wordfence_ban_ips.php) WordFence blocked " . $details->blockCount . " times for " . $details->blockType . " on " . $details->site . $do_not_delete . " (" . $details->countryCode . " " . $details->countryName . ") - " . date("D M j G:i:s Y") . "\n";
+
+		$ips_added++;
 	}
 	else {
 		unset($ips_to_ban[$IP]);
 	}
 }
 
-
-if (count($ips_to_ban) > 0) {
-	echo count($ips_to_ban) . " IPs not found in csf.deny\n";
-	echo "Writing ips to $csf_deny_file\n";
-	echo $lines_to_insert . "\n";
-	$csf_deny_file_contents .= $lines_to_insert;
-
-	// Let's let CSF worry about the additional lines being added the next time an address is added through another process.
-	file_put_contents($csf_deny_file, $csf_deny_file_contents);
-	file_put_contents($csf_deny_file_for_dashboard, $csf_deny_file_contents);
-	chown($csf_deny_file_for_dashboard, 'serafini');
+if ($ips_added > 0) {
+	echo "\nSuccessfully added $ips_added IPs to IPSET via csf_ban_wp_login_attackers\n";
 }
 else {
-	echo "No IPs found to add, all have already been added to $csf_deny_file.\n";
+	echo "\nNo new IPs to add - all IPs already banned in CSF or IPSET.\n";
 }
 
-echo "Addedd " . count($ips_to_ban) . " IPs to $csf_deny_file\n";
 echo "Done!\n";
 
 
