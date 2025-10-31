@@ -107,12 +107,13 @@ while IFS= read -r line; do
 
         # Show progress every 100 IPs
         if (( counter % 100 == 0 )); then
-            echo "Progress: $counter/$total_ips IPs processed..."
+            echo "Progress: $counter/$total_ips IPs processed (added: $added, skipped: $skipped, errors: $errors)"
         fi
 
         # Check if IP is already in IPSET
         if ipset test "$IP_SET_NAME" "$ip" &>/dev/null; then
             ((skipped++))
+            echo "[$counter/$total_ips] Skipped $ip (already in IPSET)"
             continue
         fi
 
@@ -121,10 +122,12 @@ while IFS= read -r line; do
             ((added++))
         else
             # Add to IPSET using ban script
+            echo "[$counter/$total_ips] Adding $ip..."
             if output=$("$BAN_SCRIPT" --blacklist "$ip" "$reason" 2>&1); then
                 ((added++))
+                echo "  ✓ Added successfully"
             else
-                echo "Error adding $ip: $output"
+                echo "  ✗ Error: $output"
                 ((errors++))
             fi
         fi
