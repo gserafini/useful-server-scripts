@@ -84,6 +84,9 @@ skipped=0
 errors=0
 counter=0
 
+echo "DEBUG: Starting to process IPs from $CSF_DENY_FILE"
+echo "DEBUG: Counters initialized"
+
 # Process each line in csf.deny
 while IFS= read -r line; do
     # Skip empty lines and comments
