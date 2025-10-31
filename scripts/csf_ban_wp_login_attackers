@@ -84,16 +84,13 @@ MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, based 
 DEFAULT_LOG_PATHS="/usr/local/apache/logs/apache_mainlog /usr/local/apache/domlogs /usr/local/apache/logs/error_log"
 LOG_PATHS="" 
 
-# Temporary file for IP aggregation across all keywords
-TEMP_AGGREGATE_FILE=$(mktemp)
-# Temporary file for unique aggregated IPs 
-TEMP_UNIQUE_IPS=$(mktemp)
-# Temporary file for the new, complete tracking list
-TEMP_TRACKING_FILE=$(mktemp)
-# NEW: Temporary file to cache the IP -> Country map
-TEMP_GEOIP_MAPPING=$(mktemp)
-# NEW: Temporary file to hold the robustly extracted cache
-TEMP_CACHE_EXTRACTION=$(mktemp)
+# Temporary files - initialized later only when needed for log scanning operations
+# Creating them here was wasteful for --blacklist/--whitelist/--init calls
+TEMP_AGGREGATE_FILE=""
+TEMP_UNIQUE_IPS=""
+TEMP_TRACKING_FILE=""
+TEMP_GEOIP_MAPPING=""
+TEMP_CACHE_EXTRACTION=""
 
 # --- TIMING VARIABLE ---
 START_TIME_CMD=$(date +%s)
@@ -1885,6 +1882,14 @@ echo " "
 # --- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---
 echo "--- 🛡️ 2. START: LOG SCANNING (EXTRACTION PHASE) ---"
 echo "Log paths being scanned: $LOG_PATHS"
+
+# Create temporary files NOW (only when actually doing log scanning)
+# This avoids creating unnecessary temp files for --blacklist/--whitelist calls
+TEMP_AGGREGATE_FILE=$(mktemp)
+TEMP_UNIQUE_IPS=$(mktemp)
+TEMP_TRACKING_FILE=$(mktemp)
+TEMP_GEOIP_MAPPING=$(mktemp)
+TEMP_CACHE_EXTRACTION=$(mktemp)
 
 TOTAL_KEYWORDS=${#keywords[@]}
 KEYWORD_COUNT=0
