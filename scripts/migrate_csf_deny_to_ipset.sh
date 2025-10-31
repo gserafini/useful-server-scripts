@@ -89,15 +89,22 @@ echo "DEBUG: Counters initialized"
 
 # Process each line in csf.deny
 while IFS= read -r line; do
+    echo "DEBUG: Read line: ${line:0:50}..."  # Show first 50 chars
+
     # Skip empty lines and comments
     if [[ -z "$line" ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+        echo "DEBUG: Skipping empty/comment line"
         continue
     fi
+
+    echo "DEBUG: Extracting IP from line"
 
     # Extract IP and reason
     if [[ "$line" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*(#.*)?$ ]]; then
         ip="${BASH_REMATCH[1]}"
         reason="${BASH_REMATCH[2]}"
+
+        echo "DEBUG: Extracted IP: $ip"
 
         # Clean up reason (remove leading # and whitespace)
         reason=$(echo "$reason" | sed 's/^#[[:space:]]*//')
