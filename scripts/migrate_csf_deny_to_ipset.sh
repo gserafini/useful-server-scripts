@@ -65,7 +65,7 @@ fi
 
 # Ask for confirmation unless dry-run or --force
 if [[ $DRY_RUN -eq 0 ]] && [[ $FORCE -eq 0 ]]; then
-    read -p "Proceed with migration? This will add $total_ips IPs to IPSET. [y/N] " -n 1 -r
+    read -p "Proceed with migration? This will add $total_ips IPs to IPSET. [y/N] " -n 1 -r || true
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "Migration cancelled"
