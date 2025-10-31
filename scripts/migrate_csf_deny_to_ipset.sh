@@ -3,7 +3,9 @@
 #
 # Migrates all IPs from /etc/csf/csf.deny to IPSET using csf_ban_wp_login_attackers
 #
-# Usage: sudo ./migrate_csf_deny_to_ipset.sh [--dry-run]
+# Usage: sudo ./migrate_csf_deny_to_ipset.sh [--dry-run] [--force]
+#   --dry-run: Preview migration without making changes
+#   --force:   Skip confirmation prompt (useful for automated runs)
 #
 # Author: Gabriel Serafini <gserafini@gmail.com>
 
@@ -13,13 +15,21 @@ CSF_DENY_FILE="/etc/csf/csf.deny"
 BAN_SCRIPT="/usr/local/bin/csf_ban_wp_login_attackers"
 IP_SET_NAME="high_volume_bans"  # Must match csf_ban_wp_login_attackers
 DRY_RUN=0
+FORCE=0
 
-# Check for --dry-run flag
-if [[ "${1:-}" == "--dry-run" ]]; then
-    DRY_RUN=1
-    echo "DRY RUN MODE - No IPs will be added to IPSET"
-    echo ""
-fi
+# Check for flags
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)
+            DRY_RUN=1
+            echo "DRY RUN MODE - No IPs will be added to IPSET"
+            echo ""
+            ;;
+        --force)
+            FORCE=1
+            ;;
+    esac
+done
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
@@ -53,14 +63,17 @@ if [[ $total_ips -eq 0 ]]; then
     exit 0
 fi
 
-# Ask for confirmation unless dry-run
-if [[ $DRY_RUN -eq 0 ]]; then
+# Ask for confirmation unless dry-run or --force
+if [[ $DRY_RUN -eq 0 ]] && [[ $FORCE -eq 0 ]]; then
     read -p "Proceed with migration? This will add $total_ips IPs to IPSET. [y/N] " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "Migration cancelled"
         exit 0
     fi
+    echo ""
+elif [[ $FORCE -eq 1 ]]; then
+    echo "FORCE mode enabled - proceeding without confirmation"
     echo ""
 fi
 
