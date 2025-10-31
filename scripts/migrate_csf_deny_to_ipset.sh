@@ -108,19 +108,24 @@ while IFS= read -r line; do
 
         # Clean up reason (remove leading # and whitespace)
         reason=$(echo "$reason" | sed 's/^#[[:space:]]*//')
+        echo "DEBUG: Cleaned reason: $reason"
 
         # Use default reason if empty
         if [[ -z "$reason" ]]; then
             reason="Migrated from csf.deny"
         fi
+        echo "DEBUG: Final reason: $reason"
 
-        ((counter++))
+        echo "DEBUG: About to increment counter from $counter"
+        ((counter++)) || true
+        echo "DEBUG: Counter incremented to $counter"
 
         # Show progress every 100 IPs
         if (( counter % 100 == 0 )); then
             echo "Progress: $counter/$total_ips IPs processed (added: $added, skipped: $skipped, errors: $errors)"
         fi
 
+        echo "DEBUG: About to check if IP is in IPSET"
         # Check if IP is already in IPSET
         if ipset test "$IP_SET_NAME" "$ip" &>/dev/null; then
             ((skipped++))
