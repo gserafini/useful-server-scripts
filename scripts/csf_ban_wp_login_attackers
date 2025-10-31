@@ -1176,13 +1176,19 @@ while true; do
       fi
 
       # Explicitly check for an optional message argument.
-      if [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+      # getopt inserts -- as separator, so message might be in $3 or $4
+      if [ "$#" -ge 4 ] && [ "$3" = "--" ] && [ -n "$4" ]; then
+          # Message is in $4 (after getopt's -- separator)
+          MESSAGE_TO_USE="$4"
+          shift 4 # Consume Flag, IP, --, and Message
+      elif [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+          # Message is in $3 (no -- separator)
           MESSAGE_TO_USE="$3"
-          shift 3 # Consume Flag, IP, and Message (3 arguments)
+          shift 3 # Consume Flag, IP, and Message
       else
           shift 2 # Consume only Flag and IP (2 arguments)
       fi
-      
+
       perform_whitelist "$IP_TO_WHITELIST" "$MESSAGE_TO_USE"
       ;;
     --blacklist | --block )
@@ -1196,13 +1202,19 @@ while true; do
       fi
 
       # Explicitly check for an optional message argument.
-      if [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+      # getopt inserts -- as separator, so message might be in $3 or $4
+      if [ "$#" -ge 4 ] && [ "$3" = "--" ] && [ -n "$4" ]; then
+          # Message is in $4 (after getopt's -- separator)
+          MESSAGE_TO_USE="$4"
+          shift 4 # Consume Flag, IP, --, and Message
+      elif [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+          # Message is in $3 (no -- separator)
           MESSAGE_TO_USE="$3"
-          shift 3 # Consume Flag, IP, and Message (3 arguments)
+          shift 3 # Consume Flag, IP, and Message
       else
           shift 2 # Consume only Flag and IP (2 arguments)
       fi
-      
+
       perform_blacklist "$IP_TO_BLACKLIST" "$MESSAGE_TO_USE"
       
       ;;
