@@ -57,7 +57,7 @@ while IFS= read -r line; do
         [[ -z "$reason" ]] && reason="Migrated from csf.deny"
 
         ((count++))
-        echo "[$count/$total] $ip"
+        echo "[$count/$total] $ip - reason: ${reason:0:60}..."
 
         # Call ban script - it handles everything (dupes, IPSET, etc)
         "$BAN_SCRIPT" --blacklist "$ip" "$reason" > /dev/null 2>&1
