@@ -1800,7 +1800,16 @@ echo " "
 DATE_CMD=$(date)
 echo "${DATE_CMD}"
 
-trap 'rm -f "$TEMP_AGGREGATE_FILE" "$TEMP_UNIQUE_IPS" "$TEMP_TRACKING_FILE" "$TEMP_GEOIP_MAPPING" "$TEMP_CACHE_EXTRACTION"' EXIT
+# Cleanup function for temp files - only removes if they exist
+cleanup_temp_files() {
+    [ -n "$TEMP_AGGREGATE_FILE" ] && [ -f "$TEMP_AGGREGATE_FILE" ] && rm -f "$TEMP_AGGREGATE_FILE"
+    [ -n "$TEMP_UNIQUE_IPS" ] && [ -f "$TEMP_UNIQUE_IPS" ] && rm -f "$TEMP_UNIQUE_IPS"
+    [ -n "$TEMP_TRACKING_FILE" ] && [ -f "$TEMP_TRACKING_FILE" ] && rm -f "$TEMP_TRACKING_FILE"
+    [ -n "$TEMP_GEOIP_MAPPING" ] && [ -f "$TEMP_GEOIP_MAPPING" ] && rm -f "$TEMP_GEOIP_MAPPING"
+    [ -n "$TEMP_CACHE_EXTRACTION" ] && [ -f "$TEMP_CACHE_EXTRACTION" ] && rm -f "$TEMP_CACHE_EXTRACTION"
+}
+
+trap cleanup_temp_files EXIT
 
 # 1. INITIAL REPORTING (Reflects state before any changes in this run)
 report_ban_counts "Pre-Run Ban Report"
