@@ -210,11 +210,11 @@ report_ban_counts() {
     permanent_ban_count=${permanent_ban_count:-0}
 
     local csf_deny_count
-    csf_deny_count=$(grep -cvE '^(#|\s*)' "$CSF_DENY_FILE" 2>/dev/null)
+    csf_deny_count=$(grep -cE '^[0-9]' "$CSF_DENY_FILE" 2>/dev/null)
     csf_deny_count=${csf_deny_count:-0}
 
     local csf_allow_count
-    csf_allow_count=$(grep -cvE '^(#|\s*)' "$CSF_ALLOW_FILE" 2>/dev/null)
+    csf_allow_count=$(grep -cE '^[0-9]' "$CSF_ALLOW_FILE" 2>/dev/null)
     csf_allow_count=${csf_allow_count:-0}
 
 
