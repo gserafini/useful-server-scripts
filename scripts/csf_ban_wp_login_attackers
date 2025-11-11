@@ -901,6 +901,8 @@ MODSEC_EOF
 
                 if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
                     echo "Detected CentOS $centos_major (<7): using cPanel restart scripts..."
+		    echo "/scripts/restartsrv_httpd --restart --hard"
+		    echo "/usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard"
                     /scripts/restartsrv_httpd --restart --hard
                     /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
                 else
@@ -908,9 +910,11 @@ MODSEC_EOF
 
                     # Restart Apache/httpd first
                     if /bin/systemctl restart httpd.service 2>/dev/null; then
+			echo "/bin/systemctl restart httpd.service"
                         echo "✓ httpd restarted via systemctl"
                     else
                         echo "systemctl unavailable or failed; trying service httpd restart..."
+			echo "service httpd restart"
                         service httpd restart 2>/dev/null && echo "✓ httpd restarted via service" || echo "✗ Failed to restart httpd"
                     fi
 
