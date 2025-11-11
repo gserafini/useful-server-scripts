@@ -1,3 +1,4 @@
 **/.DS_Store
 .agent-success-pack/
 .gitmodules
+.claude/*.local.json
