@@ -935,6 +935,7 @@ MODSEC_EOF
                             echo "Found php-fpm service units:"
                             while read -r svc; do
                                 if [ -z "$svc" ]; then continue; fi
+                                echo "$systemctl_cmd restart \"$svc\""
                                 if $systemctl_cmd restart "$svc" 2>/dev/null; then
                                     echo "✓ Restarted $svc via systemctl"
                                     restarted_any_phpfpm=1
@@ -952,6 +953,7 @@ MODSEC_EOF
                         # Try common vendor names first (ea-php* and php-fpm)
                         for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
                             if command -v /bin/systemctl >/dev/null 2>&1; then
+                                echo "/bin/systemctl restart \"${svc}.service\""
                                 if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
                                     echo "✓ Restarted ${svc}.service via systemctl"
                                     restarted_any_phpfpm=1
@@ -960,6 +962,7 @@ MODSEC_EOF
                             fi
 
                             # Try service wrapper
+                            echo "service \"$svc\" restart"
                             if service "$svc" restart 2>/dev/null; then
                                 echo "✓ Restarted $svc via service"
                                 restarted_any_phpfpm=1
@@ -968,6 +971,7 @@ MODSEC_EOF
 
                             # Try direct init script if present
                             if [ -x "/etc/init.d/$svc" ]; then
+                                echo "/etc/init.d/\"$svc\" restart"
                                 if /etc/init.d/"$svc" restart 2>/dev/null; then
                                     echo "✓ Restarted $svc via /etc/init.d/$svc"
                                     restarted_any_phpfpm=1
@@ -981,12 +985,16 @@ MODSEC_EOF
                             for script in /etc/init.d/*php*fpm* /etc/init.d/*php*; do
                                 [ -e "$script" ] || continue
                                 base=$(basename "$script")
+                                echo "service \"$base\" restart"
                                 if service "$base" restart 2>/dev/null; then
                                     echo "✓ Restarted $base via service (from /etc/init.d scan)"
                                     restarted_any_phpfpm=1
-                                elif [ -x "$script" ] && "$script" restart 2>/dev/null; then
-                                    echo "✓ Restarted $base via direct init.d script"
-                                    restarted_any_phpfpm=1
+                                elif [ -x "$script" ]; then
+                                    echo "\"$script\" restart"
+                                    if "$script" restart 2>/dev/null; then
+                                        echo "✓ Restarted $base via direct init.d script"
+                                        restarted_any_phpfpm=1
+                                    fi
                                 fi
                             done
                         fi
@@ -2363,6 +2371,7 @@ else
             echo "Found php-fpm service units:"
             while read -r svc; do
                 if [ -z "$svc" ]; then continue; fi
+                echo "$systemctl_cmd restart \"$svc\""
                 if $systemctl_cmd restart "$svc" 2>/dev/null; then
                     echo "Restarted $svc via systemctl"
                     restarted_any_phpfpm=1
@@ -2380,6 +2389,7 @@ else
         # Try common vendor names first (ea-php* and php-fpm)
         for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
             if command -v /bin/systemctl >/dev/null 2>&1; then
+                echo "/bin/systemctl restart \"${svc}.service\""
                 if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
                     echo "Restarted ${svc}.service via systemctl"
                     restarted_any_phpfpm=1
@@ -2388,6 +2398,7 @@ else
             fi
 
             # Try service wrapper
+            echo "service \"$svc\" restart"
             if service "$svc" restart 2>/dev/null; then
                 echo "Restarted $svc via service"
                 restarted_any_phpfpm=1
@@ -2396,6 +2407,7 @@ else
 
             # Try direct init script if present
             if [ -x "/etc/init.d/$svc" ]; then
+                echo "/etc/init.d/\"$svc\" restart"
                 if /etc/init.d/"$svc" restart 2>/dev/null; then
                     echo "Restarted $svc via /etc/init.d/$svc"
                     restarted_any_phpfpm=1
@@ -2409,12 +2421,16 @@ else
             for script in /etc/init.d/*php*fpm* /etc/init.d/*php*; do
                 [ -e "$script" ] || continue
                 base=$(basename "$script")
+                echo "service \"$base\" restart"
                 if service "$base" restart 2>/dev/null; then
                     echo "Restarted $base via service (from /etc/init.d scan)"
                     restarted_any_phpfpm=1
-                elif [ -x "$script" ] && "$script" restart 2>/dev/null; then
-                    echo "Restarted $base via direct init.d script"
-                    restarted_any_phpfpm=1
+                elif [ -x "$script" ]; then
+                    echo "\"$script\" restart"
+                    if "$script" restart 2>/dev/null; then
+                        echo "Restarted $base via direct init.d script"
+                        restarted_any_phpfpm=1
+                    fi
                 fi
             done
         fi
