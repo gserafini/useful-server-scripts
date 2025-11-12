@@ -255,8 +255,38 @@ kill_lingering_phpfpm_processes() {
     
     # Check if lsof is available
     if ! command -v lsof >/dev/null 2>&1; then
-        echo "⚠️  Warning: lsof command not found. Cannot automatically kill lingering processes."
+        echo "⚠️  Warning: lsof command not found. Trying alternative methods..."
         echo "   Install lsof: yum install -y lsof (RHEL/CentOS) or apt-get install -y lsof (Debian/Ubuntu)"
+        
+        # Fallback: kill all php-fpm master processes matching version
+        echo "🔍 Searching for php-fpm master processes (fallback method)..."
+        local phpfpm_pids
+        if [ -n "$php_version" ]; then
+            phpfpm_pids=$(ps aux | grep -E "[p]hp-fpm.*ea-php${php_version}|[p]hp${php_version}-fpm" | grep -i master | awk '{print $2}' || true)
+        else
+            phpfpm_pids=$(ps aux | grep "[p]hp-fpm" | grep -i master | awk '{print $2}' || true)
+        fi
+        
+        if [ -n "$phpfpm_pids" ]; then
+            echo "Found php-fpm master process(es): $phpfpm_pids"
+            for pid in $phpfpm_pids; do
+                echo "  Killing PID $pid with SIGKILL..."
+                if kill -9 "$pid" 2>/dev/null; then
+                    echo "  ✓ Killed PID $pid"
+                    killed_count=$((killed_count + 1))
+                else
+                    echo "  ✗ Failed to kill PID $pid (may have already exited)"
+                fi
+            done
+            
+            if [ "$killed_count" -gt 0 ]; then
+                echo "⏳ Waiting 3 seconds for processes to terminate and sockets to release..."
+                sleep 3
+                return 0
+            fi
+        else
+            echo "ℹ️  No php-fpm master processes found"
+        fi
         return 1
     fi
     
@@ -299,8 +329,24 @@ kill_lingering_phpfpm_processes() {
         fi
         
         if [ "$killed_count" -gt 0 ]; then
-            echo "⏳ Waiting 2 seconds for processes to terminate..."
-            sleep 2
+            echo "⏳ Waiting 3 seconds for processes to terminate and sockets to release..."
+            sleep 3
+            
+            # Also try to remove stale socket files from common locations
+            echo "🧹 Cleaning up stale socket files..."
+            local sock_dirs="/opt/cpanel/ea-php*/root/usr/var/run/php-fpm /var/run/php-fpm /run/php /tmp"
+            for dir in $sock_dirs; do
+                if [ -d "$dir" ]; then
+                    find "$dir" -name "*.sock" -type s 2>/dev/null | while read -r stale_sock; do
+                        # Check if socket is actually stale (no process listening)
+                        if ! lsof "$stale_sock" >/dev/null 2>&1 && ! fuser "$stale_sock" >/dev/null 2>&1; then
+                            echo "  Removing stale socket: $stale_sock"
+                            rm -f "$stale_sock" 2>/dev/null || true
+                        fi
+                    done
+                fi
+            done
+            
             return 0
         fi
         return 1
@@ -320,6 +366,11 @@ kill_lingering_phpfpm_processes() {
         
         if [ -z "$pids" ]; then
             echo "  No PIDs found for this socket"
+            # Try to remove the socket file if no process is using it
+            if [ -S "$sock_file" ]; then
+                echo "  Removing stale socket file: $sock_file"
+                rm -f "$sock_file" 2>/dev/null || echo "  ✗ Failed to remove socket file"
+            fi
             continue
         fi
         
@@ -342,8 +393,21 @@ kill_lingering_phpfpm_processes() {
     
     if [ "$killed_count" -gt 0 ]; then
         echo "✅ Killed $killed_count lingering php-fpm process(es)"
-        echo "⏳ Waiting 2 seconds for cleanup..."
-        sleep 2
+        echo "⏳ Waiting 3 seconds for cleanup and socket release..."
+        sleep 3
+        
+        # Clean up any remaining stale sockets
+        echo "🧹 Cleaning up stale socket files..."
+        while IFS= read -r sock_file; do
+            [ -z "$sock_file" ] && continue
+            if [ -S "$sock_file" ]; then
+                if ! lsof "$sock_file" >/dev/null 2>&1 && ! fuser "$sock_file" >/dev/null 2>&1; then
+                    echo "  Removing stale socket: $sock_file"
+                    rm -f "$sock_file" 2>/dev/null || echo "  ✗ Failed to remove socket"
+                fi
+            fi
+        done <<< "$socket_files"
+        
         return 0
     else
         echo "ℹ️  No processes were killed"
@@ -1020,8 +1084,15 @@ MODSEC_EOF
                     /scripts/restartsrv_httpd --restart --hard
                     
                     # Attempt php-fpm restart with retry logic on failure
-                    if ! /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard 2>&1; then
-                        echo "⚠️  PHP-FPM restart failed. Attempting to kill lingering processes..."
+                    # Capture output to check for error patterns since cPanel scripts may not return proper exit codes
+                    local phpfpm_output
+                    phpfpm_output=$(/usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard 2>&1)
+                    local phpfpm_exitcode=$?
+                    echo "$phpfpm_output"
+                    
+                    # Check if restart failed (either by exit code or error patterns in output)
+                    if [ "$phpfpm_exitcode" -ne 0 ] || echo "$phpfpm_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
+                        echo "⚠️  PHP-FPM restart failed (exit code: $phpfpm_exitcode). Attempting to kill lingering processes..."
                         kill_lingering_phpfpm_processes
                         echo "🔄 Retrying PHP-FPM restart..."
                         /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
