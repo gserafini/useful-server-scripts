@@ -21,6 +21,14 @@
 #   Example install commands:
 #     RHEL/CentOS: sudo yum install -y conntrack-tools
 #     Debian/Ubuntu: sudo apt-get install -y conntrack
+# - RECOMMENDED: Install lsof for automatic PHP-FPM restart failure recovery.
+#   When PHP-FPM restart fails due to lingering socket files (error: "Another FPM 
+#   instance seems to already listen on..."), lsof is used to identify and kill 
+#   the offending processes before retrying the restart. Without lsof, manual 
+#   intervention may be required.
+#   Example install commands:
+#     RHEL/CentOS: sudo yum install -y lsof
+#     Debian/Ubuntu: sudo apt-get install -y lsof
 # - OPTIONAL: ModSecurity Integration - For INSTANT banning on first malicious request:
 #   Run --install-mod-security-triggers to generate ModSecurity rules that set
 #   the MALICIOUS_IP environment variable, which this script detects and immediately
@@ -235,6 +243,112 @@ report_ban_counts() {
     fi
     
     echo "----------------------"
+}
+
+# Function to kill lingering php-fpm processes holding socket files
+# This is called when php-fpm restart fails due to "Another FPM instance seems to already listen" errors
+kill_lingering_phpfpm_processes() {
+    local php_version="$1"  # Optional: e.g., "74", "81", "82"
+    local killed_count=0
+    
+    echo "🔍 Searching for lingering php-fpm processes..."
+    
+    # Check if lsof is available
+    if ! command -v lsof >/dev/null 2>&1; then
+        echo "⚠️  Warning: lsof command not found. Cannot automatically kill lingering processes."
+        echo "   Install lsof: yum install -y lsof (RHEL/CentOS) or apt-get install -y lsof (Debian/Ubuntu)"
+        return 1
+    fi
+    
+    # Build search pattern based on php version if provided
+    local sock_pattern="php-fpm.*\.sock"
+    if [ -n "$php_version" ]; then
+        sock_pattern="php${php_version}.*\.sock"
+    fi
+    
+    # Find all php-fpm socket files that have open handles
+    # Common locations: /opt/cpanel/ea-php*/root/usr/var/run/php-fpm/*.sock, /var/run/php-fpm/*.sock, /run/php/*.sock
+    local socket_files
+    socket_files=$(lsof 2>/dev/null | grep -E "$sock_pattern" | awk '{print $NF}' | sort -u || true)
+    
+    if [ -z "$socket_files" ]; then
+        echo "ℹ️  No lingering php-fpm socket files found via lsof"
+        
+        # Alternative: find php-fpm master processes directly
+        echo "🔍 Searching for php-fpm master processes..."
+        local phpfpm_pids
+        if [ -n "$php_version" ]; then
+            phpfpm_pids=$(ps aux | grep -E "[p]hp-fpm.*ea-php${php_version}|[p]hp${php_version}-fpm" | grep -i master | awk '{print $2}' || true)
+        else
+            phpfpm_pids=$(ps aux | grep "[p]hp-fpm" | grep -i master | awk '{print $2}' || true)
+        fi
+        
+        if [ -n "$phpfpm_pids" ]; then
+            echo "Found php-fpm master process(es): $phpfpm_pids"
+            for pid in $phpfpm_pids; do
+                echo "  Killing PID $pid with SIGKILL..."
+                if kill -9 "$pid" 2>/dev/null; then
+                    echo "  ✓ Killed PID $pid"
+                    killed_count=$((killed_count + 1))
+                else
+                    echo "  ✗ Failed to kill PID $pid (may have already exited)"
+                fi
+            done
+        else
+            echo "ℹ️  No php-fpm master processes found"
+        fi
+        
+        if [ "$killed_count" -gt 0 ]; then
+            echo "⏳ Waiting 2 seconds for processes to terminate..."
+            sleep 2
+            return 0
+        fi
+        return 1
+    fi
+    
+    echo "Found socket file(s) with open handles:"
+    echo "$socket_files"
+    echo ""
+    
+    # For each socket file, find PIDs holding it open and kill them
+    while IFS= read -r sock_file; do
+        [ -z "$sock_file" ] && continue
+        
+        echo "Processing socket: $sock_file"
+        local pids
+        pids=$(lsof "$sock_file" 2>/dev/null | tail -n +2 | awk '{print $2}' | sort -u || true)
+        
+        if [ -z "$pids" ]; then
+            echo "  No PIDs found for this socket"
+            continue
+        fi
+        
+        echo "  Found PIDs holding socket open: $pids"
+        for pid in $pids; do
+            # Get process name for logging
+            local proc_name
+            proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+            
+            echo "  Killing PID $pid ($proc_name) with SIGKILL..."
+            if kill -9 "$pid" 2>/dev/null; then
+                echo "  ✓ Successfully killed PID $pid"
+                killed_count=$((killed_count + 1))
+            else
+                echo "  ✗ Failed to kill PID $pid (may have already exited)"
+            fi
+        done
+        echo ""
+    done <<< "$socket_files"
+    
+    if [ "$killed_count" -gt 0 ]; then
+        echo "✅ Killed $killed_count lingering php-fpm process(es)"
+        echo "⏳ Waiting 2 seconds for cleanup..."
+        sleep 2
+        return 0
+    else
+        echo "ℹ️  No processes were killed"
+        return 1
+    fi
 }
 
 # Function to perform the blacklist action (Manual Ban)
@@ -904,7 +1018,14 @@ MODSEC_EOF
 		    echo "/scripts/restartsrv_httpd --restart --hard"
 		    echo "/usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard"
                     /scripts/restartsrv_httpd --restart --hard
-                    /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
+                    
+                    # Attempt php-fpm restart with retry logic on failure
+                    if ! /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard 2>&1; then
+                        echo "⚠️  PHP-FPM restart failed. Attempting to kill lingering processes..."
+                        kill_lingering_phpfpm_processes
+                        echo "🔄 Retrying PHP-FPM restart..."
+                        /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
+                    fi
                 else
                     echo "Detected CentOS ${centos_major:-unknown} (>=7 or undetermined): using systemctl/service fallback..."
 
@@ -935,12 +1056,28 @@ MODSEC_EOF
                             echo "Found php-fpm service units:"
                             while read -r svc; do
                                 if [ -z "$svc" ]; then continue; fi
+                                
+                                # Extract PHP version from service name for targeted cleanup (e.g., ea-php74-php-fpm.service -> 74)
+                                local php_ver=""
+                                if [[ "$svc" =~ php([0-9]+) ]]; then
+                                    php_ver="${BASH_REMATCH[1]}"
+                                fi
+                                
                                 echo "$systemctl_cmd restart \"$svc\""
-                                if $systemctl_cmd restart "$svc" 2>/dev/null; then
+                                if $systemctl_cmd restart "$svc" 2>&1; then
                                     echo "✓ Restarted $svc via systemctl"
                                     restarted_any_phpfpm=1
                                 else
                                     echo "✗ Failed to restart $svc via systemctl"
+                                    echo "⚠️  Attempting to kill lingering processes for $svc..."
+                                    kill_lingering_phpfpm_processes "$php_ver"
+                                    echo "🔄 Retrying restart of $svc..."
+                                    if $systemctl_cmd restart "$svc" 2>&1; then
+                                        echo "✓ Successfully restarted $svc after cleanup"
+                                        restarted_any_phpfpm=1
+                                    else
+                                        echo "✗ Failed to restart $svc even after cleanup"
+                                    fi
                                 fi
                             done < <(echo "$php_units" | sort -u)
                         fi
@@ -952,30 +1089,67 @@ MODSEC_EOF
 
                         # Try common vendor names first (ea-php* and php-fpm)
                         for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
+                            # Extract PHP version from service name for targeted cleanup
+                            local php_ver=""
+                            if [[ "$svc" =~ php([0-9]+) ]]; then
+                                php_ver="${BASH_REMATCH[1]}"
+                            fi
+                            
+                            local restart_success=0
+                            
                             if command -v /bin/systemctl >/dev/null 2>&1; then
                                 echo "/bin/systemctl restart \"${svc}.service\""
-                                if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
+                                if /bin/systemctl restart "${svc}.service" 2>&1; then
                                     echo "✓ Restarted ${svc}.service via systemctl"
                                     restarted_any_phpfpm=1
-                                    continue
+                                    restart_success=1
                                 fi
                             fi
 
-                            # Try service wrapper
-                            echo "service \"$svc\" restart"
-                            if service "$svc" restart 2>/dev/null; then
-                                echo "✓ Restarted $svc via service"
-                                restarted_any_phpfpm=1
-                                continue
+                            # Try service wrapper if systemctl didn't work
+                            if [ "$restart_success" -eq 0 ]; then
+                                echo "service \"$svc\" restart"
+                                if service "$svc" restart 2>&1; then
+                                    echo "✓ Restarted $svc via service"
+                                    restarted_any_phpfpm=1
+                                    restart_success=1
+                                fi
                             fi
 
-                            # Try direct init script if present
-                            if [ -x "/etc/init.d/$svc" ]; then
+                            # Try direct init script if present and previous attempts failed
+                            if [ "$restart_success" -eq 0 ] && [ -x "/etc/init.d/$svc" ]; then
                                 echo "/etc/init.d/\"$svc\" restart"
-                                if /etc/init.d/"$svc" restart 2>/dev/null; then
+                                if /etc/init.d/"$svc" restart 2>&1; then
                                     echo "✓ Restarted $svc via /etc/init.d/$svc"
                                     restarted_any_phpfpm=1
-                                    continue
+                                    restart_success=1
+                                fi
+                            fi
+                            
+                            # If all attempts failed, try cleanup and retry
+                            if [ "$restart_success" -eq 0 ]; then
+                                # Check if the service actually exists before trying cleanup
+                                if systemctl list-unit-files "${svc}.service" 2>/dev/null | grep -q "${svc}.service" || \
+                                   [ -x "/etc/init.d/$svc" ] || \
+                                   service "$svc" status >/dev/null 2>&1; then
+                                    
+                                    echo "⚠️  All restart attempts failed for $svc. Attempting to kill lingering processes..."
+                                    kill_lingering_phpfpm_processes "$php_ver"
+                                    echo "🔄 Retrying restart of $svc..."
+                                    
+                                    # Retry with same priority order
+                                    if command -v /bin/systemctl >/dev/null 2>&1 && /bin/systemctl restart "${svc}.service" 2>&1; then
+                                        echo "✓ Successfully restarted ${svc}.service after cleanup"
+                                        restarted_any_phpfpm=1
+                                    elif service "$svc" restart 2>&1; then
+                                        echo "✓ Successfully restarted $svc via service after cleanup"
+                                        restarted_any_phpfpm=1
+                                    elif [ -x "/etc/init.d/$svc" ] && /etc/init.d/"$svc" restart 2>&1; then
+                                        echo "✓ Successfully restarted $svc via init.d after cleanup"
+                                        restarted_any_phpfpm=1
+                                    else
+                                        echo "✗ Failed to restart $svc even after cleanup"
+                                    fi
                                 fi
                             fi
                         done
@@ -985,15 +1159,42 @@ MODSEC_EOF
                             for script in /etc/init.d/*php*fpm* /etc/init.d/*php*; do
                                 [ -e "$script" ] || continue
                                 base=$(basename "$script")
+                                
+                                # Extract PHP version from script name
+                                local php_ver=""
+                                if [[ "$base" =~ php([0-9]+) ]]; then
+                                    php_ver="${BASH_REMATCH[1]}"
+                                fi
+                                
+                                local restart_success=0
                                 echo "service \"$base\" restart"
-                                if service "$base" restart 2>/dev/null; then
+                                if service "$base" restart 2>&1; then
                                     echo "✓ Restarted $base via service (from /etc/init.d scan)"
                                     restarted_any_phpfpm=1
+                                    restart_success=1
                                 elif [ -x "$script" ]; then
                                     echo "\"$script\" restart"
-                                    if "$script" restart 2>/dev/null; then
+                                    if "$script" restart 2>&1; then
                                         echo "✓ Restarted $base via direct init.d script"
                                         restarted_any_phpfpm=1
+                                        restart_success=1
+                                    fi
+                                fi
+                                
+                                # If restart failed, try cleanup and retry
+                                if [ "$restart_success" -eq 0 ]; then
+                                    echo "⚠️  Restart failed for $base. Attempting to kill lingering processes..."
+                                    kill_lingering_phpfpm_processes "$php_ver"
+                                    echo "🔄 Retrying restart of $base..."
+                                    
+                                    if service "$base" restart 2>&1; then
+                                        echo "✓ Successfully restarted $base via service after cleanup"
+                                        restarted_any_phpfpm=1
+                                    elif [ -x "$script" ] && "$script" restart 2>&1; then
+                                        echo "✓ Successfully restarted $base via init.d after cleanup"
+                                        restarted_any_phpfpm=1
+                                    else
+                                        echo "✗ Failed to restart $base even after cleanup"
                                     fi
                                 fi
                             done
