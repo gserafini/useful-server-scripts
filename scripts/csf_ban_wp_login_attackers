@@ -247,170 +247,189 @@ report_ban_counts() {
 
 # Function to kill lingering php-fpm processes holding socket files
 # This is called when php-fpm restart fails due to "Another FPM instance seems to already listen" errors
+# Based on manual recovery: force remove sockets first, then killall -9, then targeted cleanup
 kill_lingering_phpfpm_processes() {
     local php_version="$1"  # Optional: e.g., "74", "81", "82"
     local killed_count=0
-    
-    echo "🔍 Searching for lingering php-fpm processes..."
-    
-    # Check if lsof is available
-    if ! command -v lsof >/dev/null 2>&1; then
-        echo "⚠️  Warning: lsof command not found. Trying alternative methods..."
-        echo "   Install lsof: yum install -y lsof (RHEL/CentOS) or apt-get install -y lsof (Debian/Ubuntu)"
-        
-        # Fallback: kill all php-fpm master processes matching version
-        echo "🔍 Searching for php-fpm master processes (fallback method)..."
-        local phpfpm_pids
-        if [ -n "$php_version" ]; then
-            phpfpm_pids=$(ps aux | grep -E "[p]hp-fpm.*ea-php${php_version}|[p]hp${php_version}-fpm" | grep -i master | awk '{print $2}' || true)
-        else
-            phpfpm_pids=$(ps aux | grep "[p]hp-fpm" | grep -i master | awk '{print $2}' || true)
-        fi
-        
-        if [ -n "$phpfpm_pids" ]; then
-            echo "Found php-fpm master process(es): $phpfpm_pids"
-            for pid in $phpfpm_pids; do
-                echo "  Killing PID $pid with SIGKILL..."
-                if kill -9 "$pid" 2>/dev/null; then
-                    echo "  ✓ Killed PID $pid"
-                    killed_count=$((killed_count + 1))
-                else
-                    echo "  ✗ Failed to kill PID $pid (may have already exited)"
-                fi
-            done
-            
-            if [ "$killed_count" -gt 0 ]; then
-                echo "⏳ Waiting 3 seconds for processes to terminate and sockets to release..."
-                sleep 3
-                return 0
-            fi
-        else
-            echo "ℹ️  No php-fpm master processes found"
-        fi
-        return 1
-    fi
-    
-    # Build search pattern based on php version if provided
-    local sock_pattern="php-fpm.*\.sock"
+    local actions_taken=0
+
+    echo "🔍 Aggressively cleaning up lingering php-fpm processes..."
+
+    # STEP 1: Force remove socket files FIRST (this is what worked manually)
+    echo ""
+    echo "Step 1: Force removing socket files..."
+    local sock_dirs="/opt/cpanel/ea-php*/root/usr/var/run/php-fpm /var/run/php-fpm /run/php /tmp"
+    local sock_pattern="*.sock"
+    local sockets_removed=0
+
     if [ -n "$php_version" ]; then
-        sock_pattern="php${php_version}.*\.sock"
+        # Target specific PHP version sockets
+        sock_pattern="*php${php_version}*.sock"
+        echo "  Targeting PHP $php_version sockets: $sock_pattern"
+    else
+        echo "  Targeting all PHP-FPM sockets: $sock_pattern"
     fi
-    
-    # Find all php-fpm socket files that have open handles
-    # Common locations: /opt/cpanel/ea-php*/root/usr/var/run/php-fpm/*.sock, /var/run/php-fpm/*.sock, /run/php/*.sock
-    local socket_files
-    socket_files=$(lsof 2>/dev/null | grep -E "$sock_pattern" | awk '{print $NF}' | sort -u || true)
-    
-    if [ -z "$socket_files" ]; then
-        echo "ℹ️  No lingering php-fpm socket files found via lsof"
-        
-        # Alternative: find php-fpm master processes directly
-        echo "🔍 Searching for php-fpm master processes..."
-        local phpfpm_pids
-        if [ -n "$php_version" ]; then
-            phpfpm_pids=$(ps aux | grep -E "[p]hp-fpm.*ea-php${php_version}|[p]hp${php_version}-fpm" | grep -i master | awk '{print $2}' || true)
-        else
-            phpfpm_pids=$(ps aux | grep "[p]hp-fpm" | grep -i master | awk '{print $2}' || true)
-        fi
-        
-        if [ -n "$phpfpm_pids" ]; then
-            echo "Found php-fpm master process(es): $phpfpm_pids"
-            for pid in $phpfpm_pids; do
-                echo "  Killing PID $pid with SIGKILL..."
-                if kill -9 "$pid" 2>/dev/null; then
-                    echo "  ✓ Killed PID $pid"
-                    killed_count=$((killed_count + 1))
-                else
-                    echo "  ✗ Failed to kill PID $pid (may have already exited)"
+
+    for dir in $sock_dirs; do
+        # Use glob expansion to handle wildcards in directory path
+        for expanded_dir in $dir; do
+            if [ -d "$expanded_dir" ]; then
+                local found_socks
+                found_socks=$(find "$expanded_dir" -name "$sock_pattern" -type s 2>/dev/null || true)
+                if [ -n "$found_socks" ]; then
+                    while IFS= read -r sock_file; do
+                        [ -z "$sock_file" ] && continue
+                        echo "  Force removing: $sock_file"
+                        if rm -f "$sock_file" 2>/dev/null; then
+                            echo "  ✓ Removed $sock_file"
+                            sockets_removed=$((sockets_removed + 1))
+                            actions_taken=1
+                        else
+                            echo "  ✗ Failed to remove $sock_file"
+                        fi
+                    done <<< "$found_socks"
                 fi
-            done
+            fi
+        done
+    done
+
+    if [ "$sockets_removed" -gt 0 ]; then
+        echo "  ✅ Removed $sockets_removed socket file(s)"
+    else
+        echo "  ℹ️  No socket files found to remove"
+    fi
+
+    # STEP 2: Use killall -9 (this is what worked manually)
+    echo ""
+    echo "Step 2: Using killall -9 to terminate php-fpm processes..."
+
+    if command -v killall >/dev/null 2>&1; then
+        local killall_targets=()
+
+        if [ -n "$php_version" ]; then
+            # Target specific version patterns
+            # cPanel naming: ea-php74-php-fpm, php74-fpm, php-fpm (if it's the only version)
+            killall_targets=(
+                "ea-php${php_version}-php-fpm"
+                "php${php_version}-fpm"
+            )
+            echo "  Targeting PHP $php_version processes"
         else
-            echo "ℹ️  No php-fpm master processes found"
+            # Kill all php-fpm processes (all versions)
+            killall_targets=("php-fpm")
+            echo "  Targeting all php-fpm processes"
         fi
-        
-        if [ "$killed_count" -gt 0 ]; then
-            echo "⏳ Waiting 3 seconds for processes to terminate and sockets to release..."
-            sleep 3
-            
-            # Also try to remove stale socket files from common locations
-            echo "🧹 Cleaning up stale socket files..."
-            local sock_dirs="/opt/cpanel/ea-php*/root/usr/var/run/php-fpm /var/run/php-fpm /run/php /tmp"
-            for dir in $sock_dirs; do
-                if [ -d "$dir" ]; then
-                    find "$dir" -name "*.sock" -type s 2>/dev/null | while read -r stale_sock; do
-                        # Check if socket is actually stale (no process listening)
-                        if ! lsof "$stale_sock" >/dev/null 2>&1 && ! fuser "$stale_sock" >/dev/null 2>&1; then
-                            echo "  Removing stale socket: $stale_sock"
-                            rm -f "$stale_sock" 2>/dev/null || true
+
+        for target in "${killall_targets[@]}"; do
+            echo "  Attempting: killall -9 $target"
+            if killall -9 "$target" 2>/dev/null; then
+                echo "  ✓ Killed processes matching: $target"
+                killed_count=$((killed_count + 1))
+                actions_taken=1
+            else
+                # Not an error - process may not exist
+                echo "  ℹ️  No processes found matching: $target"
+            fi
+        done
+
+        # Also try generic php-fpm if we have a version specified and nothing was killed yet
+        if [ -n "$php_version" ] && [ "$killed_count" -eq 0 ]; then
+            echo "  Attempting generic: killall -9 php-fpm"
+            if killall -9 php-fpm 2>/dev/null; then
+                echo "  ✓ Killed generic php-fpm processes"
+                killed_count=$((killed_count + 1))
+                actions_taken=1
+            fi
+        fi
+    else
+        echo "  ⚠️  killall command not available, using fallback method"
+    fi
+
+    # STEP 3: Use lsof for targeted cleanup of any remaining processes (belt and suspenders)
+    if command -v lsof >/dev/null 2>&1; then
+        echo ""
+        echo "Step 3: Using lsof for targeted cleanup of remaining processes..."
+
+        # Build search pattern based on php version if provided
+        local sock_pattern="php-fpm.*\.sock"
+        if [ -n "$php_version" ]; then
+            sock_pattern="php${php_version}.*\.sock"
+        fi
+
+        # Find any remaining socket files that have open handles
+        local socket_files
+        socket_files=$(lsof 2>/dev/null | grep -E "$sock_pattern" | awk '{print $NF}' | sort -u || true)
+
+        if [ -n "$socket_files" ]; then
+            echo "  Found remaining socket file(s) with open handles:"
+            echo "$socket_files" | sed 's/^/    /'
+            echo ""
+
+            # For each socket file, find PIDs holding it open and kill them
+            while IFS= read -r sock_file; do
+                [ -z "$sock_file" ] && continue
+
+                local pids
+                pids=$(lsof "$sock_file" 2>/dev/null | tail -n +2 | awk '{print $2}' | sort -u || true)
+
+                if [ -n "$pids" ]; then
+                    echo "  Socket: $sock_file"
+                    for pid in $pids; do
+                        local proc_name
+                        proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+
+                        echo "    Killing PID $pid ($proc_name)..."
+                        if kill -9 "$pid" 2>/dev/null; then
+                            echo "    ✓ Killed PID $pid"
+                            killed_count=$((killed_count + 1))
+                            actions_taken=1
+                        else
+                            echo "    ✗ PID $pid already gone"
                         fi
                     done
                 fi
-            done
-            
-            return 0
+            done <<< "$socket_files"
+        else
+            echo "  ℹ️  No remaining socket files found via lsof"
         fi
-        return 1
     fi
-    
-    echo "Found socket file(s) with open handles:"
-    echo "$socket_files"
+
+    # STEP 4: Final cleanup - remove any remaining socket files
     echo ""
-    
-    # For each socket file, find PIDs holding it open and kill them
-    while IFS= read -r sock_file; do
-        [ -z "$sock_file" ] && continue
-        
-        echo "Processing socket: $sock_file"
-        local pids
-        pids=$(lsof "$sock_file" 2>/dev/null | tail -n +2 | awk '{print $2}' | sort -u || true)
-        
-        if [ -z "$pids" ]; then
-            echo "  No PIDs found for this socket"
-            # Try to remove the socket file if no process is using it
-            if [ -S "$sock_file" ]; then
-                echo "  Removing stale socket file: $sock_file"
-                rm -f "$sock_file" 2>/dev/null || echo "  ✗ Failed to remove socket file"
-            fi
-            continue
-        fi
-        
-        echo "  Found PIDs holding socket open: $pids"
-        for pid in $pids; do
-            # Get process name for logging
-            local proc_name
-            proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
-            
-            echo "  Killing PID $pid ($proc_name) with SIGKILL..."
-            if kill -9 "$pid" 2>/dev/null; then
-                echo "  ✓ Successfully killed PID $pid"
-                killed_count=$((killed_count + 1))
-            else
-                echo "  ✗ Failed to kill PID $pid (may have already exited)"
-            fi
-        done
-        echo ""
-    done <<< "$socket_files"
-    
-    if [ "$killed_count" -gt 0 ]; then
-        echo "✅ Killed $killed_count lingering php-fpm process(es)"
-        echo "⏳ Waiting 3 seconds for cleanup and socket release..."
-        sleep 3
-        
-        # Clean up any remaining stale sockets
-        echo "🧹 Cleaning up stale socket files..."
-        while IFS= read -r sock_file; do
-            [ -z "$sock_file" ] && continue
-            if [ -S "$sock_file" ]; then
-                if ! lsof "$sock_file" >/dev/null 2>&1 && ! fuser "$sock_file" >/dev/null 2>&1; then
-                    echo "  Removing stale socket: $sock_file"
-                    rm -f "$sock_file" 2>/dev/null || echo "  ✗ Failed to remove socket"
+    echo "Step 4: Final socket cleanup..."
+    local final_socks_removed=0
+
+    for dir in $sock_dirs; do
+        for expanded_dir in $dir; do
+            if [ -d "$expanded_dir" ]; then
+                local found_socks
+                found_socks=$(find "$expanded_dir" -name "$sock_pattern" -type s 2>/dev/null || true)
+                if [ -n "$found_socks" ]; then
+                    while IFS= read -r sock_file; do
+                        [ -z "$sock_file" ] && continue
+                        echo "  Force removing: $sock_file"
+                        rm -f "$sock_file" 2>/dev/null && final_socks_removed=$((final_socks_removed + 1)) || true
+                    done <<< "$found_socks"
                 fi
             fi
-        done <<< "$socket_files"
-        
+        done
+    done
+
+    if [ "$final_socks_removed" -gt 0 ]; then
+        echo "  ✅ Removed $final_socks_removed additional socket file(s)"
+        actions_taken=1
+    else
+        echo "  ℹ️  No additional socket files to remove"
+    fi
+
+    # Summary
+    echo ""
+    if [ "$actions_taken" -eq 1 ]; then
+        echo "✅ Cleanup complete. Waiting 3 seconds for full process termination..."
+        sleep 3
         return 0
     else
-        echo "ℹ️  No processes were killed"
+        echo "ℹ️  No cleanup actions were necessary"
         return 1
     fi
 }
