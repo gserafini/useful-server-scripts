@@ -2633,7 +2633,21 @@ fi
 if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
     echo "Detected CentOS $centos_major (<7): using cPanel restart scripts..."
     /scripts/restartsrv_httpd --restart --hard
-    /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
+
+    # Attempt php-fpm restart with retry logic on failure
+    # Capture output to check for error patterns since cPanel scripts may not return proper exit codes
+    local phpfpm_output
+    phpfpm_output=$(/usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard 2>&1)
+    local phpfpm_exitcode=$?
+    echo "$phpfpm_output"
+
+    # Check if restart failed (either by exit code or error patterns in output)
+    if [ "$phpfpm_exitcode" -ne 0 ] || echo "$phpfpm_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
+        echo "⚠️  PHP-FPM restart failed (exit code: $phpfpm_exitcode). Attempting to kill lingering processes..."
+        kill_lingering_phpfpm_processes
+        echo "🔄 Retrying PHP-FPM restart..."
+        /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
+    fi
 else
     echo "Detected CentOS ${centos_major:-unknown} (>=7 or undetermined): using systemctl/service fallback..."
 
@@ -2662,12 +2676,36 @@ else
             echo "Found php-fpm service units:"
             while read -r svc; do
                 if [ -z "$svc" ]; then continue; fi
+
+                # Extract PHP version from service name for targeted cleanup (e.g., ea-php74-php-fpm.service -> 74)
+                local php_ver=""
+                if [[ "$svc" =~ php([0-9]+) ]]; then
+                    php_ver="${BASH_REMATCH[1]}"
+                fi
+
                 echo "$systemctl_cmd restart \"$svc\""
-                if $systemctl_cmd restart "$svc" 2>/dev/null; then
-                    echo "Restarted $svc via systemctl"
+                local phpfpm_restart_output
+                phpfpm_restart_output=$($systemctl_cmd restart "$svc" 2>&1)
+                local phpfpm_restart_exitcode=$?
+
+                # Check if restart failed (either by exit code or error patterns in output)
+                if [ "$phpfpm_restart_exitcode" -ne 0 ] || echo "$phpfpm_restart_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on|failed to restart'; then
+                    echo "$phpfpm_restart_output"
+                    echo "⚠️  $svc restart failed (exit code: $phpfpm_restart_exitcode). Attempting to kill lingering processes..."
+
+                    if [ -n "$php_ver" ]; then
+                        kill_lingering_phpfpm_processes "$php_ver"
+                    else
+                        kill_lingering_phpfpm_processes
+                    fi
+
+                    echo "🔄 Retrying $svc restart..."
+                    $systemctl_cmd restart "$svc"
+                    echo "✓ Retried $svc"
                     restarted_any_phpfpm=1
                 else
-                    echo "Failed to restart $svc via systemctl"
+                    echo "Restarted $svc via systemctl"
+                    restarted_any_phpfpm=1
                 fi
             done < <(echo "$php_units" | sort -u)
         fi
@@ -2679,30 +2717,102 @@ else
 
         # Try common vendor names first (ea-php* and php-fpm)
         for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
+            # Extract PHP version from service name for targeted cleanup
+            local php_ver=""
+            if [[ "$svc" =~ php([0-9]+) ]]; then
+                php_ver="${BASH_REMATCH[1]}"
+            fi
+
+            local restart_succeeded=0
+
             if command -v /bin/systemctl >/dev/null 2>&1; then
                 echo "/bin/systemctl restart \"${svc}.service\""
-                if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
+                local phpfpm_fallback_output
+                phpfpm_fallback_output=$(/bin/systemctl restart "${svc}.service" 2>&1)
+                local phpfpm_fallback_exitcode=$?
+
+                if [ "$phpfpm_fallback_exitcode" -eq 0 ]; then
                     echo "Restarted ${svc}.service via systemctl"
+                    restarted_any_phpfpm=1
+                    restart_succeeded=1
+                elif echo "$phpfpm_fallback_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on|failed to restart'; then
+                    echo "$phpfpm_fallback_output"
+                    echo "⚠️  ${svc}.service restart failed. Attempting to kill lingering processes..."
+
+                    if [ -n "$php_ver" ]; then
+                        kill_lingering_phpfpm_processes "$php_ver"
+                    else
+                        kill_lingering_phpfpm_processes
+                    fi
+
+                    echo "🔄 Retrying ${svc}.service restart..."
+                    if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
+                        echo "✓ Retried ${svc}.service successfully"
+                        restarted_any_phpfpm=1
+                        restart_succeeded=1
+                    fi
+                fi
+            fi
+
+            if [ "$restart_succeeded" -eq 1 ]; then
+                continue
+            fi
+
+            # Try service wrapper
+            echo "service \"$svc\" restart"
+            local phpfpm_svc_output
+            phpfpm_svc_output=$(service "$svc" restart 2>&1)
+            local phpfpm_svc_exitcode=$?
+
+            if [ "$phpfpm_svc_exitcode" -eq 0 ]; then
+                echo "Restarted $svc via service"
+                restarted_any_phpfpm=1
+                continue
+            elif echo "$phpfpm_svc_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
+                echo "$phpfpm_svc_output"
+                echo "⚠️  $svc restart failed via service. Attempting to kill lingering processes..."
+
+                if [ -n "$php_ver" ]; then
+                    kill_lingering_phpfpm_processes "$php_ver"
+                else
+                    kill_lingering_phpfpm_processes
+                fi
+
+                echo "🔄 Retrying $svc restart via service..."
+                if service "$svc" restart 2>/dev/null; then
+                    echo "✓ Retried $svc via service successfully"
                     restarted_any_phpfpm=1
                     continue
                 fi
             fi
 
-            # Try service wrapper
-            echo "service \"$svc\" restart"
-            if service "$svc" restart 2>/dev/null; then
-                echo "Restarted $svc via service"
-                restarted_any_phpfpm=1
-                continue
-            fi
-
             # Try direct init script if present
             if [ -x "/etc/init.d/$svc" ]; then
                 echo "/etc/init.d/\"$svc\" restart"
-                if /etc/init.d/"$svc" restart 2>/dev/null; then
+                local phpfpm_init_output
+                phpfpm_init_output=$(/etc/init.d/"$svc" restart 2>&1)
+                local phpfpm_init_exitcode=$?
+
+                if [ "$phpfpm_init_exitcode" -eq 0 ]; then
                     echo "Restarted $svc via /etc/init.d/$svc"
                     restarted_any_phpfpm=1
                     continue
+                elif echo "$phpfpm_init_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
+                    echo "$phpfpm_init_output"
+                    echo "⚠️  $svc restart failed via init.d. Attempting to kill lingering processes..."
+
+                    if [ -n "$php_ver" ]; then
+                        kill_lingering_phpfpm_processes "$php_ver"
+                    else
+                        kill_lingering_phpfpm_processes
+                    fi
+
+                    echo "🔄 Retrying $svc restart via init.d..."
+                    if /etc/init.d/"$svc" restart 2>/dev/null; then
+                        echo "✓ Retried $svc via init.d successfully"
+                        restarted_any_phpfpm=1
+                        continue
+                    fi
                 fi
             fi
         done
