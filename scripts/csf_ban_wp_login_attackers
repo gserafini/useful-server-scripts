@@ -2462,9 +2462,45 @@ BEGIN {
 
     processed = 0
     current_date = strftime("%Y-%m-%d %H:%M:%S")
-    
+
     # Use the variable passed from the shell
     total_ips = total_ips_count
+
+    # --- 🧹 PROACTIVE ROTATION: Prune BEFORE adding new IPs ---
+    # Calculate current ban count and project space needed
+    current_ban_count = length(ban_list)
+
+    # Worst-case estimate: assume all IPs from logs are new additions
+    # (Reality: some are already banned, so this is conservative)
+    projected_total = current_ban_count + total_ips
+
+    # If projected total would exceed max, prune rotatable IPs now
+    if (projected_total > max_bans) {
+        prune_count = projected_total - max_bans
+        print "INFO: Projected ban count (" projected_total ") would exceed MAX_BANS (" max_bans "). Proactively pruning " prune_count " non-permanent entries before adding new IPs." > "/dev/stderr"
+
+        delete_count = 0
+        # Iterate over existing bans and remove oldest rotatable IPs
+        for (ip in ban_list) {
+            if (delete_count >= prune_count) {
+                break
+            }
+
+            # Only delete rotatable (non-permanent) IPs
+            if (ban_list[ip] !~ /do not delete/) {
+                # Remove from ipset immediately
+                system("ipset del \"" ip_set_name "\" \"" ip "\" > /dev/null 2>&1")
+                delete ban_list[ip]
+                delete_count++
+                print "PRUNED: Removed rotatable IP " ip " to make room for new bans." > "/dev/stderr"
+            }
+        }
+
+        print "INFO: Pruned " delete_count " IPs. Current ban count: " length(ban_list) " / " max_bans > "/dev/stderr"
+    } else {
+        print "INFO: Current bans: " current_ban_count " / " max_bans " - Space available for " total_ips " potential new IPs." > "/dev/stderr"
+    }
+    # --- END PROACTIVE ROTATION ---
 }
 
 {
@@ -2538,16 +2574,17 @@ END {
         printf "Processing bans: %d of %d (100.00%%) - Complete.\n" , total_ips, total_ips > "/dev/stderr"
     }
     
-    # --- 🧹 START: ROTATION LOGIC ---
-    # NOTE: This simple rotation assumes that IPs remaining in '\''ban_list'\'' that are NOT 
-    # marked '\''do not delete'\'' can be arbitrarily deleted until the limit is met.
+    # --- 🧹 START: SAFETY NET ROTATION LOGIC ---
+    # NOTE: Primary rotation now happens in BEGIN block (proactive pruning).
+    # This END block rotation serves as a safety net in case the projection
+    # underestimated the number of new unique IPs.
     prune_count = 0
     total_current_bans = length(ban_list)
-    
+
     # 1. Calculate how many IPs must be pruned to fit within MAX_BANS
     if (total_current_bans > max_bans) {
         prune_count = total_current_bans - max_bans
-        print "WARNING: Total ban count (" total_current_bans ") exceeds MAX_BANS (" max_bans "). Pruning " prune_count " non-permanent entries." > "/dev/stderr"
+        print "WARNING: Ban count (" total_current_bans ") still exceeds MAX_BANS (" max_bans ") after proactive pruning. Safety net pruning " prune_count " additional non-permanent entries." > "/dev/stderr"
     }
 
     # 2. Prune rotatable IPs: delete oldest non-permanent ban(s).
