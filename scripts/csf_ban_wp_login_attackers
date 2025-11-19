@@ -2488,11 +2488,14 @@ BEGIN {
 
             # Only delete rotatable (non-permanent) IPs
             if (ban_list[ip] !~ /do not delete/) {
+                # Save the full ban details before deleting
+                ban_details = ban_list[ip]
+
                 # Remove from ipset immediately
                 system("ipset del \"" ip_set_name "\" \"" ip "\" > /dev/null 2>&1")
                 delete ban_list[ip]
                 delete_count++
-                print "PRUNED: Removed rotatable IP " ip " to make room for new bans." > "/dev/stderr"
+                print "PRUNED: " ban_details > "/dev/stderr"
             }
         }
 
@@ -2596,11 +2599,14 @@ END {
             if (ban_list[ip] !~ /do not delete/) {
                 # Check if we are now allowed to upgrade (either because limit was not hit, OR we just pruned one)
                 if (delete_count < prune_count) {
+                    # Save the full ban details before deleting
+                    ban_details = ban_list[ip]
+
                     # Remove from the ipset (real-time action)
                     system("ipset del \"" ip_set_name "\" \"" ip "\" > /dev/null 2>&1")
                     delete ban_list[ip] # Remove from final list
                     delete_count++
-                    print "ROTATED: Removed oldest non-permanent IP: " ip " to comply with max ban limit." > "/dev/stderr"
+                    print "ROTATED: " ban_details > "/dev/stderr"
                 }
             }
         }
