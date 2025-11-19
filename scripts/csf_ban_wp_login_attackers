@@ -2636,9 +2636,8 @@ if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
 
     # Attempt php-fpm restart with retry logic on failure
     # Capture output to check for error patterns since cPanel scripts may not return proper exit codes
-    local phpfpm_output
     phpfpm_output=$(/usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard 2>&1)
-    local phpfpm_exitcode=$?
+    phpfpm_exitcode=$?
     echo "$phpfpm_output"
 
     # Check if restart failed (either by exit code or error patterns in output)
@@ -2678,15 +2677,14 @@ else
                 if [ -z "$svc" ]; then continue; fi
 
                 # Extract PHP version from service name for targeted cleanup (e.g., ea-php74-php-fpm.service -> 74)
-                local php_ver=""
+                php_ver=""
                 if [[ "$svc" =~ php([0-9]+) ]]; then
                     php_ver="${BASH_REMATCH[1]}"
                 fi
 
                 echo "$systemctl_cmd restart \"$svc\""
-                local phpfpm_restart_output
                 phpfpm_restart_output=$($systemctl_cmd restart "$svc" 2>&1)
-                local phpfpm_restart_exitcode=$?
+                phpfpm_restart_exitcode=$?
 
                 # Check if restart failed (either by exit code or error patterns in output)
                 if [ "$phpfpm_restart_exitcode" -ne 0 ] || echo "$phpfpm_restart_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on|failed to restart'; then
@@ -2718,18 +2716,17 @@ else
         # Try common vendor names first (ea-php* and php-fpm)
         for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
             # Extract PHP version from service name for targeted cleanup
-            local php_ver=""
+            php_ver=""
             if [[ "$svc" =~ php([0-9]+) ]]; then
                 php_ver="${BASH_REMATCH[1]}"
             fi
 
-            local restart_succeeded=0
+            restart_succeeded=0
 
             if command -v /bin/systemctl >/dev/null 2>&1; then
                 echo "/bin/systemctl restart \"${svc}.service\""
-                local phpfpm_fallback_output
                 phpfpm_fallback_output=$(/bin/systemctl restart "${svc}.service" 2>&1)
-                local phpfpm_fallback_exitcode=$?
+                phpfpm_fallback_exitcode=$?
 
                 if [ "$phpfpm_fallback_exitcode" -eq 0 ]; then
                     echo "Restarted ${svc}.service via systemctl"
@@ -2760,9 +2757,8 @@ else
 
             # Try service wrapper
             echo "service \"$svc\" restart"
-            local phpfpm_svc_output
             phpfpm_svc_output=$(service "$svc" restart 2>&1)
-            local phpfpm_svc_exitcode=$?
+            phpfpm_svc_exitcode=$?
 
             if [ "$phpfpm_svc_exitcode" -eq 0 ]; then
                 echo "Restarted $svc via service"
@@ -2789,9 +2785,8 @@ else
             # Try direct init script if present
             if [ -x "/etc/init.d/$svc" ]; then
                 echo "/etc/init.d/\"$svc\" restart"
-                local phpfpm_init_output
                 phpfpm_init_output=$(/etc/init.d/"$svc" restart 2>&1)
-                local phpfpm_init_exitcode=$?
+                phpfpm_init_exitcode=$?
 
                 if [ "$phpfpm_init_exitcode" -eq 0 ]; then
                     echo "Restarted $svc via /etc/init.d/$svc"
