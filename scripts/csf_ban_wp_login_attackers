@@ -83,9 +83,10 @@
 IP_SET_NAME="high_volume_bans"
 IP_TRACKING_FILE="/etc/csf/ipset_tracking_${IP_SET_NAME}.log"
 CSF_ALLOW_FILE="/etc/csf/csf.allow"
+CSF_IGNORE_FILE="/etc/csf/csf.ignore"
 CSF_DENY_FILE="/etc/csf/csf.deny"
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
-MAX_BANS=50000
+MAX_BANS=100000
 MAX_PERMANENT_BANS=5000
 MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, based on aggregated hits.
 # DEFAULT LOG FILES: These are used if no --logs argument is provided.
@@ -104,14 +105,17 @@ TEMP_CACHE_EXTRACTION=""
 START_TIME_CMD=$(date +%s)
 START_TIME=${START_TIME_CMD}
 # -------------------------------
-
-# --- MODSECURITY INTEGRATION: CHECK FOR ENVIRONMENT VARIABLE ---
-# If ModSecurity sets MALICIOUS_IP environment variable, immediately ban that IP
-# This allows instant blocking before the cron-based log scan runs
-if [ -n "$MALICIOUS_IP" ]; then
-    # Execute blacklist function with ModSecurity context
-    exec "$0" --blacklist "$MALICIOUS_IP" "ModSecurity triggered ban"
-fi
+# DISABLED: 
+# DISABLED: # --- MODSECURITY INTEGRATION: CHECK FOR ENVIRONMENT VARIABLE ---
+# DISABLED: # If ModSecurity sets MALICIOUS_IP environment variable, immediately ban that IP
+# DISABLED: # This allows instant blocking before the cron-based log scan runs
+# DISABLED: if [ -n "$MALICIOUS_IP" ]; then
+# DISABLED:     # CRITICAL: Unset to prevent infinite exec loop
+# DISABLED:     _malicious_ip="$MALICIOUS_IP"
+# DISABLED:     unset MALICIOUS_IP
+# DISABLED:     # Execute blacklist function with ModSecurity context
+# DISABLED:     exec "$0" --blacklist "$_malicious_ip" "ModSecurity triggered ban"
+# DISABLED: fi
 # ---------------------------------------------------------------
 
 # Function to safely validate an IP address format
@@ -163,8 +167,9 @@ is_setup_complete() {
     if [ -z "$iptables_path" ]; then
         return 1
     fi
-    local iptables_rule_line="$iptables_path -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
-    if [ ! -f "$CSF_POST_FILE" ] || ! grep -q "$iptables_rule_line" "$CSF_POST_FILE"; then
+    # Check for either old (-A INPUT) or new (-I INPUT 10) rule format for backward compatibility
+    local iptables_rule_pattern="match-set $IP_SET_NAME src -j DROP"
+    if [ ! -f "$CSF_POST_FILE" ] || ! grep -q "$iptables_rule_pattern" "$CSF_POST_FILE"; then
         return 1
     fi
     return 0
@@ -581,7 +586,9 @@ perform_init() {
         echo "ERROR: Cannot find a valid path for the iptables executable. Initialization cannot proceed."
         exit 1
     fi
-    local iptables_rule_line="$iptables_path -A INPUT -m set --match-set $IP_SET_NAME src -j DROP"
+    # CRITICAL: Use -I INPUT 10 to insert rule BEFORE port 80/443 ACCEPTs (not -A which appends to end)
+    # Position 10 is right after LOCALINPUT chain, ensuring banned IPs are dropped before HTTP traffic is accepted
+    local iptables_rule_line="$iptables_path -I INPUT 10 -m set --match-set $IP_SET_NAME src -j DROP"
 
     echo "--- 🛠️ Initialization Action ---"
 
@@ -1729,6 +1736,23 @@ keywords=(
 ["1 /wp-includes/mani.php"]="/wp-includes/mani.php"
 ["1 /xp.php"]="xp.php"
 
+  # --- High-traffic patterns identified 2025-12-01 ---
+  ["1 /1.php"]="1.php"
+  ["1 /i.php"]="i.php"
+  ["1 /info.php"]="info.php"
+  ["1 tinyfilemanager.php"]="tinyfilemanager.php"
+  ["1 classwithtostring.php"]="classwithtostring.php"
+  ["1 autoload_classmap.php"]="autoload_classmap.php"
+  ["1 index.bak.php"]="index.bak.php"
+  ["1 ioxi-o.php"]="ioxi-o.php"
+  ["1 akcc.php"]="akcc.php"
+  ["1 gelay.php"]="gelay.php"
+  ["1 gfile.php"]="gfile.php"
+  ["1 bolt.php"]="bolt.php"
+  ["1 radio.php"]="radio.php"
+  ["1 moon.php"]="moon.php"
+  ["1 /.well-known/.*\.php"]="/.well-known/*.php webshell attempt"
+
   # --- Remote Management Probing ---
   ["1 /commpilot/"]="/commpilot/"
   ["1 /PhoneBackup/"]="/PhoneBackup/"
@@ -2433,6 +2457,8 @@ gawk -v ip_set_name="$IP_SET_NAME" \
 -v max_violation_count="$MAX_VIOLATION_COUNT" \
 -v temp_geoip_mapping="$TEMP_GEOIP_MAPPING" \
 -v total_ips_count="$TOTAL_UNIQUE_IPS" \
+-v csf_allow_file="$CSF_ALLOW_FILE" \
+-v csf_ignore_file="$CSF_IGNORE_FILE" \
 '
 BEGIN {
     FS="\t" # FIX 2: Set Input Field Separator to Tab to correctly read the summary
@@ -2459,6 +2485,37 @@ BEGIN {
         geoip_map[parts[1]] = parts[2]
     }
     close(temp_geoip_mapping)
+
+    # 3. READ CSF ALLOW/IGNORE FILES (WHITELIST) - Never ban these IPs
+    allowlist_count = 0
+    while ((getline line < csf_allow_file) > 0) {
+        if (line !~ /^#/ && line !~ /^[[:space:]]*$/) {
+            split(line, parts, "#")
+            ip = parts[1]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+            if (ip != "" && ip ~ /^[0-9]/) {
+                allowlist[ip] = 1
+                allowlist_count++
+            }
+        }
+    }
+    close(csf_allow_file)
+
+    # Also load csf.ignore
+    while ((getline line < csf_ignore_file) > 0) {
+        if (line !~ /^#/ && line !~ /^[[:space:]]*$/) {
+            split(line, parts, "#")
+            ip = parts[1]
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
+            if (ip != "" && ip ~ /^[0-9]/) {
+                allowlist[ip] = 1
+                allowlist_count++
+            }
+        }
+    }
+    close(csf_ignore_file)
+
+    print "INFO: Loaded " allowlist_count " whitelisted IPs from csf.allow and csf.ignore" > "/dev/stderr"
 
     processed = 0
     current_date = strftime("%Y-%m-%d %H:%M:%S")
@@ -2530,7 +2587,13 @@ BEGIN {
         # 🔑 OPTIMIZATION 2: IPSET ADD (Fast Kernel-level insertion)
         # IP is new.
         # Add to ipset and tracking file.
-        
+
+        # CRITICAL: Skip whitelisted IPs (csf.allow and csf.ignore)
+        if (ip in allowlist) {
+            print "SKIPPED: " ip " is whitelisted in csf.allow/csf.ignore - will NOT ban" > "/dev/stderr"
+            next
+        }
+
         # Check for permanent status first
         is_new_ban_permanent = 0
         message = "csf_ban_wp_login_attackers inserted IP to ipset [Violations: " count ", " description "]"
