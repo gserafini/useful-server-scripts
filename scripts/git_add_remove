@@ -1,0 +1,150 @@
+#!/bin/bash
+
+#################################################################
+#
+# Git equivalent of svn_add_remove
+# Stages new untracked files and deleted files for commit
+# Useful for when upgrading WordPress and wanting to commit changes
+#
+# Author: Gabriel Serafini <gserafini@gmail.com>
+# Based on svn_add_remove script
+#
+# INSTALL
+# Symlink the file into /usr/local/bin to enable system-wide
+# ln -s $PWD/git_add_remove /usr/local/bin/git_add_remove
+#
+#################################################################
+
+# Check if we are in a git repository
+if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+    echo "Error: Not a git repository"
+    exit 1
+fi
+
+USER=$(whoami)
+DIR_OWNER=$(stat -c "%U" . 2>/dev/null || stat -f "%Su" .)
+
+echo "==================================================="
+echo "Git Add/Remove - Stage new and deleted files"
+echo "==================================================="
+echo
+
+# Show current status summary
+echo "Current git status:"
+git status --short
+echo
+
+# Handle untracked files
+echo "Searching for untracked files..."
+UNTRACKED=$(git ls-files --others --exclude-standard | grep -v "wp-content/cache" | grep -v "error_log" | grep -v "ftpquota")
+UNTRACKED_COUNT=$(echo "$UNTRACKED" | grep -c . 2>/dev/null || echo 0)
+
+if [ "$UNTRACKED_COUNT" -gt 0 ] && [ -n "$UNTRACKED" ]; then
+    echo "$UNTRACKED"
+    echo "----------------------------------------------------"
+    echo "TOTAL UNTRACKED FILES: $UNTRACKED_COUNT"
+    echo
+    echo "Stage these files for addition? [y]/n "
+    read -e t1
+
+    if [[ "$t1" == 'y' || "$t1" == 'yes' || "$t1" == "" ]]; then
+        echo "$UNTRACKED" | xargs -d '\n' git add 2>/dev/null || echo "$UNTRACKED" | xargs -I {} git add "{}"
+        echo
+        echo "$UNTRACKED_COUNT files staged for addition."
+        echo
+    fi
+else
+    echo "No untracked files found."
+fi
+
+echo
+
+# Handle deleted files
+echo "Searching for deleted files..."
+DELETED=$(git ls-files --deleted)
+DELETED_COUNT=$(echo "$DELETED" | grep -c . 2>/dev/null || echo 0)
+
+if [ "$DELETED_COUNT" -gt 0 ] && [ -n "$DELETED" ]; then
+    echo "$DELETED"
+    echo "----------------------------------------------------"
+    echo "TOTAL DELETED FILES: $DELETED_COUNT"
+    echo
+    echo "Stage these files for deletion? [y]/n "
+    read -e t2
+
+    if [[ "$t2" == 'y' || "$t2" == 'yes' || "$t2" == "" ]]; then
+        echo "$DELETED" | xargs -d '\n' git rm --cached 2>/dev/null || echo "$DELETED" | xargs -I {} git rm --cached "{}"
+        echo
+        echo "$DELETED_COUNT files staged for deletion."
+        echo
+    fi
+else
+    echo "No deleted files found."
+fi
+
+echo
+
+# Handle modified files
+echo "Searching for modified files..."
+MODIFIED=$(git ls-files --modified)
+MODIFIED_COUNT=$(echo "$MODIFIED" | grep -c . 2>/dev/null || echo 0)
+
+if [ "$MODIFIED_COUNT" -gt 0 ] && [ -n "$MODIFIED" ]; then
+    echo "$MODIFIED" | head -20
+    if [ "$MODIFIED_COUNT" -gt 20 ]; then
+        echo "... and $((MODIFIED_COUNT - 20)) more"
+    fi
+    echo "----------------------------------------------------"
+    echo "TOTAL MODIFIED FILES: $MODIFIED_COUNT"
+    echo
+    echo "Stage these modified files? [y]/n "
+    read -e t3
+
+    if [[ "$t3" == 'y' || "$t3" == 'yes' || "$t3" == "" ]]; then
+        git add -u
+        echo
+        echo "$MODIFIED_COUNT modified files staged."
+        echo
+    fi
+else
+    echo "No modified files found."
+fi
+
+echo
+
+# Show staged changes
+STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+if [ "$STAGED_COUNT" -gt 0 ]; then
+    echo "==================================================="
+    echo "STAGED CHANGES: $STAGED_COUNT files"
+    echo "==================================================="
+    git diff --cached --stat | tail -5
+    echo
+    echo "Commit these changes now? [y]/n "
+    read -e commit_now
+
+    if [[ "$commit_now" == 'y' || "$commit_now" == 'yes' || "$commit_now" == "" ]]; then
+        echo "Enter commit message (or press Enter for default): "
+        read -e commit_msg
+        if [ -z "$commit_msg" ]; then
+            commit_msg="Update files via git_add_remove"
+        fi
+        git commit -m "$commit_msg"
+        echo
+        echo "Changes committed!"
+    else
+        echo "Don't forget to commit your changes! ;)"
+    fi
+else
+    echo "No changes staged for commit."
+fi
+
+# Fix ownership if run as root
+if [[ "$USER" == "root" ]]; then
+    echo
+    echo "Fixing .git ownership to $DIR_OWNER..."
+    chown -R "$DIR_OWNER":"$DIR_OWNER" .git
+    echo "Done!"
+fi
+
+exit 0
