@@ -37,7 +37,11 @@ echo
 # Handle untracked files
 echo "Searching for untracked files..."
 UNTRACKED=$(git ls-files --others --exclude-standard | grep -v "wp-content/cache" | grep -v "error_log" | grep -v "ftpquota")
-UNTRACKED_COUNT=$(echo "$UNTRACKED" | grep -c . 2>/dev/null || echo 0)
+if [ -n "$UNTRACKED" ]; then
+    UNTRACKED_COUNT=$(echo "$UNTRACKED" | wc -l | tr -d ' ')
+else
+    UNTRACKED_COUNT=0
+fi
 
 if [ "$UNTRACKED_COUNT" -gt 0 ] && [ -n "$UNTRACKED" ]; then
     echo "$UNTRACKED"
@@ -62,7 +66,11 @@ echo
 # Handle deleted files
 echo "Searching for deleted files..."
 DELETED=$(git ls-files --deleted)
-DELETED_COUNT=$(echo "$DELETED" | grep -c . 2>/dev/null || echo 0)
+if [ -n "$DELETED" ]; then
+    DELETED_COUNT=$(echo "$DELETED" | wc -l | tr -d ' ')
+else
+    DELETED_COUNT=0
+fi
 
 if [ "$DELETED_COUNT" -gt 0 ] && [ -n "$DELETED" ]; then
     echo "$DELETED"
@@ -87,7 +95,11 @@ echo
 # Handle modified files
 echo "Searching for modified files..."
 MODIFIED=$(git ls-files --modified)
-MODIFIED_COUNT=$(echo "$MODIFIED" | grep -c . 2>/dev/null || echo 0)
+if [ -n "$MODIFIED" ]; then
+    MODIFIED_COUNT=$(echo "$MODIFIED" | wc -l | tr -d ' ')
+else
+    MODIFIED_COUNT=0
+fi
 
 if [ "$MODIFIED_COUNT" -gt 0 ] && [ -n "$MODIFIED" ]; then
     echo "$MODIFIED" | head -20
@@ -113,7 +125,7 @@ fi
 echo
 
 # Show staged changes
-STAGED_COUNT=$(git diff --cached --name-only | wc -l)
+STAGED_COUNT=$(git diff --cached --name-only | wc -l | tr -d ' ')
 if [ "$STAGED_COUNT" -gt 0 ]; then
     echo "==================================================="
     echo "STAGED CHANGES: $STAGED_COUNT files"
