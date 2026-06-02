@@ -250,6 +250,51 @@ report_ban_counts() {
     echo "----------------------"
 }
 
+# Rebuild the live ipset from the persistent tracking file.
+# This is needed after csf reloads because the custom ipset can be recreated
+# empty even though the tracking file still contains the intended bans.
+repopulate_ipset_from_tracking_file() {
+    local tracked_count=0
+    local restored_count=0
+    local skipped_count=0
+
+    if ! ipset list "$IP_SET_NAME" &> /dev/null; then
+        echo "ERROR: ipset '$IP_SET_NAME' does not exist; cannot repopulate from tracking file."
+        return 1
+    fi
+
+    if [ ! -f "$IP_TRACKING_FILE" ]; then
+        echo "Tracking file $IP_TRACKING_FILE does not exist; nothing to repopulate."
+        return 0
+    fi
+
+    echo "Repopulating live ipset '$IP_SET_NAME' from $IP_TRACKING_FILE..."
+
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+
+        local ip
+        ip=${line%% *}
+
+        if ! validate_ip "$ip"; then
+            skipped_count=$((skipped_count + 1))
+            continue
+        fi
+
+        tracked_count=$((tracked_count + 1))
+        if ipset add "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1; then
+            restored_count=$((restored_count + 1))
+        fi
+    done < "$IP_TRACKING_FILE"
+
+    echo "Repopulated $restored_count tracked IPs into '$IP_SET_NAME' from $tracked_count tracking entries."
+    if [ "$skipped_count" -gt 0 ]; then
+        echo "Skipped $skipped_count malformed tracking entries."
+    fi
+
+    return 0
+}
+
 # Function to kill lingering php-fpm processes holding socket files
 # This is called when php-fpm restart fails due to "Another FPM instance seems to already listen" errors
 # Based on manual recovery: force remove sockets first, then killall -9, then targeted cleanup
@@ -563,6 +608,7 @@ perform_whitelist() {
 
     echo "Reloading CSF to apply $CSF_ALLOW_FILE changes..."
     /usr/sbin/csf -r
+    repopulate_ipset_from_tracking_file || exit 1
 
     echo "Whitelist action complete for $ip."
     local end_time_cmd
@@ -613,6 +659,7 @@ perform_init() {
 
     echo "5. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
+    repopulate_ipset_from_tracking_file || exit 1
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
     # CONNTRACK CHECK: Recommend installing conntrack-tools if you want bans to immediately
@@ -681,6 +728,17 @@ perform_clear() {
     report_ban_counts "Post-Clear Report" 0 "$end_time"
     # No per-IP iptables cleanup here — conntrack is preferred. If you want immediate
     # termination of established connections, install conntrack-tools (see --init message).
+    exit 0
+}
+
+perform_rebuild_live_set() {
+    ensure_setup
+    echo "--- 🔄 Rebuild Live IPSET Action ---"
+    repopulate_ipset_from_tracking_file || exit 1
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Rebuild Report" 0 "$end_time"
     exit 0
 }
 
@@ -1438,7 +1496,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -1450,6 +1508,9 @@ while true; do
     --init )
       perform_init
       ;;
+    --rebuild-live-set )
+      perform_rebuild_live_set
+      ;;
     --install-mod-security-triggers )
       perform_install_modsecurity_triggers
       ;;
@@ -1457,6 +1518,7 @@ while true; do
             echo "Usage: $0 [options]"
             echo "Options:"
             echo "  --init                    Initialize ipset and CSF hooks"
+            echo "  --rebuild-live-set        Repopulate the live ipset from the tracking file"
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
