@@ -214,9 +214,21 @@ report_ban_counts() {
     local end_time="${3:-0}" 
     echo "--- 📊 $report_title ---"
     
-    local ipset_count
-    ipset_count=$(grep -cvE '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null)
-    ipset_count=${ipset_count:-0}
+    local live_ipset_count
+    local live_ipset_count_cmd
+    live_ipset_count_cmd=$(ipset list "$IP_SET_NAME" 2>/dev/null | awk 'BEGIN{c=0;f=0} /^Members:/{f=1;next} f && NF{c++} END{print c+0}')
+    live_ipset_count=${live_ipset_count_cmd}
+    live_ipset_count=${live_ipset_count:-0}
+
+    local tracking_line_count
+    tracking_line_count=$(grep -cvE '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null)
+    tracking_line_count=${tracking_line_count:-0}
+
+    local tracking_unique_count
+    local tracking_unique_count_cmd
+    tracking_unique_count_cmd=$(awk '!seen[$1]++{c++} END{print c+0}' "$IP_TRACKING_FILE" 2>/dev/null)
+    tracking_unique_count=${tracking_unique_count_cmd}
+    tracking_unique_count=${tracking_unique_count:-0}
 
     local permanent_ban_count
     permanent_ban_count=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
@@ -231,7 +243,8 @@ report_ban_counts() {
     csf_allow_count=${csf_allow_count:-0}
 
 
-    echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
+    echo "Live IPs in custom IPSET '$IP_SET_NAME': $live_ipset_count / $MAX_BANS"
+    echo "Tracked IPs in $IP_TRACKING_FILE: $tracking_line_count lines, $tracking_unique_count unique"
     echo "Permanent IPs ('do not delete'): $permanent_ban_count / $MAX_PERMANENT_BANS"
     echo "Total IPs in CSF Deny File '$CSF_DENY_FILE': $csf_deny_count"
     echo "Total IPs in CSF Allow File '$CSF_ALLOW_FILE': $csf_allow_count"
