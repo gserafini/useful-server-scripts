@@ -128,6 +128,23 @@ validate_ip() {
     fi
 }
 
+# Function to terminate live sessions for an IP after it is banned.
+# Prefer conntrack when available, then fall back to ss -K for hosts that
+# do not have conntrack-tools installed.
+terminate_live_sessions_for_ip() {
+    local ip="$1"
+
+    if command -v conntrack >/dev/null 2>&1; then
+        conntrack -D -s "$ip" >/dev/null 2>&1 || true
+        conntrack -D -d "$ip" >/dev/null 2>&1 || true
+    fi
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -K src "$ip" >/dev/null 2>&1 || true
+        ss -K dst "$ip" >/dev/null 2>&1 || true
+    fi
+}
+
 # Function to determine the absolute path of iptables for rule generation
 get_iptables_path() {
     local path
@@ -524,7 +541,8 @@ perform_blacklist() {
     fi
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
-        echo "IP $ip is already in ipset: $IP_SET_NAME. Skipping insertion."
+        echo "IP $ip is already in ipset: $IP_SET_NAME. Refreshing live-session teardown."
+        terminate_live_sessions_for_ip "$ip"
         local end_time_cmd
         end_time_cmd=$(date +%s)
         local end_time=${end_time_cmd}
@@ -558,11 +576,7 @@ perform_blacklist() {
         exit 1
     fi
 
-    # If conntrack-tools is available, delete any conntrack entries for this IP so
-    # established sessions are terminated immediately.
-    if command -v conntrack >/dev/null 2>&1; then
-        conntrack -D -s "$ip" >/dev/null 2>&1 || true
-    fi
+    terminate_live_sessions_for_ip "$ip"
 
     echo "$ip # [$timestamp] $ban_reason" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
