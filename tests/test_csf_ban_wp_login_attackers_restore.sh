@@ -10,6 +10,62 @@ fail() {
 
 grep -q '^repopulate_ipset_from_tracking_file()' "$SCRIPT" || fail "missing repopulate_ipset_from_tracking_file helper"
 
+grep -q '^CSF_REBUILD_LINE=' "$SCRIPT" || fail "missing persistent CSF rebuild hook command"
+setup_block=$(sed -n '/^is_setup_complete() {/,/^}/p' "$SCRIPT")
+printf '%s\n' "$setup_block" | grep -q 'CSF_REBUILD_LINE' || fail "setup check does not require the rebuild hook"
+
+repopulate_block=$(sed -n '/^repopulate_ipset_from_tracking_file() {/,/^}/p' "$SCRIPT")
+printf '%s\n' "$repopulate_block" | grep -q 'ip -4 -o addr show' || fail "rebuild does not discover local addresses"
+printf '%s\n' "$repopulate_block" | grep -q 'ipset restore' || fail "rebuild does not use atomic bulk restore"
+printf '%s\n' "$repopulate_block" | grep -q 'protected' || fail "rebuild does not skip local addresses"
+
+sandbox=$(mktemp -d)
+trap 'rm -rf "$sandbox"' EXIT
+cat > "$sandbox/tracking.log" <<'EOF'
+203.0.113.10 # malicious source
+10.20.30.40 # stale local self-ban
+203.0.113.10 # duplicate source
+999.0.0.1 # malformed source
+EOF
+
+IP_SET_NAME="high_volume_bans"
+IP_TRACKING_FILE="$sandbox/tracking.log"
+MAX_BANS=250000
+
+ip() {
+    printf '%s\n' '2: eth0    inet 10.20.30.40/24 brd 10.20.30.255 scope global eth0'
+}
+
+ipset() {
+    printf '%s\n' "$*" >> "$sandbox/ipset-calls.log"
+    case "$1" in
+        list|del)
+            return 0
+            ;;
+        restore)
+            cat > "$sandbox/restore-input.log"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+eval "$repopulate_block"
+rebuild_output=$(repopulate_ipset_from_tracking_file)
+
+grep -q '^add high_volume_bans 203\.0\.113\.10 -exist$' "$sandbox/restore-input.log" || fail "bulk restore omitted valid tracked IP"
+if grep -q '10\.20\.30\.40' "$sandbox/restore-input.log"; then
+    fail "bulk restore included assigned local IP"
+fi
+[ "$(grep -c '203\.0\.113\.10' "$sandbox/restore-input.log")" -eq 1 ] || fail "bulk restore did not deduplicate tracked IPs"
+grep -q '^del high_volume_bans 10\.20\.30\.40 -exist$' "$sandbox/ipset-calls.log" || fail "rebuild did not remove stale live self-ban"
+printf '%s\n' "$rebuild_output" | grep -q 'Skipped 1 malformed tracking entries' || fail "rebuild did not report malformed entry"
+printf '%s\n' "$rebuild_output" | grep -q 'Skipped and removed 1 assigned local-address entries' || fail "rebuild did not report local self-ban"
+
+unset -f ip ipset
+rm -rf "$sandbox"
+trap - EXIT
+
 whitelist_block=$(sed -n '/^perform_whitelist() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$whitelist_block" | grep -q '/usr/sbin/csf -r' || fail "whitelist block missing csf reload"
 printf '%s\n' "$whitelist_block" | grep -q 'repopulate_ipset_from_tracking_file' || fail "whitelist block does not repopulate live ipset after csf reload"
@@ -17,6 +73,7 @@ printf '%s\n' "$whitelist_block" | grep -q 'repopulate_ipset_from_tracking_file'
 init_block=$(sed -n '/^perform_init() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$init_block" | grep -q '/usr/sbin/csf -r' || fail "init block missing csf reload"
 printf '%s\n' "$init_block" | grep -q 'repopulate_ipset_from_tracking_file' || fail "init block does not repopulate live ipset after csf reload"
+printf '%s\n' "$init_block" | grep -q 'CSF_REBUILD_LINE' || fail "init block does not persist the rebuild hook"
 
 grep -q -- '--rebuild-live-set' "$SCRIPT" || fail "help/argument parser missing --rebuild-live-set"
 

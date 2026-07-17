@@ -179,6 +179,8 @@ get_nameservers.sh --csv
 
 - Handles 50,000+ bans efficiently using IPSET
 - Integrates with CSF firewall via `/etc/csf/csfpost.sh`
+- Replays the persistent tracking file automatically after every CSF rebuild
+- Excludes assigned local IPv4 addresses from both manual bans and replay
 - Terminates existing connections when banning (requires conntrack-tools)
 - Generates abuse evidence reports with WHOIS integration
 - Supports manual whitelist/blacklist management
@@ -196,6 +198,7 @@ This creates:
 
 - IPSET table named `high_volume_bans`
 - iptables DROP rule in `/etc/csf/csfpost.sh`
+- post-rebuild replay command in `/etc/csf/csfpost.sh`
 - Tracking file at `/etc/csf/ipset_tracking_high_volume_bans.log`
 
 #### Daily Operations
@@ -279,6 +282,9 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | Flag | Description |
 |------|-------------|
 | `--init` | Initialize IPSET table and CSF integration (one-time setup) |
+| `--rebuild-live-set` | Bulk-replay tracked bans while excluding assigned local addresses |
+| `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
+| `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`) |
 | `--whitelist IP [MSG]` | Remove IP from bans and add to CSF allow list (alias: `--unblock`) |
 | `--clear` | Flush all bans from IPSET and tracking file (DANGEROUS) |

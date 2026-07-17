@@ -86,6 +86,7 @@ CSF_ALLOW_FILE="/etc/csf/csf.allow"
 CSF_IGNORE_FILE="/etc/csf/csf.ignore"
 CSF_DENY_FILE="/etc/csf/csf.deny"
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
+CSF_REBUILD_LINE="/usr/local/useful-server-scripts/scripts/csf_ban_wp_login_attackers --rebuild-live-set"
 MAX_BANS=250000
 MAX_PERMANENT_BANS=5000
 MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, based on aggregated hits.
@@ -189,6 +190,9 @@ is_setup_complete() {
     if [ ! -f "$CSF_POST_FILE" ] || ! grep -q "$iptables_rule_pattern" "$CSF_POST_FILE"; then
         return 1
     fi
+    if ! grep -Fqx "$CSF_REBUILD_LINE" "$CSF_POST_FILE"; then
+        return 1
+    fi
     return 0
 }
 
@@ -284,10 +288,13 @@ report_ban_counts() {
 # This is needed after csf reloads because the custom ipset can be recreated
 # empty even though the tracking file still contains the intended bans.
 repopulate_ipset_from_tracking_file() {
+    local local_ip_file
+    local restore_file
+    local stats_file
     local tracked_count=0
     local restored_count=0
-    local failed_count=0
     local skipped_count=0
+    local local_skipped_count=0
 
     if ! ipset list "$IP_SET_NAME" &> /dev/null; then
         echo "ERROR: ipset '$IP_SET_NAME' does not exist; cannot repopulate from tracking file."
@@ -299,36 +306,84 @@ repopulate_ipset_from_tracking_file() {
         return 0
     fi
 
+    local_ip_file=$(mktemp /tmp/high_volume_rebuild_local_ips.XXXXXX) || return 1
+    restore_file=$(mktemp /tmp/high_volume_rebuild_restore.XXXXXX) || {
+        rm -f "$local_ip_file"
+        return 1
+    }
+    stats_file=$(mktemp /tmp/high_volume_rebuild_stats.XXXXXX) || {
+        rm -f "$local_ip_file" "$restore_file"
+        return 1
+    }
+
+    {
+        echo "127.0.0.1"
+        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
+    } | sort -u > "$local_ip_file"
+
+    if [ ! -s "$local_ip_file" ]; then
+        echo "ERROR: Could not discover local IPv4 addresses before rebuilding '$IP_SET_NAME'."
+        rm -f "$local_ip_file" "$restore_file" "$stats_file"
+        return 1
+    fi
+
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        ipset del "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1 || true
+    done < "$local_ip_file"
+
+    awk -v set_name="$IP_SET_NAME" -v stats_file="$stats_file" '
+        function valid_ipv4(ip, parts, count, i) {
+            count = split(ip, parts, ".")
+            if (count != 4) return 0
+            for (i = 1; i <= 4; i++) {
+                if (parts[i] !~ /^[0-9]+$/ || parts[i] < 0 || parts[i] > 255) return 0
+            }
+            return 1
+        }
+        NR == FNR {
+            protected[$1] = 1
+            next
+        }
+        NF {
+            ip = $1
+            if (!valid_ipv4(ip)) {
+                malformed++
+                next
+            }
+            tracked++
+            if (ip in protected) {
+                local_skipped++
+                next
+            }
+            if (!seen[ip]++) {
+                print "add " set_name " " ip " -exist"
+                restored++
+            }
+        }
+        END {
+            print tracked + 0, restored + 0, malformed + 0, local_skipped + 0 > stats_file
+        }
+    ' "$local_ip_file" "$IP_TRACKING_FILE" > "$restore_file"
+
+    read -r tracked_count restored_count skipped_count local_skipped_count < "$stats_file"
+
     echo "Repopulating live ipset '$IP_SET_NAME' from $IP_TRACKING_FILE..."
+    if [ -s "$restore_file" ] && ! ipset restore < "$restore_file"; then
+        echo "ERROR: Bulk restore into '$IP_SET_NAME' failed."
+        echo "Remedy: run '$0 --resize-live-set $MAX_BANS' and retry the rebuild."
+        rm -f "$local_ip_file" "$restore_file" "$stats_file"
+        return 1
+    fi
 
-    while IFS= read -r line; do
-        [ -z "$line" ] && continue
+    rm -f "$local_ip_file" "$restore_file" "$stats_file"
 
-        local ip
-        ip=${line%% *}
-
-        if ! validate_ip "$ip"; then
-            skipped_count=$((skipped_count + 1))
-            continue
-        fi
-
-        tracked_count=$((tracked_count + 1))
-        if ipset add "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1; then
-            restored_count=$((restored_count + 1))
-        else
-            failed_count=$((failed_count + 1))
-        fi
-    done < "$IP_TRACKING_FILE"
-
-    echo "Repopulated $restored_count tracked IPs into '$IP_SET_NAME' from $tracked_count tracking entries."
+    echo "Repopulated $restored_count unique tracked IPs into '$IP_SET_NAME' from $tracked_count valid tracking entries."
     if [ "$skipped_count" -gt 0 ]; then
         echo "Skipped $skipped_count malformed tracking entries."
     fi
-
-    if [ "$failed_count" -gt 0 ]; then
-        echo "ERROR: Failed to restore $failed_count tracked entries into '$IP_SET_NAME'."
-        echo "Remedy: run '$0 --resize-live-set $MAX_BANS' and retry the rebuild."
-        return 1
+    if [ "$local_skipped_count" -gt 0 ]; then
+        echo "Skipped and removed $local_skipped_count assigned local-address entries."
     fi
 
     return 0
@@ -908,10 +963,15 @@ perform_init() {
         echo "$iptables_rule_line" | tee -a "$CSF_POST_FILE" > /dev/null
     fi
 
-    echo "4. Ensuring tracking file $IP_TRACKING_FILE exists..."
+    echo "4. Adding tracked-ban replay command to $CSF_POST_FILE..."
+    if ! grep -Fqx "$CSF_REBUILD_LINE" "$CSF_POST_FILE"; then
+        echo "$CSF_REBUILD_LINE" | tee -a "$CSF_POST_FILE" > /dev/null
+    fi
+
+    echo "5. Ensuring tracking file $IP_TRACKING_FILE exists..."
     touch "$IP_TRACKING_FILE" || { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1; }
 
-    echo "5. Reloading CSF to apply new rules..."
+    echo "6. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
     ensure_live_ipset_capacity || exit 1
     repopulate_ipset_from_tracking_file || exit 1
