@@ -86,7 +86,7 @@ CSF_ALLOW_FILE="/etc/csf/csf.allow"
 CSF_IGNORE_FILE="/etc/csf/csf.ignore"
 CSF_DENY_FILE="/etc/csf/csf.deny"
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
-MAX_BANS=100000
+MAX_BANS=250000
 MAX_PERMANENT_BANS=5000
 MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, based on aggregated hits.
 # DEFAULT LOG FILES: These are used if no --logs argument is provided.
@@ -286,6 +286,7 @@ report_ban_counts() {
 repopulate_ipset_from_tracking_file() {
     local tracked_count=0
     local restored_count=0
+    local failed_count=0
     local skipped_count=0
 
     if ! ipset list "$IP_SET_NAME" &> /dev/null; then
@@ -314,6 +315,8 @@ repopulate_ipset_from_tracking_file() {
         tracked_count=$((tracked_count + 1))
         if ipset add "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1; then
             restored_count=$((restored_count + 1))
+        else
+            failed_count=$((failed_count + 1))
         fi
     done < "$IP_TRACKING_FILE"
 
@@ -322,7 +325,143 @@ repopulate_ipset_from_tracking_file() {
         echo "Skipped $skipped_count malformed tracking entries."
     fi
 
+    if [ "$failed_count" -gt 0 ]; then
+        echo "ERROR: Failed to restore $failed_count tracked entries into '$IP_SET_NAME'."
+        echo "Remedy: run '$0 --resize-live-set $MAX_BANS' and retry the rebuild."
+        return 1
+    fi
+
     return 0
+}
+
+get_live_ipset_maxelem() {
+    ipset list "$IP_SET_NAME" 2>/dev/null |
+        awk '/^Header:/ {for (i = 1; i <= NF; i++) if ($i == "maxelem") {print $(i + 1); exit}}'
+}
+
+update_persistent_ipset_capacity() {
+    local target_max="$1"
+    local temp_file
+    local backup_file
+
+    temp_file=$(mktemp "${CSF_POST_FILE}.resize.XXXXXX") || return 1
+    backup_file="${CSF_POST_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    if ! awk -v set_name="$IP_SET_NAME" -v max_bans="$target_max" '
+        BEGIN { updated = 0 }
+        $1 == "ipset" && $2 == "create" && $3 == set_name && $4 == "hash:ip" {
+            print "ipset create " set_name " hash:ip maxelem " max_bans " -exist"
+            updated = 1
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print "ipset create " set_name " hash:ip maxelem " max_bans " -exist"
+            }
+        }
+    ' "$CSF_POST_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    cp -a "$CSF_POST_FILE" "$backup_file" || { rm -f "$temp_file"; return 1; }
+    chmod --reference="$CSF_POST_FILE" "$temp_file" || { rm -f "$temp_file"; return 1; }
+    chown --reference="$CSF_POST_FILE" "$temp_file" || { rm -f "$temp_file"; return 1; }
+    mv -f "$temp_file" "$CSF_POST_FILE" || return 1
+    echo "Updated persistent ipset capacity in $CSF_POST_FILE (backup: $backup_file)."
+}
+
+resize_live_ipset() {
+    local target_max="${1:-$MAX_BANS}"
+    local current_max
+    local temp_set="${IP_SET_NAME}_resize_$$"
+    local restore_file
+    local expected_count
+    local restored_count
+
+    if ! [[ "$target_max" =~ ^[0-9]+$ ]] || [ "$target_max" -lt 1 ]; then
+        echo "ERROR: resize target must be a positive integer."
+        return 1
+    fi
+
+    current_max=$(get_live_ipset_maxelem)
+    if ! [[ "$current_max" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Could not determine maxelem for '$IP_SET_NAME'."
+        return 1
+    fi
+
+    if [ "$current_max" -ge "$target_max" ]; then
+        echo "Live ipset '$IP_SET_NAME' already has capacity $current_max."
+        update_persistent_ipset_capacity "$current_max" || return 1
+        return 0
+    fi
+
+    restore_file=$(mktemp "/tmp/${IP_SET_NAME}.restore.XXXXXX") || return 1
+    ipset destroy "$temp_set" >/dev/null 2>&1 || true
+
+    if ! ipset create "$temp_set" hash:ip maxelem "$target_max"; then
+        rm -f "$restore_file"
+        echo "ERROR: Could not create temporary ipset '$temp_set'."
+        return 1
+    fi
+
+    awk -v set_name="$temp_set" '
+        $1 ~ /^[0-9.]+$/ && split($1, octets, /\./) == 4 && !seen[$1]++ {
+            print "add " set_name " " $1
+        }
+    ' "$IP_TRACKING_FILE" > "$restore_file"
+    expected_count=$(wc -l < "$restore_file")
+
+    if [ "$expected_count" -ge "$target_max" ]; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Tracking corpus has $expected_count unique entries, which does not fit in target capacity $target_max."
+        echo "Remedy: rerun --resize-live-set with a value greater than $expected_count."
+        return 1
+    fi
+
+    if ! ipset restore < "$restore_file"; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Failed to populate temporary ipset '$temp_set'; live set was not changed."
+        return 1
+    fi
+
+    restored_count=$(ipset save "$temp_set" | grep -c "^add $temp_set ")
+    if [ "$restored_count" -ne "$expected_count" ]; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Temporary ipset verification failed: expected $expected_count entries, restored $restored_count."
+        return 1
+    fi
+
+    if ! ipset swap "$temp_set" "$IP_SET_NAME"; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Atomic ipset swap failed; live set was not changed."
+        return 1
+    fi
+
+    ipset destroy "$temp_set" >/dev/null 2>&1 || true
+    rm -f "$restore_file"
+    update_persistent_ipset_capacity "$target_max" || return 1
+    echo "Resized '$IP_SET_NAME' from $current_max to $target_max and restored $restored_count unique tracked bans."
+}
+
+ensure_live_ipset_capacity() {
+    local current_max
+    current_max=$(get_live_ipset_maxelem)
+
+    if ! [[ "$current_max" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Could not determine live ipset capacity."
+        return 1
+    fi
+
+    if [ "$current_max" -lt "$MAX_BANS" ]; then
+        echo "Live ipset capacity $current_max is below configured capacity $MAX_BANS; repairing it now."
+        resize_live_ipset "$MAX_BANS" || return 1
+    fi
 }
 
 # Function to kill lingering php-fpm processes holding socket files
@@ -518,6 +657,7 @@ kill_lingering_phpfpm_processes() {
 # UPDATED to accept an optional message
 perform_blacklist() {
     ensure_setup
+    ensure_live_ipset_capacity || exit 1
     local ip="$1"
     local message="$2"
     
@@ -635,6 +775,7 @@ perform_whitelist() {
 
     echo "Reloading CSF to apply $CSF_ALLOW_FILE changes..."
     /usr/sbin/csf -r
+    ensure_live_ipset_capacity || exit 1
     repopulate_ipset_from_tracking_file || exit 1
 
     echo "Whitelist action complete for $ip."
@@ -686,6 +827,7 @@ perform_init() {
 
     echo "5. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
+    ensure_live_ipset_capacity || exit 1
     repopulate_ipset_from_tracking_file || exit 1
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
@@ -761,11 +903,24 @@ perform_clear() {
 perform_rebuild_live_set() {
     ensure_setup
     echo "--- 🔄 Rebuild Live IPSET Action ---"
+    ensure_live_ipset_capacity || exit 1
     repopulate_ipset_from_tracking_file || exit 1
     local end_time_cmd
     end_time_cmd=$(date +%s)
     local end_time=${end_time_cmd}
     report_ban_counts "Post-Rebuild Report" 0 "$end_time"
+    exit 0
+}
+
+perform_resize_live_set() {
+    ensure_setup
+    local target_max="$1"
+    echo "--- Resize Live IPSET Action ---"
+    resize_live_ipset "$target_max" || exit 1
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Resize Report" 0 "$end_time"
     exit 0
 }
 
@@ -1523,7 +1678,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -1538,6 +1693,9 @@ while true; do
     --rebuild-live-set )
       perform_rebuild_live_set
       ;;
+    --resize-live-set )
+      perform_resize_live_set "$2"
+      ;;
     --install-mod-security-triggers )
       perform_install_modsecurity_triggers
       ;;
@@ -1546,6 +1704,7 @@ while true; do
             echo "Options:"
             echo "  --init                    Initialize ipset and CSF hooks"
             echo "  --rebuild-live-set        Repopulate the live ipset from the tracking file"
+            echo "  --resize-live-set <MAX>   Atomically resize the live ipset and restore tracked bans"
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
