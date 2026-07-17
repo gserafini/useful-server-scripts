@@ -786,6 +786,92 @@ perform_whitelist() {
     exit 0
 }
 
+# Persistently protect every IPv4 address assigned to this host from the
+# high-volume ban set. This repairs stale self-bans with one CSF reload.
+perform_whitelist_local_addresses() {
+    ensure_setup
+    local timestamp
+    local local_ip_file
+    local cleaned_tracking_file
+    local tracking_backup
+    local before_count
+    local after_count
+    local removed_count
+
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local_ip_file=$(mktemp /tmp/high_volume_local_ips.XXXXXX) || exit 1
+    cleaned_tracking_file=$(mktemp "${IP_TRACKING_FILE}.local-whitelist.XXXXXX") || {
+        rm -f "$local_ip_file"
+        exit 1
+    }
+
+    {
+        echo "127.0.0.1"
+        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
+    } | sort -u > "$local_ip_file"
+
+    if [ ! -s "$local_ip_file" ]; then
+        echo "ERROR: Could not discover local IPv4 addresses."
+        rm -f "$local_ip_file" "$cleaned_tracking_file"
+        exit 1
+    fi
+
+    echo "--- Local Address Whitelist Action ---"
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        if ! grep -q "^${ip}[[:space:]]" "$CSF_ALLOW_FILE"; then
+            echo "$ip # Added via script at $timestamp. Reason: Local server address" >> "$CSF_ALLOW_FILE"
+            echo "Added local address $ip to $CSF_ALLOW_FILE."
+        else
+            echo "Local address $ip is already present in $CSF_ALLOW_FILE."
+        fi
+        ipset del "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1 || true
+    done < "$local_ip_file"
+
+    before_count=$(wc -l < "$IP_TRACKING_FILE")
+    awk 'NR == FNR { protected[$1] = 1; next } !($1 in protected)' \
+        "$local_ip_file" "$IP_TRACKING_FILE" > "$cleaned_tracking_file"
+    after_count=$(wc -l < "$cleaned_tracking_file")
+    removed_count=$((before_count - after_count))
+
+    if [ "$removed_count" -gt 0 ]; then
+        tracking_backup="${IP_TRACKING_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp -a "$IP_TRACKING_FILE" "$tracking_backup" || {
+            rm -f "$local_ip_file" "$cleaned_tracking_file"
+            exit 1
+        }
+        chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
+        chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
+        mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"
+        echo "Removed $removed_count local-address entries from tracking (backup: $tracking_backup)."
+    else
+        rm -f "$cleaned_tracking_file"
+        echo "No local addresses were present in the tracking file."
+    fi
+
+    echo "Reloading CSF once to apply the local-address allowlist..."
+    /usr/sbin/csf -r
+    ensure_live_ipset_capacity || exit 1
+    repopulate_ipset_from_tracking_file || exit 1
+
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        if ipset test "$IP_SET_NAME" "$ip" >/dev/null 2>&1; then
+            echo "ERROR: Local address $ip reappeared in $IP_SET_NAME after rebuild."
+            rm -f "$local_ip_file"
+            exit 1
+        fi
+    done < "$local_ip_file"
+    rm -f "$local_ip_file"
+
+    echo "Local addresses are allowlisted and absent from $IP_SET_NAME."
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Local-Whitelist Report" 0 "$end_time"
+    exit 0
+}
+
 # Function to initialize IPSET and CSF rules
 perform_init() {
     local ip_set_line="ipset create $IP_SET_NAME hash:ip maxelem $MAX_BANS -exist"
@@ -1678,7 +1764,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -1696,6 +1782,9 @@ while true; do
     --resize-live-set )
       perform_resize_live_set "$2"
       ;;
+    --whitelist-local-addresses )
+      perform_whitelist_local_addresses
+      ;;
     --install-mod-security-triggers )
       perform_install_modsecurity_triggers
       ;;
@@ -1705,6 +1794,7 @@ while true; do
             echo "  --init                    Initialize ipset and CSF hooks"
             echo "  --rebuild-live-set        Repopulate the live ipset from the tracking file"
             echo "  --resize-live-set <MAX>   Atomically resize the live ipset and restore tracked bans"
+            echo "  --whitelist-local-addresses  Remove assigned local IPv4 addresses from bans with one CSF reload"
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"

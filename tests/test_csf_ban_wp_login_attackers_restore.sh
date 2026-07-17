@@ -20,6 +20,13 @@ printf '%s\n' "$init_block" | grep -q 'repopulate_ipset_from_tracking_file' || f
 
 grep -q -- '--rebuild-live-set' "$SCRIPT" || fail "help/argument parser missing --rebuild-live-set"
 
+grep -q -- '--whitelist-local-addresses' "$SCRIPT" || fail "help/argument parser missing --whitelist-local-addresses"
+grep -q '^perform_whitelist_local_addresses()' "$SCRIPT" || fail "missing perform_whitelist_local_addresses helper"
+local_whitelist_block=$(sed -n '/^perform_whitelist_local_addresses() {/,/^}/p' "$SCRIPT")
+printf '%s\n' "$local_whitelist_block" | grep -q '/usr/sbin/csf -r' || fail "local-address whitelist does not reload CSF"
+printf '%s\n' "$local_whitelist_block" | grep -q 'repopulate_ipset_from_tracking_file' || fail "local-address whitelist does not rebuild the live ipset"
+printf '%s\n' "$local_whitelist_block" | grep -q 'ip -4 -o addr show' || fail "local-address whitelist does not discover assigned IPv4 addresses"
+
 grep -q '^MAX_BANS=250000$' "$SCRIPT" || fail "MAX_BANS must provide headroom for the tracked ban corpus"
 grep -q '^resize_live_ipset()' "$SCRIPT" || fail "missing atomic resize_live_ipset helper"
 grep -q '^ensure_live_ipset_capacity()' "$SCRIPT" || fail "missing ensure_live_ipset_capacity helper"
