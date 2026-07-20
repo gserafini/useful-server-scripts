@@ -110,4 +110,9 @@ printf '%s\n' "$blacklist_block" | grep -q 'ensure_live_ipset_capacity' || fail 
 rebuild_block=$(sed -n '/^perform_rebuild_live_set() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$rebuild_block" | grep -q 'ensure_live_ipset_capacity' || fail "rebuild does not repair undersized live sets"
 
+finalization_block=$(sed -n '/^echo "Banned IPs recorded in tracking file:/,$p' "$SCRIPT")
+if printf '%s\n' "$finalization_block" | grep -Eq 'restartsrv_httpd|restartsrv_apache_php_fpm|systemctl restart httpd|service httpd restart'; then
+    fail "routine log scans must not restart Apache or PHP-FPM"
+fi
+
 echo "PASS: csf_ban_wp_login_attackers restores and resizes the live ipset"
