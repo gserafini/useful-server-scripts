@@ -289,6 +289,7 @@ report_ban_counts() {
 # empty even though the tracking file still contains the intended bans.
 repopulate_ipset_from_tracking_file() {
     local local_ip_file
+    local local_ip
     local restore_file
     local stats_file
     local tracked_count=0
@@ -327,9 +328,9 @@ repopulate_ipset_from_tracking_file() {
         return 1
     fi
 
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
-        ipset del "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1 || true
+    while IFS= read -r local_ip; do
+        [ -z "$local_ip" ] && continue
+        ipset del "$IP_SET_NAME" "$local_ip" -exist >/dev/null 2>&1 || true
     done < "$local_ip_file"
 
     awk -v set_name="$IP_SET_NAME" -v stats_file="$stats_file" '

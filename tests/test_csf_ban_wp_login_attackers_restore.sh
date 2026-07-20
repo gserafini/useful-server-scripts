@@ -53,6 +53,14 @@ ipset() {
 eval "$repopulate_block"
 rebuild_output=$(repopulate_ipset_from_tracking_file)
 
+verify_rebuild_preserves_caller_ip() {
+    local ip="198.51.100.42"
+    repopulate_ipset_from_tracking_file >/dev/null
+    [ "$ip" = "198.51.100.42" ]
+}
+
+verify_rebuild_preserves_caller_ip || fail "rebuild clobbered the caller's local IP variable"
+
 grep -q '^add high_volume_bans 203\.0\.113\.10 -exist$' "$sandbox/restore-input.log" || fail "bulk restore omitted valid tracked IP"
 if grep -q '10\.20\.30\.40' "$sandbox/restore-input.log"; then
     fail "bulk restore included assigned local IP"
