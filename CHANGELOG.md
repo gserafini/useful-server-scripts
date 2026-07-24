@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-24
+
+- Add a lock-protected ModSecurity adapter that reads the client IP from the CGI environment, replacing ineffective `exec` commands that attempted to pass arguments directly.
+
 ## 2026-07-20
 
 - Preserve caller-local IP variables while rebuilding `high_volume_bans`, so whitelist/unblock completion output retains the target IP.

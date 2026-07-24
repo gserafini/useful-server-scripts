@@ -182,6 +182,7 @@ get_nameservers.sh --csv
 - Replays the persistent tracking file automatically after every CSF rebuild
 - Excludes assigned local IPv4 addresses from both manual bans and replay
 - Terminates existing connections when banning (requires conntrack-tools)
+- Supports safe ModSecurity `exec` bans through a no-argument CGI adapter
 - Generates abuse evidence reports with WHOIS integration
 - Supports manual whitelist/blacklist management
 - Rotatable ban list with permanent ban threshold
@@ -229,6 +230,21 @@ Scans default log paths and bans IPs matching keyword patterns. Add to cron:
 ```bash
 */5 * * * * /usr/local/bin/csf_ban_wp_login_attackers
 ```
+
+**ModSecurity persistent bans**:
+
+ModSecurity 2.x executes external programs without command-line arguments. Rules
+must call `modsecurity_persistent_blacklist` directly and rely on the CGI
+`REMOTE_ADDR` environment variable:
+
+```apache
+SecRule REQUEST_URI "@rx malicious-pattern" \
+  "phase:1,id:999999,deny,status:403,exec:'/usr/local/useful-server-scripts/scripts/modsecurity_persistent_blacklist'"
+```
+
+The adapter validates the client IPv4 address, serializes concurrent burst
+matches, and invokes `csf_ban_wp_login_attackers --blacklist` through the
+existing sudo policy.
 
 **Custom log paths**:
 
