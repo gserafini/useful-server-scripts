@@ -1,0 +1,51 @@
+#!/bin/bash
+set -u
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+BAN_SCRIPT="/usr/local/useful-server-scripts/scripts/csf_ban_wp_login_attackers"
+SUDO_BIN="/usr/bin/sudo"
+
+is_valid_ipv4() {
+    local ip="$1"
+    local octet
+    local -a octets
+
+    IFS='.' read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+}
+
+run_modsecurity_blacklist() {
+    local remote_addr="${REMOTE_ADDR:-}"
+    local status
+
+    if ! is_valid_ipv4 "$remote_addr"; then
+        echo "ERROR: REMOTE_ADDR is missing or invalid; configure ModSecurity exec to call this adapter directly with no arguments."
+        return 1
+    fi
+
+    if ! exec 9<"$BAN_SCRIPT"; then
+        echo "ERROR: Cannot open blacklist CLI at $BAN_SCRIPT."
+        return 1
+    fi
+
+    if ! flock -n 9; then
+        echo "SKIP: another persistent ban is already running."
+        exec 9<&-
+        return 0
+    fi
+
+    "$SUDO_BIN" "$BAN_SCRIPT" --blacklist "$remote_addr" \
+        "ModSecurity automatic persistent ban"
+    status=$?
+    exec 9<&-
+    return "$status"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    run_modsecurity_blacklist
+fi
