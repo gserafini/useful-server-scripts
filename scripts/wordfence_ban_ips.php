@@ -1,4 +1,24 @@
 <?php
+// Prevent overlapping cron runs from piling up and spawning redundant ban checks.
+$lock_file = fopen('/var/run/wordfence_ban_ips.lock', 'c');
+if ($lock_file === false) {
+	fwrite(STDERR, "Unable to open lock file /var/run/wordfence_ban_ips.lock\n");
+	exit(1);
+}
+
+if (!flock($lock_file, LOCK_EX | LOCK_NB)) {
+	echo "Another wordfence_ban_ips.php instance is already running, exiting.\n";
+	exit(0);
+}
+
+ftruncate($lock_file, 0);
+fwrite($lock_file, getmypid() . PHP_EOL);
+
+register_shutdown_function(function () use ($lock_file) {
+	flock($lock_file, LOCK_UN);
+	fclose($lock_file);
+});
+
 // 1. Get list of all IPs we want to deny
 // 2. Check to see if they're already in csf.deny (it's expensive to try to deny each IP individually and let csf check it)
 // 3. Add IPs to deny file
@@ -105,5 +125,4 @@ else {
 }
 
 echo "Done!\n";
-
 

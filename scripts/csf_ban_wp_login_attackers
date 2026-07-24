@@ -86,7 +86,8 @@ CSF_ALLOW_FILE="/etc/csf/csf.allow"
 CSF_IGNORE_FILE="/etc/csf/csf.ignore"
 CSF_DENY_FILE="/etc/csf/csf.deny"
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
-MAX_BANS=100000
+CSF_REBUILD_LINE="/usr/local/useful-server-scripts/scripts/csf_ban_wp_login_attackers --rebuild-live-set"
+MAX_BANS=250000
 MAX_PERMANENT_BANS=5000
 MAX_VIOLATION_COUNT=20 # The threshold for permanent (do not delete) ban, based on aggregated hits.
 # DEFAULT LOG FILES: These are used if no --logs argument is provided.
@@ -125,6 +126,23 @@ validate_ip() {
         return 0 
     else
         return 1 
+    fi
+}
+
+# Function to terminate live sessions for an IP after it is banned.
+# Prefer conntrack when available, then fall back to ss -K for hosts that
+# do not have conntrack-tools installed.
+terminate_live_sessions_for_ip() {
+    local ip="$1"
+
+    if command -v conntrack >/dev/null 2>&1; then
+        conntrack -D -s "$ip" >/dev/null 2>&1 || true
+        conntrack -D -d "$ip" >/dev/null 2>&1 || true
+    fi
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -K src "$ip" >/dev/null 2>&1 || true
+        ss -K dst "$ip" >/dev/null 2>&1 || true
     fi
 }
 
@@ -172,6 +190,9 @@ is_setup_complete() {
     if [ ! -f "$CSF_POST_FILE" ] || ! grep -q "$iptables_rule_pattern" "$CSF_POST_FILE"; then
         return 1
     fi
+    if ! grep -Fqx "$CSF_REBUILD_LINE" "$CSF_POST_FILE"; then
+        return 1
+    fi
     return 0
 }
 
@@ -214,9 +235,21 @@ report_ban_counts() {
     local end_time="${3:-0}" 
     echo "--- 📊 $report_title ---"
     
-    local ipset_count
-    ipset_count=$(grep -cvE '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null)
-    ipset_count=${ipset_count:-0}
+    local live_ipset_count
+    local live_ipset_count_cmd
+    live_ipset_count_cmd=$(ipset list "$IP_SET_NAME" 2>/dev/null | awk 'BEGIN{c=0;f=0} /^Members:/{f=1;next} f && NF{c++} END{print c+0}')
+    live_ipset_count=${live_ipset_count_cmd}
+    live_ipset_count=${live_ipset_count:-0}
+
+    local tracking_line_count
+    tracking_line_count=$(grep -cvE '^\s*$' "$IP_TRACKING_FILE" 2>/dev/null)
+    tracking_line_count=${tracking_line_count:-0}
+
+    local tracking_unique_count
+    local tracking_unique_count_cmd
+    tracking_unique_count_cmd=$(awk '!seen[$1]++{c++} END{print c+0}' "$IP_TRACKING_FILE" 2>/dev/null)
+    tracking_unique_count=${tracking_unique_count_cmd}
+    tracking_unique_count=${tracking_unique_count:-0}
 
     local permanent_ban_count
     permanent_ban_count=$(grep -c "do not delete" "$IP_TRACKING_FILE" 2>/dev/null)
@@ -231,7 +264,8 @@ report_ban_counts() {
     csf_allow_count=${csf_allow_count:-0}
 
 
-    echo "Total IPs in custom IPSET '$IP_SET_NAME': $ipset_count / $MAX_BANS"
+    echo "Live IPs in custom IPSET '$IP_SET_NAME': $live_ipset_count / $MAX_BANS"
+    echo "Tracked IPs in $IP_TRACKING_FILE: $tracking_line_count lines, $tracking_unique_count unique"
     echo "Permanent IPs ('do not delete'): $permanent_ban_count / $MAX_PERMANENT_BANS"
     echo "Total IPs in CSF Deny File '$CSF_DENY_FILE': $csf_deny_count"
     echo "Total IPs in CSF Allow File '$CSF_ALLOW_FILE': $csf_allow_count"
@@ -248,6 +282,242 @@ report_ban_counts() {
     fi
     
     echo "----------------------"
+}
+
+# Rebuild the live ipset from the persistent tracking file.
+# This is needed after csf reloads because the custom ipset can be recreated
+# empty even though the tracking file still contains the intended bans.
+repopulate_ipset_from_tracking_file() {
+    local local_ip_file
+    local local_ip
+    local restore_file
+    local stats_file
+    local tracked_count=0
+    local restored_count=0
+    local skipped_count=0
+    local local_skipped_count=0
+
+    if ! ipset list "$IP_SET_NAME" &> /dev/null; then
+        echo "ERROR: ipset '$IP_SET_NAME' does not exist; cannot repopulate from tracking file."
+        return 1
+    fi
+
+    if [ ! -f "$IP_TRACKING_FILE" ]; then
+        echo "Tracking file $IP_TRACKING_FILE does not exist; nothing to repopulate."
+        return 0
+    fi
+
+    local_ip_file=$(mktemp /tmp/high_volume_rebuild_local_ips.XXXXXX) || return 1
+    restore_file=$(mktemp /tmp/high_volume_rebuild_restore.XXXXXX) || {
+        rm -f "$local_ip_file"
+        return 1
+    }
+    stats_file=$(mktemp /tmp/high_volume_rebuild_stats.XXXXXX) || {
+        rm -f "$local_ip_file" "$restore_file"
+        return 1
+    }
+
+    {
+        echo "127.0.0.1"
+        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
+    } | sort -u > "$local_ip_file"
+
+    if [ ! -s "$local_ip_file" ]; then
+        echo "ERROR: Could not discover local IPv4 addresses before rebuilding '$IP_SET_NAME'."
+        rm -f "$local_ip_file" "$restore_file" "$stats_file"
+        return 1
+    fi
+
+    while IFS= read -r local_ip; do
+        [ -z "$local_ip" ] && continue
+        ipset del "$IP_SET_NAME" "$local_ip" -exist >/dev/null 2>&1 || true
+    done < "$local_ip_file"
+
+    awk -v set_name="$IP_SET_NAME" -v stats_file="$stats_file" '
+        function valid_ipv4(ip, parts, count, i) {
+            count = split(ip, parts, ".")
+            if (count != 4) return 0
+            for (i = 1; i <= 4; i++) {
+                if (parts[i] !~ /^[0-9]+$/ || parts[i] < 0 || parts[i] > 255) return 0
+            }
+            return 1
+        }
+        NR == FNR {
+            protected[$1] = 1
+            next
+        }
+        NF {
+            ip = $1
+            if (!valid_ipv4(ip)) {
+                malformed++
+                next
+            }
+            tracked++
+            if (ip in protected) {
+                local_skipped++
+                next
+            }
+            if (!seen[ip]++) {
+                print "add " set_name " " ip " -exist"
+                restored++
+            }
+        }
+        END {
+            print tracked + 0, restored + 0, malformed + 0, local_skipped + 0 > stats_file
+        }
+    ' "$local_ip_file" "$IP_TRACKING_FILE" > "$restore_file"
+
+    read -r tracked_count restored_count skipped_count local_skipped_count < "$stats_file"
+
+    echo "Repopulating live ipset '$IP_SET_NAME' from $IP_TRACKING_FILE..."
+    if [ -s "$restore_file" ] && ! ipset restore < "$restore_file"; then
+        echo "ERROR: Bulk restore into '$IP_SET_NAME' failed."
+        echo "Remedy: run '$0 --resize-live-set $MAX_BANS' and retry the rebuild."
+        rm -f "$local_ip_file" "$restore_file" "$stats_file"
+        return 1
+    fi
+
+    rm -f "$local_ip_file" "$restore_file" "$stats_file"
+
+    echo "Repopulated $restored_count unique tracked IPs into '$IP_SET_NAME' from $tracked_count valid tracking entries."
+    if [ "$skipped_count" -gt 0 ]; then
+        echo "Skipped $skipped_count malformed tracking entries."
+    fi
+    if [ "$local_skipped_count" -gt 0 ]; then
+        echo "Skipped and removed $local_skipped_count assigned local-address entries."
+    fi
+
+    return 0
+}
+
+get_live_ipset_maxelem() {
+    ipset list "$IP_SET_NAME" 2>/dev/null |
+        awk '/^Header:/ {for (i = 1; i <= NF; i++) if ($i == "maxelem") {print $(i + 1); exit}}'
+}
+
+update_persistent_ipset_capacity() {
+    local target_max="$1"
+    local temp_file
+    local backup_file
+
+    temp_file=$(mktemp "${CSF_POST_FILE}.resize.XXXXXX") || return 1
+    backup_file="${CSF_POST_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    if ! awk -v set_name="$IP_SET_NAME" -v max_bans="$target_max" '
+        BEGIN { updated = 0 }
+        $1 == "ipset" && $2 == "create" && $3 == set_name && $4 == "hash:ip" {
+            print "ipset create " set_name " hash:ip maxelem " max_bans " -exist"
+            updated = 1
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                print "ipset create " set_name " hash:ip maxelem " max_bans " -exist"
+            }
+        }
+    ' "$CSF_POST_FILE" > "$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    cp -a "$CSF_POST_FILE" "$backup_file" || { rm -f "$temp_file"; return 1; }
+    chmod --reference="$CSF_POST_FILE" "$temp_file" || { rm -f "$temp_file"; return 1; }
+    chown --reference="$CSF_POST_FILE" "$temp_file" || { rm -f "$temp_file"; return 1; }
+    mv -f "$temp_file" "$CSF_POST_FILE" || return 1
+    echo "Updated persistent ipset capacity in $CSF_POST_FILE (backup: $backup_file)."
+}
+
+resize_live_ipset() {
+    local target_max="${1:-$MAX_BANS}"
+    local current_max
+    local temp_set="${IP_SET_NAME}_resize_$$"
+    local restore_file
+    local expected_count
+    local restored_count
+
+    if ! [[ "$target_max" =~ ^[0-9]+$ ]] || [ "$target_max" -lt 1 ]; then
+        echo "ERROR: resize target must be a positive integer."
+        return 1
+    fi
+
+    current_max=$(get_live_ipset_maxelem)
+    if ! [[ "$current_max" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Could not determine maxelem for '$IP_SET_NAME'."
+        return 1
+    fi
+
+    if [ "$current_max" -ge "$target_max" ]; then
+        echo "Live ipset '$IP_SET_NAME' already has capacity $current_max."
+        update_persistent_ipset_capacity "$current_max" || return 1
+        return 0
+    fi
+
+    restore_file=$(mktemp "/tmp/${IP_SET_NAME}.restore.XXXXXX") || return 1
+    ipset destroy "$temp_set" >/dev/null 2>&1 || true
+
+    if ! ipset create "$temp_set" hash:ip maxelem "$target_max"; then
+        rm -f "$restore_file"
+        echo "ERROR: Could not create temporary ipset '$temp_set'."
+        return 1
+    fi
+
+    awk -v set_name="$temp_set" '
+        $1 ~ /^[0-9.]+$/ && split($1, octets, /\./) == 4 && !seen[$1]++ {
+            print "add " set_name " " $1
+        }
+    ' "$IP_TRACKING_FILE" > "$restore_file"
+    expected_count=$(wc -l < "$restore_file")
+
+    if [ "$expected_count" -ge "$target_max" ]; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Tracking corpus has $expected_count unique entries, which does not fit in target capacity $target_max."
+        echo "Remedy: rerun --resize-live-set with a value greater than $expected_count."
+        return 1
+    fi
+
+    if ! ipset restore < "$restore_file"; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Failed to populate temporary ipset '$temp_set'; live set was not changed."
+        return 1
+    fi
+
+    restored_count=$(ipset save "$temp_set" | grep -c "^add $temp_set ")
+    if [ "$restored_count" -ne "$expected_count" ]; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Temporary ipset verification failed: expected $expected_count entries, restored $restored_count."
+        return 1
+    fi
+
+    if ! ipset swap "$temp_set" "$IP_SET_NAME"; then
+        ipset destroy "$temp_set" >/dev/null 2>&1 || true
+        rm -f "$restore_file"
+        echo "ERROR: Atomic ipset swap failed; live set was not changed."
+        return 1
+    fi
+
+    ipset destroy "$temp_set" >/dev/null 2>&1 || true
+    rm -f "$restore_file"
+    update_persistent_ipset_capacity "$target_max" || return 1
+    echo "Resized '$IP_SET_NAME' from $current_max to $target_max and restored $restored_count unique tracked bans."
+}
+
+ensure_live_ipset_capacity() {
+    local current_max
+    current_max=$(get_live_ipset_maxelem)
+
+    if ! [[ "$current_max" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Could not determine live ipset capacity."
+        return 1
+    fi
+
+    if [ "$current_max" -lt "$MAX_BANS" ]; then
+        echo "Live ipset capacity $current_max is below configured capacity $MAX_BANS; repairing it now."
+        resize_live_ipset "$MAX_BANS" || return 1
+    fi
 }
 
 # Function to kill lingering php-fpm processes holding socket files
@@ -443,6 +713,7 @@ kill_lingering_phpfpm_processes() {
 # UPDATED to accept an optional message
 perform_blacklist() {
     ensure_setup
+    ensure_live_ipset_capacity || exit 1
     local ip="$1"
     local message="$2"
     
@@ -466,7 +737,8 @@ perform_blacklist() {
     fi
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
-        echo "IP $ip is already in ipset: $IP_SET_NAME. Skipping insertion."
+        echo "IP $ip is already in ipset: $IP_SET_NAME. Refreshing live-session teardown."
+        terminate_live_sessions_for_ip "$ip"
         local end_time_cmd
         end_time_cmd=$(date +%s)
         local end_time=${end_time_cmd}
@@ -500,11 +772,7 @@ perform_blacklist() {
         exit 1
     fi
 
-    # If conntrack-tools is available, delete any conntrack entries for this IP so
-    # established sessions are terminated immediately.
-    if command -v conntrack >/dev/null 2>&1; then
-        conntrack -D -s "$ip" >/dev/null 2>&1 || true
-    fi
+    terminate_live_sessions_for_ip "$ip"
 
     echo "$ip # [$timestamp] $ban_reason" | tee -a "$IP_TRACKING_FILE" > /dev/null
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
@@ -563,12 +831,100 @@ perform_whitelist() {
 
     echo "Reloading CSF to apply $CSF_ALLOW_FILE changes..."
     /usr/sbin/csf -r
+    ensure_live_ipset_capacity || exit 1
+    repopulate_ipset_from_tracking_file || exit 1
 
     echo "Whitelist action complete for $ip."
     local end_time_cmd
     end_time_cmd=$(date +%s)
     local end_time=${end_time_cmd}
     report_ban_counts "Post-Whitelist Report" 0 "$end_time"
+    exit 0
+}
+
+# Persistently protect every IPv4 address assigned to this host from the
+# high-volume ban set. This repairs stale self-bans with one CSF reload.
+perform_whitelist_local_addresses() {
+    ensure_setup
+    local timestamp
+    local local_ip_file
+    local cleaned_tracking_file
+    local tracking_backup
+    local before_count
+    local after_count
+    local removed_count
+
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    local_ip_file=$(mktemp /tmp/high_volume_local_ips.XXXXXX) || exit 1
+    cleaned_tracking_file=$(mktemp "${IP_TRACKING_FILE}.local-whitelist.XXXXXX") || {
+        rm -f "$local_ip_file"
+        exit 1
+    }
+
+    {
+        echo "127.0.0.1"
+        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
+    } | sort -u > "$local_ip_file"
+
+    if [ ! -s "$local_ip_file" ]; then
+        echo "ERROR: Could not discover local IPv4 addresses."
+        rm -f "$local_ip_file" "$cleaned_tracking_file"
+        exit 1
+    fi
+
+    echo "--- Local Address Whitelist Action ---"
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        if ! grep -q "^${ip}[[:space:]]" "$CSF_ALLOW_FILE"; then
+            echo "$ip # Added via script at $timestamp. Reason: Local server address" >> "$CSF_ALLOW_FILE"
+            echo "Added local address $ip to $CSF_ALLOW_FILE."
+        else
+            echo "Local address $ip is already present in $CSF_ALLOW_FILE."
+        fi
+        ipset del "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1 || true
+    done < "$local_ip_file"
+
+    before_count=$(wc -l < "$IP_TRACKING_FILE")
+    awk 'NR == FNR { protected[$1] = 1; next } !($1 in protected)' \
+        "$local_ip_file" "$IP_TRACKING_FILE" > "$cleaned_tracking_file"
+    after_count=$(wc -l < "$cleaned_tracking_file")
+    removed_count=$((before_count - after_count))
+
+    if [ "$removed_count" -gt 0 ]; then
+        tracking_backup="${IP_TRACKING_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp -a "$IP_TRACKING_FILE" "$tracking_backup" || {
+            rm -f "$local_ip_file" "$cleaned_tracking_file"
+            exit 1
+        }
+        chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
+        chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
+        mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"
+        echo "Removed $removed_count local-address entries from tracking (backup: $tracking_backup)."
+    else
+        rm -f "$cleaned_tracking_file"
+        echo "No local addresses were present in the tracking file."
+    fi
+
+    echo "Reloading CSF once to apply the local-address allowlist..."
+    /usr/sbin/csf -r
+    ensure_live_ipset_capacity || exit 1
+    repopulate_ipset_from_tracking_file || exit 1
+
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        if ipset test "$IP_SET_NAME" "$ip" >/dev/null 2>&1; then
+            echo "ERROR: Local address $ip reappeared in $IP_SET_NAME after rebuild."
+            rm -f "$local_ip_file"
+            exit 1
+        fi
+    done < "$local_ip_file"
+    rm -f "$local_ip_file"
+
+    echo "Local addresses are allowlisted and absent from $IP_SET_NAME."
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Local-Whitelist Report" 0 "$end_time"
     exit 0
 }
 
@@ -608,11 +964,18 @@ perform_init() {
         echo "$iptables_rule_line" | tee -a "$CSF_POST_FILE" > /dev/null
     fi
 
-    echo "4. Ensuring tracking file $IP_TRACKING_FILE exists..."
+    echo "4. Adding tracked-ban replay command to $CSF_POST_FILE..."
+    if ! grep -Fqx "$CSF_REBUILD_LINE" "$CSF_POST_FILE"; then
+        echo "$CSF_REBUILD_LINE" | tee -a "$CSF_POST_FILE" > /dev/null
+    fi
+
+    echo "5. Ensuring tracking file $IP_TRACKING_FILE exists..."
     touch "$IP_TRACKING_FILE" || { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1; }
 
-    echo "5. Reloading CSF to apply new rules..."
+    echo "6. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
+    ensure_live_ipset_capacity || exit 1
+    repopulate_ipset_from_tracking_file || exit 1
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
     # CONNTRACK CHECK: Recommend installing conntrack-tools if you want bans to immediately
@@ -681,6 +1044,30 @@ perform_clear() {
     report_ban_counts "Post-Clear Report" 0 "$end_time"
     # No per-IP iptables cleanup here — conntrack is preferred. If you want immediate
     # termination of established connections, install conntrack-tools (see --init message).
+    exit 0
+}
+
+perform_rebuild_live_set() {
+    ensure_setup
+    echo "--- 🔄 Rebuild Live IPSET Action ---"
+    ensure_live_ipset_capacity || exit 1
+    repopulate_ipset_from_tracking_file || exit 1
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Rebuild Report" 0 "$end_time"
+    exit 0
+}
+
+perform_resize_live_set() {
+    ensure_setup
+    local target_max="$1"
+    echo "--- Resize Live IPSET Action ---"
+    resize_live_ipset "$target_max" || exit 1
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Resize Report" 0 "$end_time"
     exit 0
 }
 
@@ -1438,7 +1825,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -1450,6 +1837,15 @@ while true; do
     --init )
       perform_init
       ;;
+    --rebuild-live-set )
+      perform_rebuild_live_set
+      ;;
+    --resize-live-set )
+      perform_resize_live_set "$2"
+      ;;
+    --whitelist-local-addresses )
+      perform_whitelist_local_addresses
+      ;;
     --install-mod-security-triggers )
       perform_install_modsecurity_triggers
       ;;
@@ -1457,6 +1853,9 @@ while true; do
             echo "Usage: $0 [options]"
             echo "Options:"
             echo "  --init                    Initialize ipset and CSF hooks"
+            echo "  --rebuild-live-set        Repopulate the live ipset from the tracking file"
+            echo "  --resize-live-set <MAX>   Atomically resize the live ipset and restore tracked bans"
+            echo "  --whitelist-local-addresses  Remove assigned local IPv4 addresses from bans with one CSF reload"
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
@@ -2721,228 +3120,7 @@ report_ban_counts "Post-Run Ban Report" "$NEW_BANS_COUNT" "$END_TIME"
 echo "Banned IPs recorded in tracking file: $IP_TRACKING_FILE"
 
 echo ""
-echo "Restarting Apache..."
-
-# Restart services: use cPanel legacy scripts on CentOS <7, systemctl on CentOS >=7
-centos_major=""
-if [ -f /etc/centos-release ]; then
-    centos_major=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/centos-release)
-elif [ -f /etc/redhat-release ]; then
-    centos_major=$(sed -n 's/.*release \([0-9]\+\).*/\1/p' /etc/redhat-release)
-fi
-
-# fallback to lsb_release if parsing failed
-if ! [[ "$centos_major" =~ ^[0-9]+$ ]] && command -v lsb_release >/dev/null 2>&1; then
-    centos_major=$(lsb_release -sr | cut -d. -f1)
-fi
-
-if [[ "$centos_major" =~ ^[0-9]+$ ]] && [ "$centos_major" -lt 7 ]; then
-    echo "Detected CentOS $centos_major (<7): using cPanel restart scripts..."
-    /scripts/restartsrv_httpd --restart --hard
-
-    # Attempt php-fpm restart with retry logic on failure
-    # Capture output to check for error patterns since cPanel scripts may not return proper exit codes
-    phpfpm_output=$(/usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard 2>&1)
-    phpfpm_exitcode=$?
-    echo "$phpfpm_output"
-
-    # Check if restart failed (either by exit code or error patterns in output)
-    if [ "$phpfpm_exitcode" -ne 0 ] || echo "$phpfpm_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
-        echo "⚠️  PHP-FPM restart failed (exit code: $phpfpm_exitcode). Attempting to kill lingering processes..."
-        kill_lingering_phpfpm_processes
-        echo "🔄 Retrying PHP-FPM restart..."
-        /usr/local/cpanel/scripts/restartsrv_apache_php_fpm --restart --hard
-    fi
-else
-    echo "Detected CentOS ${centos_major:-unknown} (>=7 or undetermined): using systemctl/service fallback..."
-
-    # Restart Apache/httpd first
-    if /bin/systemctl restart httpd.service 2>/dev/null; then
-        echo "httpd restarted via systemctl"
-    else
-        echo "systemctl unavailable or failed; trying service httpd restart..."
-        service httpd restart 2>/dev/null && echo "httpd restarted via service" || echo "Failed to restart httpd"
-    fi
-
-    # Discover php-fpm services dynamically instead of hard-coding
-    restarted_any_phpfpm=0
-    systemctl_cmd="$(command -v systemctl 2>/dev/null || true)"
-
-    if [ -n "$systemctl_cmd" ]; then
-        # List unit names and match typical php-fpm patterns (ea-php*, php*-fpm, php-fpm)
-        php_units=$($systemctl_cmd list-units --all --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E -i '(^ea-php[0-9]+-php-fpm\.service$|php([0-9]+)?-?fpm(\.service)?$)' || true)
-        # If none found, also check installed unit-files (covers disabled units)
-        if [ -z "$php_units" ]; then
-            php_units=$($systemctl_cmd list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E -i '(^ea-php[0-9]+-php-fpm\.service$|php([0-9]+)?-?fpm(\.service)?$)' || true)
-        fi
-
-        if [ -n "$php_units" ]; then
-            # Deduplicate and restart each using process substitution to avoid subshell
-            echo "Found php-fpm service units:"
-            while read -r svc; do
-                if [ -z "$svc" ]; then continue; fi
-
-                # Extract PHP version from service name for targeted cleanup (e.g., ea-php74-php-fpm.service -> 74)
-                php_ver=""
-                if [[ "$svc" =~ php([0-9]+) ]]; then
-                    php_ver="${BASH_REMATCH[1]}"
-                fi
-
-                echo "$systemctl_cmd restart \"$svc\""
-                phpfpm_restart_output=$($systemctl_cmd restart "$svc" 2>&1)
-                phpfpm_restart_exitcode=$?
-
-                # Check if restart failed (either by exit code or error patterns in output)
-                if [ "$phpfpm_restart_exitcode" -ne 0 ] || echo "$phpfpm_restart_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on|failed to restart'; then
-                    echo "$phpfpm_restart_output"
-                    echo "⚠️  $svc restart failed (exit code: $phpfpm_restart_exitcode). Attempting to kill lingering processes..."
-
-                    if [ -n "$php_ver" ]; then
-                        kill_lingering_phpfpm_processes "$php_ver"
-                    else
-                        kill_lingering_phpfpm_processes
-                    fi
-
-                    echo "🔄 Retrying $svc restart..."
-                    $systemctl_cmd restart "$svc"
-                    echo "✓ Retried $svc"
-                    restarted_any_phpfpm=1
-                else
-                    echo "Restarted $svc via systemctl"
-                    restarted_any_phpfpm=1
-                fi
-            done < <(echo "$php_units" | sort -u)
-        fi
-    fi
-
-    # Fallback for non-systemd systems or if no units were discovered/restarted
-    if [ "$restarted_any_phpfpm" -eq 0 ]; then
-        echo "No php-fpm systemd units restarted (none discovered or systemctl unavailable). Trying service/init.d fallbacks..."
-
-        # Try common vendor names first (ea-php* and php-fpm)
-        for svc in ea-php82-php-fpm ea-php81-php-fpm ea-php74-php-fpm php-fpm; do
-            # Extract PHP version from service name for targeted cleanup
-            php_ver=""
-            if [[ "$svc" =~ php([0-9]+) ]]; then
-                php_ver="${BASH_REMATCH[1]}"
-            fi
-
-            restart_succeeded=0
-
-            if command -v /bin/systemctl >/dev/null 2>&1; then
-                echo "/bin/systemctl restart \"${svc}.service\""
-                phpfpm_fallback_output=$(/bin/systemctl restart "${svc}.service" 2>&1)
-                phpfpm_fallback_exitcode=$?
-
-                if [ "$phpfpm_fallback_exitcode" -eq 0 ]; then
-                    echo "Restarted ${svc}.service via systemctl"
-                    restarted_any_phpfpm=1
-                    restart_succeeded=1
-                elif echo "$phpfpm_fallback_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on|failed to restart'; then
-                    echo "$phpfpm_fallback_output"
-                    echo "⚠️  ${svc}.service restart failed. Attempting to kill lingering processes..."
-
-                    if [ -n "$php_ver" ]; then
-                        kill_lingering_phpfpm_processes "$php_ver"
-                    else
-                        kill_lingering_phpfpm_processes
-                    fi
-
-                    echo "🔄 Retrying ${svc}.service restart..."
-                    if /bin/systemctl restart "${svc}.service" 2>/dev/null; then
-                        echo "✓ Retried ${svc}.service successfully"
-                        restarted_any_phpfpm=1
-                        restart_succeeded=1
-                    fi
-                fi
-            fi
-
-            if [ "$restart_succeeded" -eq 1 ]; then
-                continue
-            fi
-
-            # Try service wrapper
-            echo "service \"$svc\" restart"
-            phpfpm_svc_output=$(service "$svc" restart 2>&1)
-            phpfpm_svc_exitcode=$?
-
-            if [ "$phpfpm_svc_exitcode" -eq 0 ]; then
-                echo "Restarted $svc via service"
-                restarted_any_phpfpm=1
-                continue
-            elif echo "$phpfpm_svc_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
-                echo "$phpfpm_svc_output"
-                echo "⚠️  $svc restart failed via service. Attempting to kill lingering processes..."
-
-                if [ -n "$php_ver" ]; then
-                    kill_lingering_phpfpm_processes "$php_ver"
-                else
-                    kill_lingering_phpfpm_processes
-                fi
-
-                echo "🔄 Retrying $svc restart via service..."
-                if service "$svc" restart 2>/dev/null; then
-                    echo "✓ Retried $svc via service successfully"
-                    restarted_any_phpfpm=1
-                    continue
-                fi
-            fi
-
-            # Try direct init script if present
-            if [ -x "/etc/init.d/$svc" ]; then
-                echo "/etc/init.d/\"$svc\" restart"
-                phpfpm_init_output=$(/etc/init.d/"$svc" restart 2>&1)
-                phpfpm_init_exitcode=$?
-
-                if [ "$phpfpm_init_exitcode" -eq 0 ]; then
-                    echo "Restarted $svc via /etc/init.d/$svc"
-                    restarted_any_phpfpm=1
-                    continue
-                elif echo "$phpfpm_init_output" | grep -qE '\[FAILED\]|FPM initialization failed|already listen on'; then
-                    echo "$phpfpm_init_output"
-                    echo "⚠️  $svc restart failed via init.d. Attempting to kill lingering processes..."
-
-                    if [ -n "$php_ver" ]; then
-                        kill_lingering_phpfpm_processes "$php_ver"
-                    else
-                        kill_lingering_phpfpm_processes
-                    fi
-
-                    echo "🔄 Retrying $svc restart via init.d..."
-                    if /etc/init.d/"$svc" restart 2>/dev/null; then
-                        echo "✓ Retried $svc via init.d successfully"
-                        restarted_any_phpfpm=1
-                        continue
-                    fi
-                fi
-            fi
-        done
-
-        # As a last resort, scan /etc/init.d for any php*-fpm scripts and attempt restart
-        if [ "$restarted_any_phpfpm" -eq 0 ]; then
-            for script in /etc/init.d/*php*fpm* /etc/init.d/*php*; do
-                [ -e "$script" ] || continue
-                base=$(basename "$script")
-                echo "service \"$base\" restart"
-                if service "$base" restart 2>/dev/null; then
-                    echo "Restarted $base via service (from /etc/init.d scan)"
-                    restarted_any_phpfpm=1
-                elif [ -x "$script" ]; then
-                    echo "\"$script\" restart"
-                    if "$script" restart 2>/dev/null; then
-                        echo "Restarted $base via direct init.d script"
-                        restarted_any_phpfpm=1
-                    fi
-                fi
-            done
-        fi
-    fi
-
-    if [ "$restarted_any_phpfpm" -eq 0 ]; then
-        echo "Warning: No php-fpm services were restarted. Please verify php-fpm service names on this host."
-    fi
-fi
-
+echo "No service restart required; IP-set changes are live immediately."
 echo ""
 echo "Done!"
 exit 0
