@@ -106,6 +106,39 @@ printf '%s\n' "$persistence_block" | grep -q 'CSF_POST_FILE' || fail "capacity p
 
 blacklist_block=$(sed -n '/^perform_blacklist() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$blacklist_block" | grep -q 'ensure_live_ipset_capacity' || fail "blacklist does not repair undersized live sets"
+printf '%s\n' "$blacklist_block" | grep -q 'awk -v target="\$ip"' ||
+    fail "blacklist allow check does not use exact first-field matching"
+
+blacklist_sandbox=$(mktemp -d)
+trap 'rm -rf "$blacklist_sandbox"' EXIT
+
+cat > "$blacklist_sandbox/csf.allow" <<'EOF'
+203.0.113.77 # trusted management endpoint
+EOF
+
+CSF_ALLOW_FILE="$blacklist_sandbox/csf.allow"
+IP_SET_NAME="high_volume_bans"
+ensure_setup() { return 0; }
+ensure_live_ipset_capacity() { return 0; }
+validate_ip() { return 0; }
+ipset() {
+    fail "allowlisted blacklist request touched ipset"
+}
+
+eval "$blacklist_block"
+set +e
+allowlisted_output=$(perform_blacklist "203.0.113.77" "regression test" 2>&1)
+allowlisted_status=$?
+set -e
+
+[ "$allowlisted_status" -eq 3 ] ||
+    fail "allowlisted blacklist request exited $allowlisted_status instead of 3"
+printf '%s\n' "$allowlisted_output" | grep -q 'csf -ar 203\.0\.113\.77' ||
+    fail "allowlisted blacklist refusal did not provide the exact removal remedy"
+
+unset -f ensure_setup ensure_live_ipset_capacity validate_ip ipset perform_blacklist
+rm -rf "$blacklist_sandbox"
+trap - EXIT
 
 rebuild_block=$(sed -n '/^perform_rebuild_live_set() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$rebuild_block" | grep -q 'ensure_live_ipset_capacity' || fail "rebuild does not repair undersized live sets"

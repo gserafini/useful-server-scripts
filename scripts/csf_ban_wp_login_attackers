@@ -730,10 +730,11 @@ perform_blacklist() {
         exit 1
     fi
 
-    # FIX: Use braces around simple variable to prevent SC2015 warning
-    if grep -q "^${ip}[[:space:]]*" "$CSF_ALLOW_FILE"; then
-        echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Skipping blacklist action."
-        exit 0
+    if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_ALLOW_FILE"; then
+        echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Refusing blacklist action."
+        echo "If the allow entry is obsolete, run: csf -ar $ip"
+        echo "Then retry: $0 --blacklist $ip \"${message:-reason}\""
+        exit 3
     fi
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-25
+
+- Match `csf.allow` entries by their exact IP field, return a distinct failure status for protected blacklist targets, and print the exact removal-and-retry remedy so callers cannot report a skipped ban as successful.
+
 ## 2026-07-24
 
 - Add a lock-protected ModSecurity adapter that reads the client IP from the CGI environment, replacing ineffective `exec` commands that attempted to pass arguments directly.
