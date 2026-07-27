@@ -161,7 +161,7 @@ validate_ipv4_24_cidr() {
 
 # Read the exact CSF capacity setting used by csf -d.
 get_csf_deny_limit() {
-    awk -F= '
+    LC_ALL=C awk -F= '
         /^[[:space:]]*DENY_IP_LIMIT[[:space:]]*=/ {
             value = $2
             sub(/[[:space:]]*#.*/, "", value)
@@ -177,7 +177,7 @@ get_csf_deny_limit() {
 # Mirror CSF's DENY_IP_LIMIT accounting: comments, includes, blanks, and
 # protected "do not delete" entries do not consume an evictable slot.
 count_active_csf_deny_entries() {
-    awk '
+    LC_ALL=C awk '
         /^[[:space:]]*($|#|Include)/ { next }
         tolower($0) ~ /do not delete/ { next }
         { count++ }
@@ -191,7 +191,7 @@ list_covered_csf_children() {
     local cidr="$1"
     local prefix="${cidr%0/24}"
 
-    awk -v prefix="$prefix" '
+    LC_ALL=C awk -v prefix="$prefix" '
         /^[[:space:]]*($|#|Include)/ { next }
         $1 ~ /\// { next }
         index($1, prefix) == 1 {
@@ -323,14 +323,14 @@ perform_promote_cidr() {
         return 1
     fi
 
-    if awk -v target="$cidr" '$1 == target { found=1; exit } END { exit !found }' "$CSF_DENY_FILE"; then
+    if LC_ALL=C awk -v target="$cidr" '$1 == target { found=1; exit } END { exit !found }' "$CSF_DENY_FILE"; then
         parent_present=1
         parent_delta=0
     fi
 
     mapfile -t covered_children < <(list_covered_csf_children "$cidr")
 
-    if awk -v prefix="${cidr%0/24}" '
+    if LC_ALL=C awk -v prefix="${cidr%0/24}" '
         /^[[:space:]]*($|#|Include)/ { next }
         $1 ~ /\// { next }
         index($1, prefix) == 1 && tolower($0) ~ /do not delete/ { found=1; exit }
@@ -412,7 +412,7 @@ perform_promote_cidr() {
     timestamp=$(date)
     sanitized_message=${message//$'\n'/ }
 
-    if ! awk \
+    if ! LC_ALL=C awk \
         -v cidr="$cidr" \
         -v prefix="${cidr%0/24}" \
         -v comment="$sanitized_message" \
@@ -454,7 +454,7 @@ perform_promote_cidr() {
             echo "ERROR: Could not create a temporary CSF permanent-history file."
             return 1
         }
-        if ! awk -F'|' -v prefix="${cidr%0/24}" '
+        if ! LC_ALL=C awk -F'|' -v prefix="${cidr%0/24}" '
             index($1, prefix) == 1 {
                 suffix = substr($1, length(prefix) + 1)
                 if (suffix ~ /^[0-9]+$/ && (suffix + 0) >= 0 && (suffix + 0) <= 255) {
@@ -500,7 +500,7 @@ perform_promote_cidr() {
     done
     removed_children=${#covered_children[@]}
 
-    if ! awk -v target="$cidr" '$1 == target { found=1; exit } END { exit !found }' "$CSF_DENY_FILE" ||
+    if ! LC_ALL=C awk -v target="$cidr" '$1 == target { found=1; exit } END { exit !found }' "$CSF_DENY_FILE" ||
         [ -n "$(list_covered_csf_children "$cidr")" ] ||
         ! ipset test "$CSF_CHAIN_DENY_SET" "$cidr" >/dev/null 2>&1; then
         rollback_csf_cidr_promotion "$backup_file" "$tempip_backup_file"
