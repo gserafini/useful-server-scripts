@@ -302,6 +302,7 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`) |
+| `--promote-cidr CIDR [MSG]` | Atomically replace covered CSF child bans with a canonical IPv4 `/24`; refuses unsafe capacity changes and rolls back on failure |
 | `--whitelist IP [MSG]` | Remove IP from bans and add to CSF allow list (alias: `--unblock`) |
 | `--clear` | Flush all bans from IPSET and tracking file (DANGEROUS) |
 | `--logs "PATH1 PATH2"` | Override default log paths to scan |

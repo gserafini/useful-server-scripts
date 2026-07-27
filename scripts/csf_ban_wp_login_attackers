@@ -52,8 +52,10 @@
 #    The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
 # 4. --blacklist <IP> [MESSAGE] / --block <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list
 #    and the tracking file. It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
-# 5. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
-# 6. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+# 5. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
+#    It installs live parent coverage before deduplication, refuses unsafe capacity changes, and rolls back on failure.
+# 6. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 7. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
 #
 # Additional reporting / abuse-evidence options (read-only):
 # - --abuse-report <IP> [MIN_HITS]  (alias: --abuse)
@@ -85,6 +87,11 @@ IP_TRACKING_FILE="/etc/csf/ipset_tracking_${IP_SET_NAME}.log"
 CSF_ALLOW_FILE="/etc/csf/csf.allow"
 CSF_IGNORE_FILE="/etc/csf/csf.ignore"
 CSF_DENY_FILE="/etc/csf/csf.deny"
+CSF_CONF_FILE="/etc/csf/csf.conf"
+CSF_TEMPIP_FILE="/var/lib/csf/csf.tempip"
+CSF_BIN="/usr/sbin/csf"
+CSF_CHAIN_DENY_SET="chain_DENY"
+CSF_PROMOTE_LOCK_FILE="/var/lock/csf-cidr-promotion.lock"
 CSF_POST_FILE="/etc/csf/csfpost.sh" # Path to custom firewall rules
 CSF_REBUILD_LINE="/usr/local/useful-server-scripts/scripts/csf_ban_wp_login_attackers --rebuild-live-set"
 MAX_BANS=250000
@@ -127,6 +134,396 @@ validate_ip() {
     else
         return 1 
     fi
+}
+
+# Validate the canonical /24 networks emitted by security-sweep.sh.
+validate_ipv4_24_cidr() {
+    local cidr="$1"
+    local first
+    local second
+    local third
+    local fourth
+
+    if [[ ! "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/24$ ]]; then
+        return 1
+    fi
+
+    first="${BASH_REMATCH[1]}"
+    second="${BASH_REMATCH[2]}"
+    third="${BASH_REMATCH[3]}"
+    fourth="${BASH_REMATCH[4]}"
+
+    [ "$first" -le 255 ] &&
+        [ "$second" -le 255 ] &&
+        [ "$third" -le 255 ] &&
+        [ "$fourth" -eq 0 ]
+}
+
+# Read the exact CSF capacity setting used by csf -d.
+get_csf_deny_limit() {
+    awk -F= '
+        /^[[:space:]]*DENY_IP_LIMIT[[:space:]]*=/ {
+            value = $2
+            sub(/[[:space:]]*#.*/, "", value)
+            gsub(/[[:space:]"]/, "", value)
+            if (value ~ /^[0-9]+$/) {
+                print value
+                exit
+            }
+        }
+    ' "$CSF_CONF_FILE"
+}
+
+# Mirror CSF's DENY_IP_LIMIT accounting: comments, includes, blanks, and
+# protected "do not delete" entries do not consume an evictable slot.
+count_active_csf_deny_entries() {
+    awk '
+        /^[[:space:]]*($|#|Include)/ { next }
+        tolower($0) ~ /do not delete/ { next }
+        { count++ }
+        END { print count + 0 }
+    ' "$CSF_DENY_FILE"
+}
+
+# Print every single-IP policy line covered by a canonical /24. Duplicate
+# lines are intentional here because capacity accounting is line-based.
+list_covered_csf_children() {
+    local cidr="$1"
+    local prefix="${cidr%0/24}"
+
+    awk -v prefix="$prefix" '
+        /^[[:space:]]*($|#|Include)/ { next }
+        $1 ~ /\// { next }
+        index($1, prefix) == 1 {
+            suffix = substr($1, length(prefix) + 1)
+            if (suffix ~ /^[0-9]+$/ && (suffix + 0) >= 0 && (suffix + 0) <= 255) {
+                print $1
+            }
+        }
+    ' "$CSF_DENY_FILE"
+}
+
+rollback_csf_cidr_promotion() {
+    local backup_file="$1"
+    local tempip_backup_file="${2:-}"
+    local restore_status=0
+
+    if ! cat "$backup_file" > "$CSF_DENY_FILE"; then
+        restore_status=1
+    fi
+    if [ -n "$tempip_backup_file" ] &&
+        ! cat "$tempip_backup_file" > "$CSF_TEMPIP_FILE"; then
+        restore_status=1
+    fi
+
+    flock -u 7 >/dev/null 2>&1 || true
+    flock -u 8 >/dev/null 2>&1 || true
+
+    if [ "$restore_status" -eq 0 ] && "$CSF_BIN" -r >/dev/null 2>&1; then
+        rm -f "$backup_file" "$tempip_backup_file"
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Promotion failed; restored the original CSF deny policy and rebuilt the live firewall."
+        return 0
+    fi
+
+    flock -u 9 >/dev/null 2>&1 || true
+    echo "CRITICAL: Promotion failed and automatic rollback did not complete."
+    echo "Remedy: restore $backup_file to $CSF_DENY_FILE, then run $CSF_BIN -r."
+    return 1
+}
+
+# Replace individual CSF bans with one persistent /24 without opening a
+# coverage gap or allowing CSF's capacity eviction behavior to discard a rule.
+perform_promote_cidr() {
+    local cidr="$1"
+    local message="${2:-Atomic CIDR promotion}"
+    local deny_limit
+    local current_count
+    local projected_count
+    local final_count
+    local parent_delta=1
+    local parent_present=0
+    local live_parent_preexisting=0
+    local backup_file
+    local tempip_backup_file=""
+    local policy_temp
+    local tempip_temp=""
+    local timestamp
+    local sanitized_message
+    local has_tempip=0
+    local child
+    local removed_children=0
+    local -a covered_children=()
+    local -A removed_once=()
+
+    if ! validate_ipv4_24_cidr "$cidr"; then
+        echo "ERROR: --promote-cidr requires a canonical IPv4 /24 such as 203.0.113.0/24."
+        return 1
+    fi
+
+    if [ ! -f "$CSF_DENY_FILE" ] || [ ! -f "$CSF_CONF_FILE" ]; then
+        echo "ERROR: CSF deny policy or configuration file is missing."
+        return 1
+    fi
+
+    if ! command -v "$CSF_BIN" >/dev/null 2>&1; then
+        echo "ERROR: CSF command is unavailable at $CSF_BIN."
+        return 1
+    fi
+
+    exec 9>"$CSF_PROMOTE_LOCK_FILE" || {
+        echo "ERROR: Cannot open CIDR promotion lock $CSF_PROMOTE_LOCK_FILE."
+        return 1
+    }
+    if ! flock -n 9; then
+        echo "ERROR: Another CIDR promotion is already running."
+        return 1
+    fi
+
+    exec 8<>"$CSF_DENY_FILE" || {
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Cannot open $CSF_DENY_FILE for an atomic policy transaction."
+        return 1
+    }
+    if ! flock -w 30 8; then
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Cannot acquire CSF's deny-policy lock."
+        return 1
+    fi
+    if [ -f "$CSF_TEMPIP_FILE" ]; then
+        exec 7<>"$CSF_TEMPIP_FILE" || {
+            flock -u 8 >/dev/null 2>&1 || true
+            flock -u 9 >/dev/null 2>&1 || true
+            echo "ERROR: Cannot open $CSF_TEMPIP_FILE for the CIDR transaction."
+            return 1
+        }
+        if ! flock -w 10 7; then
+            flock -u 8 >/dev/null 2>&1 || true
+            flock -u 9 >/dev/null 2>&1 || true
+            echo "ERROR: Cannot acquire CSF's permanent-history lock."
+            return 1
+        fi
+        has_tempip=1
+    fi
+
+    deny_limit=$(get_csf_deny_limit)
+    current_count=$(count_active_csf_deny_entries)
+    if ! [[ "$deny_limit" =~ ^[0-9]+$ ]] || [ "$deny_limit" -lt 1 ]; then
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not read a positive DENY_IP_LIMIT from $CSF_CONF_FILE."
+        return 1
+    fi
+    if ! [[ "$current_count" =~ ^[0-9]+$ ]]; then
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not count active entries in $CSF_DENY_FILE."
+        return 1
+    fi
+
+    if awk -v target="$cidr" '$1 == target { found=1; exit } END { exit !found }' "$CSF_DENY_FILE"; then
+        parent_present=1
+        parent_delta=0
+    fi
+
+    mapfile -t covered_children < <(list_covered_csf_children "$cidr")
+
+    if awk -v prefix="${cidr%0/24}" '
+        /^[[:space:]]*($|#|Include)/ { next }
+        $1 ~ /\// { next }
+        index($1, prefix) == 1 && tolower($0) ~ /do not delete/ { found=1; exit }
+        END { exit !found }
+    ' "$CSF_DENY_FILE"; then
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: $cidr covers a protected \"do not delete\" entry; refusing automatic promotion."
+        return 1
+    fi
+
+    projected_count=$((current_count - ${#covered_children[@]} + parent_delta))
+    if [ "$projected_count" -gt "$deny_limit" ]; then
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Promoting $cidr would exceed DENY_IP_LIMIT $deny_limit ($projected_count projected entries)."
+        echo "Remedy: first promote a reviewed range with enough covered child bans to create headroom."
+        return 1
+    fi
+
+    backup_file=$(mktemp "${CSF_DENY_FILE}.promote.XXXXXX") || {
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not create a CSF deny backup."
+        return 1
+    }
+    if ! cp -a "$CSF_DENY_FILE" "$backup_file"; then
+        rm -f "$backup_file"
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not back up $CSF_DENY_FILE."
+        return 1
+    fi
+    if [ "$has_tempip" -eq 1 ]; then
+        tempip_backup_file=$(mktemp "${CSF_TEMPIP_FILE}.promote.XXXXXX") || {
+            rm -f "$backup_file"
+            flock -u 7 >/dev/null 2>&1 || true
+            flock -u 8 >/dev/null 2>&1 || true
+            flock -u 9 >/dev/null 2>&1 || true
+            echo "ERROR: Could not create a CSF permanent-history backup."
+            return 1
+        }
+        if ! cp -a "$CSF_TEMPIP_FILE" "$tempip_backup_file"; then
+            rm -f "$backup_file" "$tempip_backup_file"
+            flock -u 7 >/dev/null 2>&1 || true
+            flock -u 8 >/dev/null 2>&1 || true
+            flock -u 9 >/dev/null 2>&1 || true
+            echo "ERROR: Could not back up $CSF_TEMPIP_FILE."
+            return 1
+        fi
+    fi
+
+    if ipset test "$CSF_CHAIN_DENY_SET" "$cidr" >/dev/null 2>&1; then
+        live_parent_preexisting=1
+    fi
+    if ! ipset add "$CSF_CHAIN_DENY_SET" "$cidr" -exist; then
+        rm -f "$backup_file" "$tempip_backup_file"
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not install live coverage for $cidr; policy was not changed."
+        return 1
+    fi
+
+    policy_temp=$(mktemp "${CSF_DENY_FILE}.new.XXXXXX") || {
+        [ "$live_parent_preexisting" -eq 1 ] ||
+            ipset del "$CSF_CHAIN_DENY_SET" "$cidr" -exist >/dev/null 2>&1
+        rm -f "$backup_file" "$tempip_backup_file"
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not create a temporary promoted policy."
+        return 1
+    }
+    timestamp=$(date)
+    sanitized_message=${message//$'\n'/ }
+
+    if ! awk \
+        -v cidr="$cidr" \
+        -v prefix="${cidr%0/24}" \
+        -v comment="$sanitized_message" \
+        -v timestamp="$timestamp" '
+            BEGIN { parent_seen = 0 }
+            $1 == cidr { parent_seen = 1 }
+            /^[[:space:]]*($|#|Include)/ { print; next }
+            $1 !~ /\// && index($1, prefix) == 1 {
+                suffix = substr($1, length(prefix) + 1)
+                if (suffix ~ /^[0-9]+$/ && (suffix + 0) >= 0 && (suffix + 0) <= 255) {
+                    next
+                }
+            }
+            { print }
+            END {
+                if (!parent_seen) {
+                    print cidr " # " comment " - " timestamp
+                }
+            }
+        ' "$CSF_DENY_FILE" > "$policy_temp"; then
+        [ "$live_parent_preexisting" -eq 1 ] ||
+            ipset del "$CSF_CHAIN_DENY_SET" "$cidr" -exist >/dev/null 2>&1
+        rm -f "$policy_temp" "$backup_file" "$tempip_backup_file"
+        [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+        flock -u 8 >/dev/null 2>&1 || true
+        flock -u 9 >/dev/null 2>&1 || true
+        echo "ERROR: Could not build the promoted CSF deny policy; policy was not changed."
+        return 1
+    fi
+
+    if [ "$has_tempip" -eq 1 ]; then
+        tempip_temp=$(mktemp "${CSF_TEMPIP_FILE}.new.XXXXXX") || {
+            [ "$live_parent_preexisting" -eq 1 ] ||
+                ipset del "$CSF_CHAIN_DENY_SET" "$cidr" -exist >/dev/null 2>&1
+            rm -f "$policy_temp" "$backup_file" "$tempip_backup_file"
+            flock -u 7 >/dev/null 2>&1 || true
+            flock -u 8 >/dev/null 2>&1 || true
+            flock -u 9 >/dev/null 2>&1 || true
+            echo "ERROR: Could not create a temporary CSF permanent-history file."
+            return 1
+        }
+        if ! awk -F'|' -v prefix="${cidr%0/24}" '
+            index($1, prefix) == 1 {
+                suffix = substr($1, length(prefix) + 1)
+                if (suffix ~ /^[0-9]+$/ && (suffix + 0) >= 0 && (suffix + 0) <= 255) {
+                    next
+                }
+            }
+            { print }
+        ' "$CSF_TEMPIP_FILE" > "$tempip_temp"; then
+            [ "$live_parent_preexisting" -eq 1 ] ||
+                ipset del "$CSF_CHAIN_DENY_SET" "$cidr" -exist >/dev/null 2>&1
+            rm -f "$policy_temp" "$tempip_temp" "$backup_file" "$tempip_backup_file"
+            flock -u 7 >/dev/null 2>&1 || true
+            flock -u 8 >/dev/null 2>&1 || true
+            flock -u 9 >/dev/null 2>&1 || true
+            echo "ERROR: Could not build the promoted CSF permanent-history file."
+            return 1
+        fi
+    fi
+
+    if ! cat "$policy_temp" > "$CSF_DENY_FILE"; then
+        rm -f "$policy_temp" "$tempip_temp"
+        rollback_csf_cidr_promotion "$backup_file" "$tempip_backup_file"
+        return 1
+    fi
+    if [ "$has_tempip" -eq 1 ] &&
+        ! cat "$tempip_temp" > "$CSF_TEMPIP_FILE"; then
+        rm -f "$policy_temp" "$tempip_temp"
+        rollback_csf_cidr_promotion "$backup_file" "$tempip_backup_file"
+        return 1
+    fi
+    rm -f "$policy_temp" "$tempip_temp"
+
+    for child in "${covered_children[@]}"; do
+        if [ -n "${removed_once[$child]:-}" ]; then
+            continue
+        fi
+        removed_once[$child]=1
+
+        if ! ipset del "$CSF_CHAIN_DENY_SET" "$child" -exist; then
+            rollback_csf_cidr_promotion "$backup_file" "$tempip_backup_file"
+            return 1
+        fi
+    done
+    removed_children=${#covered_children[@]}
+
+    if ! awk -v target="$cidr" '$1 == target { found=1; exit } END { exit !found }' "$CSF_DENY_FILE" ||
+        [ -n "$(list_covered_csf_children "$cidr")" ] ||
+        ! ipset test "$CSF_CHAIN_DENY_SET" "$cidr" >/dev/null 2>&1; then
+        rollback_csf_cidr_promotion "$backup_file" "$tempip_backup_file"
+        return 1
+    fi
+
+    final_count=$(count_active_csf_deny_entries)
+    if ! [[ "$final_count" =~ ^[0-9]+$ ]] || [ "$final_count" -gt "$deny_limit" ]; then
+        rollback_csf_cidr_promotion "$backup_file" "$tempip_backup_file"
+        return 1
+    fi
+
+    rm -f "$backup_file" "$tempip_backup_file"
+    [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
+    flock -u 8 >/dev/null 2>&1 || true
+    flock -u 9 >/dev/null 2>&1 || true
+    local headroom=$((deny_limit - final_count))
+    local slot_label="slots"
+    local remain_label="remain"
+    [ "$headroom" -eq 1 ] && slot_label="slot"
+    [ "$headroom" -eq 1 ] && remain_label="remains"
+    echo "Promoted $cidr: removed $removed_children covered child bans; $headroom $slot_label of headroom $remain_label."
+    return 0
 }
 
 # Function to terminate live sessions for an IP after it is banned.
@@ -1826,7 +2223,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,promote-cidr:,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -1860,6 +2257,7 @@ while true; do
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
+            echo "  --promote-cidr <CIDR> [MSG]  Atomically replace covered child bans with a persistent IPv4 /24"
             echo "  --logs \"<path1> <path2>\"    Override default log paths to scan"
             echo "  --clear                   Flush ipset and clear tracking file (interactive)"
             echo "  --abuse, --abuse-report <IP> [MIN_HITS]   Generate an abuse evidence report for <IP> (read-only)"
@@ -1924,6 +2322,28 @@ while true; do
 
       perform_blacklist "$IP_TO_BLACKLIST" "$MESSAGE_TO_USE"
       
+      ;;
+    --promote-cidr )
+      CIDR_TO_PROMOTE="$2"
+      MESSAGE_TO_USE=""
+
+      if [ -z "$CIDR_TO_PROMOTE" ] || ! validate_ipv4_24_cidr "$CIDR_TO_PROMOTE"; then
+          echo "Error: --promote-cidr requires a canonical IPv4 /24 argument."
+          exit 1
+      fi
+
+      if [ "$#" -ge 4 ] && [ "$3" = "--" ] && [ -n "$4" ]; then
+          MESSAGE_TO_USE="$4"
+          shift 4
+      elif [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+          MESSAGE_TO_USE="$3"
+          shift 3
+      else
+          shift 2
+      fi
+
+      perform_promote_cidr "$CIDR_TO_PROMOTE" "$MESSAGE_TO_USE"
+      exit $?
       ;;
         --abuse-min )
             ABUSE_MIN="$2"

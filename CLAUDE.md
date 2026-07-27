@@ -49,6 +49,7 @@ The script is organized into distinct functional areas:
 - `get_iptables_path()`: Locate iptables binary
 - `is_setup_complete()`: Verify IPSET and CSF integration
 - `perform_blacklist()`: Manually ban an IP
+- `perform_promote_cidr()`: Atomically replace covered CSF child bans with one persistent `/24`
 - `perform_whitelist()`: Remove IP from ban list and add to CSF allow list
 - `perform_init()`: Initialize IPSET table and add firewall rules
 - `perform_clear()`: Flush all bans (requires confirmation)
@@ -65,6 +66,7 @@ sudo ./scripts/csf_ban_wp_login_attackers --init
 **Manual IP Operations**:
 ```bash
 sudo ./scripts/csf_ban_wp_login_attackers --blacklist 1.2.3.4 "Reason here"
+sudo ./scripts/csf_ban_wp_login_attackers --promote-cidr 1.2.3.0/24 "Reviewed hostile campaign"
 sudo ./scripts/csf_ban_wp_login_attackers --whitelist 1.2.3.4 "Trusted admin"
 ```
 
@@ -167,7 +169,15 @@ When adding new features:
 
 ## Testing Commands
 
-There are no automated tests in this repository. Manual testing workflow:
+Run the automated firewall regression tests before deployment:
+
+```bash
+tests/test_csf_ban_wp_login_attackers_restore.sh
+tests/test_csf_cidr_promotion.sh
+tests/test_modsecurity_persistent_blacklist.sh
+```
+
+Manual verification workflow:
 
 1. **Syntax Check**: `bash -n scripts/<script_name>`
 2. **Setup Verification**: `sudo ./scripts/csf_ban_wp_login_attackers --init` (review output, don't apply on dev machines)

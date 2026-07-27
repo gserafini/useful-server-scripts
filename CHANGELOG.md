@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-27
+
+- Add lock-protected, rollback-safe CSF `/24` promotion that establishes live parent coverage before removing child bans, refuses capacity-evicting changes, and verifies the final policy and firewall state.
+
 ## 2026-07-25
 
 - Match `csf.allow` entries by their exact IP field, return a distinct failure status for protected blacklist targets, and print the exact removal-and-retry remedy so callers cannot report a skipped ban as successful.
