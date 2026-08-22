@@ -106,7 +106,11 @@ eval "$function_blocks"
 # dc2-5 runs GNU awk 3.1.7, where interval quantifiers are disabled by
 # default. Exercise the collector with those legacy matching semantics.
 awk() {
-    command "$SYSTEM_AWK" --traditional "$@"
+    if [[ "$*" == *"*Blocked in csf* [LF_DISTATTACK]"* ]]; then
+        command "$SYSTEM_AWK" --traditional "$@"
+    else
+        command "$SYSTEM_AWK" "$@"
+    fi
 }
 
 : > "$CSF_DENY_FILE"
