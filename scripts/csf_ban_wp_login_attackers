@@ -540,7 +540,7 @@ collect_lfd_distributed_ips() {
     LC_ALL=C tail -n "$LFD_MIGRATE_TAIL_LINES" "$LFD_LOG_FILE" | LC_ALL=C awk '
         index($0, "*Blocked in csf* [LF_DISTATTACK]") {
             for (field = 1; field <= NF; field++) {
-                if ($field ~ /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/ && !seen[$field]++) {
+                if ($field ~ /^[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?\.[0-9][0-9]?[0-9]?$/ && !seen[$field]++) {
                     print $field
                     break
                 }

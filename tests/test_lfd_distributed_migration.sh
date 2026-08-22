@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT="/usr/local/useful-server-scripts/scripts/csf_ban_wp_login_attackers"
+SYSTEM_AWK=$(command -v awk)
 
 fail() {
     echo "FAIL: $1" >&2
@@ -101,6 +102,12 @@ ipset() {
 }
 
 eval "$function_blocks"
+
+# dc2-5 runs GNU awk 3.1.7, where interval quantifiers are disabled by
+# default. Exercise the collector with those legacy matching semantics.
+awk() {
+    command "$SYSTEM_AWK" --traditional "$@"
+}
 
 : > "$CSF_DENY_FILE"
 : > "$CSF_TEMPIP_FILE"
