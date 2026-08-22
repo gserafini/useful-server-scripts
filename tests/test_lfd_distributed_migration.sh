@@ -9,6 +9,9 @@ fail() {
     exit 1
 }
 
+grep -q '^PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"$' "$SCRIPT" ||
+    fail "script does not provide the cron-safe system PATH required for ipset and csf"
+
 for function_name in \
     validate_ip \
     get_csf_deny_limit \

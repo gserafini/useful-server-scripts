@@ -1,4 +1,7 @@
 #!/bin/bash
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
 # High-Performance IP Banning Script using IPSET and CSF.
 # This script is designed for deployment via cron job to automate Web Application Firewall (WAF) 
 # actions.
