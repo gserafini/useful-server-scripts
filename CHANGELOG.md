@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-22
+
+- Add a lock-protected `LF_DISTATTACK` migration that establishes persistent `high_volume_bans` coverage before selectively removing evictable exact-IP CSF entries, preserves protected and unrelated policy, and rolls back on any live-firewall failure.
+
 ## 2026-07-27
 
 - Add lock-protected, rollback-safe CSF `/24` promotion that establishes live parent coverage before removing child bans, refuses capacity-evicting changes, and verifies the final policy and firewall state.
