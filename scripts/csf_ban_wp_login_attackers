@@ -55,10 +55,11 @@ export PATH
 #    The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
 # 4. --blacklist <IP> [MESSAGE] / --block <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list
 #    and the tracking file. It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
-# 5. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
+# 5. --blacklist-file <FILE|-> [MESSAGE]: Preflights, deduplicates, and blacklists every IPv4 address in a file or stdin.
+# 6. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
 #    It installs live parent coverage before deduplication, refuses unsafe capacity changes, and rolls back on failure.
-# 6. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
-# 7. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+# 7. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 8. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
 #
 # Additional reporting / abuse-evidence options (read-only):
 # - --abuse-report <IP> [MIN_HITS]  (alias: --abuse)
@@ -134,11 +135,19 @@ START_TIME=${START_TIME_CMD}
 # Function to safely validate an IP address format
 validate_ip() {
     local ip=$1
-    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        return 0 
-    else
-        return 1 
-    fi
+    local IFS='.'
+    local octets=()
+    local octet
+
+    [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    read -r -a octets <<< "$ip"
+    [ "${#octets[@]}" -eq 4 ] || return 1
+
+    for octet in "${octets[@]}"; do
+        [ "$((10#$octet))" -le 255 ] || return 1
+    done
+
+    return 0
 }
 
 # Validate the canonical /24 networks emitted by security-sweep.sh.
@@ -1443,7 +1452,7 @@ kill_lingering_phpfpm_processes() {
 # UPDATED to accept an optional message
 perform_blacklist() {
     ensure_setup
-    ensure_live_ipset_capacity || exit 1
+    ensure_live_ipset_capacity || return 1
     local ip="$1"
     local message="$2"
     
@@ -1457,14 +1466,14 @@ perform_blacklist() {
 
     if ! validate_ip "$ip"; then
         echo "Error: Invalid IP address format: $ip"
-        exit 1
+        return 1
     fi
 
     if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_ALLOW_FILE"; then
         echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Refusing blacklist action."
         echo "If the allow entry is obsolete, run: csf -ar $ip"
         echo "Then retry: $0 --blacklist $ip \"${message:-reason}\""
-        exit 3
+        return 3
     fi
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
@@ -1474,7 +1483,7 @@ perform_blacklist() {
         end_time_cmd=$(date +%s)
         local end_time=${end_time_cmd}
         report_ban_counts "Post-Blacklist Report" 0 "$end_time"
-        exit 0
+        return 0
     fi
     
     # Use the same lookup method as the batch lookup for consistency
@@ -1500,7 +1509,7 @@ perform_blacklist() {
         echo "Added $ip to ipset: $IP_SET_NAME."
     else
         echo "ERROR: Failed to add $ip to ipset. Check ipset utility and permissions."
-        exit 1
+        return 1
     fi
 
     terminate_live_sessions_for_ip "$ip"
@@ -1511,7 +1520,82 @@ perform_blacklist() {
     end_time_cmd=$(date +%s)
     local end_time=${end_time_cmd}
     report_ban_counts "Post-Blacklist Report" 1 "$end_time"
-    exit 0
+    return 0
+}
+
+# Preflight an entire IPv4 list before mutating firewall state, then process
+# every unique entry through the same guarded single-IP path used by --blacklist.
+perform_blacklist_file() {
+    local source_file="$1"
+    local message="$2"
+    local normalized_file
+    local line=""
+    local entry=""
+    local line_number=0
+    local invalid_count=0
+    local total=0
+    local succeeded=0
+    local failed=0
+
+    if [ "$source_file" != "-" ] && [ ! -r "$source_file" ]; then
+        echo "Error: --blacklist-file cannot read: $source_file" >&2
+        return 1
+    fi
+
+    normalized_file=$(mktemp "${TMPDIR:-/tmp}/csf-blacklist-file.XXXXXX") || {
+        echo "Error: Unable to create blacklist batch staging file." >&2
+        return 1
+    }
+
+    if [ "$source_file" = "-" ]; then
+        exec 3<&0
+    else
+        exec 3<"$source_file"
+    fi
+
+    while IFS= read -r line <&3 || [ -n "$line" ]; do
+        line_number=$((line_number + 1))
+        entry=${line%%#*}
+        entry=$(printf '%s\n' "$entry" | awk '{$1=$1; print}')
+        [ -z "$entry" ] && continue
+
+        if ! validate_ip "$entry"; then
+            echo "Error: Invalid IPv4 address at $source_file line $line_number: $entry" >&2
+            invalid_count=$((invalid_count + 1))
+            continue
+        fi
+
+        if ! grep -Fqx "$entry" "$normalized_file"; then
+            printf '%s\n' "$entry" >> "$normalized_file"
+        fi
+    done
+    exec 3<&-
+
+    if [ "$invalid_count" -ne 0 ]; then
+        rm -f "$normalized_file"
+        echo "Error: Refusing batch; $invalid_count invalid entr$( [ "$invalid_count" -eq 1 ] && printf 'y' || printf 'ies' ) found during preflight." >&2
+        return 1
+    fi
+
+    if [ ! -s "$normalized_file" ]; then
+        rm -f "$normalized_file"
+        echo "Error: --blacklist-file contained no IPv4 addresses." >&2
+        return 1
+    fi
+
+    total=$(wc -l < "$normalized_file")
+    while IFS= read -r entry; do
+        if perform_blacklist "$entry" "$message"; then
+            succeeded=$((succeeded + 1))
+        else
+            failed=$((failed + 1))
+            echo "Error: Blacklist action failed for $entry; continuing batch." >&2
+        fi
+    done < "$normalized_file"
+    rm -f "$normalized_file"
+
+    echo "Blacklist batch complete: $total unique IPs; $succeeded succeeded, $failed failed."
+    [ "$failed" -eq 0 ]
 }
 
 # Function to perform the whitelist action
@@ -2556,7 +2640,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -2590,6 +2674,7 @@ while true; do
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
+            echo "  --blacklist-file <FILE|-> [MSG]  Preflight, deduplicate, and blacklist IPv4 addresses from a file or stdin"
             echo "  --promote-cidr <CIDR> [MSG]  Atomically replace covered child bans with a persistent IPv4 /24"
             echo "  --migrate-lfd-distributed  Move recent LF_DISTATTACK blocks into persistent ipset coverage"
             echo "  --logs \"<path1> <path2>\"    Override default log paths to scan"
@@ -2655,7 +2740,29 @@ while true; do
       fi
 
       perform_blacklist "$IP_TO_BLACKLIST" "$MESSAGE_TO_USE"
-      
+      exit $?
+      ;;
+    --blacklist-file )
+      BLACKLIST_SOURCE="$2"
+      MESSAGE_TO_USE=""
+
+      if [ -z "$BLACKLIST_SOURCE" ]; then
+          echo "Error: --blacklist-file requires a readable file path or - for stdin."
+          exit 1
+      fi
+
+      if [ "$#" -ge 4 ] && [ "$3" = "--" ] && [ -n "$4" ]; then
+          MESSAGE_TO_USE="$4"
+          shift 4
+      elif [ "$#" -ge 3 ] && [ "$3" != "--" ] && ! [[ "$3" =~ ^--.* ]]; then
+          MESSAGE_TO_USE="$3"
+          shift 3
+      else
+          shift 2
+      fi
+
+      perform_blacklist_file "$BLACKLIST_SOURCE" "$MESSAGE_TO_USE"
+      exit $?
       ;;
     --promote-cidr )
       CIDR_TO_PROMOTE="$2"

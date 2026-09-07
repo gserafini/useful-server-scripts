@@ -211,6 +211,12 @@ This creates:
 sudo csf_ban_wp_login_attackers --blacklist 1.2.3.4 "Brute force wp-login"
 # Alias: --block
 
+# Ban a reviewed list after validating the entire input before any mutation
+sudo csf_ban_wp_login_attackers --blacklist-file campaign-ips.txt "Distributed crawler campaign"
+
+# Read the reviewed list from stdin
+printf '%s\n' 1.2.3.4 5.6.7.8 | sudo csf_ban_wp_login_attackers --blacklist-file - "Distributed crawler campaign"
+
 # Whitelist an IP (adds to /etc/csf/csf.allow)
 sudo csf_ban_wp_login_attackers --whitelist 1.2.3.4 "Trusted admin"
 # Alias: --unblock
@@ -302,6 +308,7 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`) |
+| `--blacklist-file FILE|- [MSG]` | Preflight and deduplicate a file or stdin list, then process every IPv4 address through the guarded blacklist path |
 | `--promote-cidr CIDR [MSG]` | Atomically replace covered CSF child bans with a canonical IPv4 `/24`; refuses unsafe capacity changes and rolls back on failure |
 | `--migrate-lfd-distributed` | Preserve recent LFD `LF_DISTATTACK` blocks in `high_volume_bans`, then atomically remove only their evictable exact-IP CSF entries |
 | `--whitelist IP [MSG]` | Remove IP from bans and add to CSF allow list (alias: `--unblock`) |

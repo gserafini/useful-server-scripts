@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-07
+
+- Add `--blacklist-file` for preflighted, deduplicated batch containment from a file or stdin, with complete processing and an explicit partial-failure summary.
+- Reject IPv4 addresses with out-of-range octets before firewall or tracking mutations.
+
 ## 2026-08-22
 
 - Add a lock-protected `LF_DISTATTACK` migration that establishes persistent `high_volume_bans` coverage before selectively removing evictable exact-IP CSF entries, preserves protected and unrelated policy, and rolls back on any live-firewall failure.
