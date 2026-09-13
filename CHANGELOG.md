@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-13
+
+- Add read-only `--check-ip` output for live ipset, tracking, exact CSF deny, parent `/24`, and exact CSF allow coverage during incident response.
+
 ## 2026-09-12
 
 - Add `--unblacklist` to reverse a tracked high-volume false-positive deny without creating an overly broad `csf.allow` trust entry.

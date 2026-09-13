@@ -59,10 +59,11 @@ export PATH
 #    supplied one per line; MESSAGE is one shared reason passed as the optional argument after FILE or -.
 # 6. --unblacklist <IP> [MESSAGE]: Removes an exact IP from the live high-volume set and tracking file
 #    without adding it to csf.allow or changing independent CSF deny policy.
-# 7. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
+# 7. --check-ip <IP>: Reports exact live ipset, tracking, CSF deny, and CSF allow coverage without mutation.
+# 8. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
 #    It installs live parent coverage before deduplication, refuses unsafe capacity changes, and rolls back on failure.
-# 8. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
-# 9. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+# 9. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 10. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
 #
 # Additional reporting / abuse-evidence options (read-only):
 # - --abuse-report <IP> [MIN_HITS]  (alias: --abuse)
@@ -151,6 +152,45 @@ validate_ip() {
     done
 
     return 0
+}
+
+# Report the exact live and persistent policy coverage used during incident
+# response. This path is intentionally read-only and does not call ensure_setup.
+perform_check_ip() {
+    local ip="$1"
+    local parent_cidr
+    local live_state="absent"
+    local tracking_count="unavailable"
+    local deny_exact_count="unavailable"
+    local deny_parent_count="unavailable"
+    local allow_exact_count="unavailable"
+
+    if ! validate_ip "$ip"; then
+        echo "Error: --check-ip requires a valid IPv4 address argument." >&2
+        return 1
+    fi
+
+    parent_cidr="${ip%.*}.0/24"
+    if ipset test "$IP_SET_NAME" "$ip" >/dev/null 2>&1; then
+        live_state="present"
+    fi
+    if [ -r "$IP_TRACKING_FILE" ]; then
+        tracking_count=$(awk -v target="$ip" '$1 == target { count++ } END { print count + 0 }' "$IP_TRACKING_FILE")
+    fi
+    if [ -r "$CSF_DENY_FILE" ]; then
+        deny_exact_count=$(awk -v target="$ip" '$1 == target { count++ } END { print count + 0 }' "$CSF_DENY_FILE")
+        deny_parent_count=$(awk -v target="$parent_cidr" '$1 == target { count++ } END { print count + 0 }' "$CSF_DENY_FILE")
+    fi
+    if [ -r "$CSF_ALLOW_FILE" ]; then
+        allow_exact_count=$(awk -v target="$ip" '$1 == target { count++ } END { print count + 0 }' "$CSF_ALLOW_FILE")
+    fi
+
+    echo "IP: $ip"
+    echo "Live ipset $IP_SET_NAME: $live_state"
+    echo "Tracking entries: $tracking_count"
+    echo "CSF deny exact entries: $deny_exact_count"
+    echo "CSF deny parent /24 entries: $deny_parent_count"
+    echo "CSF allow exact entries: $allow_exact_count"
 }
 
 # Validate the canonical /24 networks emitted by security-sweep.sh.
@@ -2708,7 +2748,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,unblacklist:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,unblacklist:,check-ip:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -2744,6 +2784,7 @@ while true; do
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
             echo "  --blacklist-file <FILE|-> [MSG]  Ban bare IPv4 addresses (one per line); MSG is one shared reason"
             echo "  --unblacklist <IP> [MSG]  Remove IP from this tool's live/tracked deny without adding csf.allow"
+            echo "  --check-ip <IP>           Report live and persistent deny/allow coverage (read-only)"
             echo "  --promote-cidr <CIDR> [MSG]  Atomically replace covered child bans with a persistent IPv4 /24"
             echo "  --migrate-lfd-distributed  Move recent LF_DISTATTACK blocks into persistent ipset coverage"
             echo "  --logs \"<path1> <path2>\"    Override default log paths to scan"
@@ -2853,6 +2894,12 @@ while true; do
       fi
 
       perform_unblacklist "$IP_TO_UNBLACKLIST" "$MESSAGE_TO_USE"
+      exit $?
+      ;;
+    --check-ip )
+      IP_TO_CHECK="$2"
+      shift 2
+      perform_check_ip "$IP_TO_CHECK"
       exit $?
       ;;
     --promote-cidr )
