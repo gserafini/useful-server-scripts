@@ -217,6 +217,9 @@ sudo csf_ban_wp_login_attackers --blacklist-file campaign-ips.txt "Distributed c
 # Read the reviewed list from stdin
 printf '%s\n' 1.2.3.4 5.6.7.8 | sudo csf_ban_wp_login_attackers --blacklist-file - "Distributed crawler campaign"
 
+# Reverse this tool's false-positive deny without globally allowlisting the IP
+sudo csf_ban_wp_login_attackers --unblacklist 1.2.3.4 "Reviewed false positive"
+
 # Whitelist an IP (adds to /etc/csf/csf.allow)
 sudo csf_ban_wp_login_attackers --whitelist 1.2.3.4 "Trusted admin"
 # Alias: --unblock
@@ -309,6 +312,7 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`) |
 | `--blacklist-file FILE|- [MSG]` | Preflight and deduplicate a file or stdin list, then process every IPv4 address through the guarded blacklist path |
+| `--unblacklist IP [MSG]` | Remove an exact IP from `high_volume_bans` and its tracking file without adding it to `csf.allow` or changing independent CSF deny policy |
 | `--promote-cidr CIDR [MSG]` | Atomically replace covered CSF child bans with a canonical IPv4 `/24`; refuses unsafe capacity changes and rolls back on failure |
 | `--migrate-lfd-distributed` | Preserve recent LFD `LF_DISTATTACK` blocks in `high_volume_bans`, then atomically remove only their evictable exact-IP CSF entries |
 | `--whitelist IP [MSG]` | Remove IP from bans and add to CSF allow list (alias: `--unblock`) |

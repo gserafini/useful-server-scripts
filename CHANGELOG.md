@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-12
+
+- Add `--unblacklist` to reverse a tracked high-volume false-positive deny without creating an overly broad `csf.allow` trust entry.
+- Clarify that `--blacklist-file` accepts bare IPv4 addresses one per line and one shared message argument.
+
 ## 2026-09-07
 
 - Add `--blacklist-file` for preflighted, deduplicated batch containment from a file or stdin, with complete processing and an explicit partial-failure summary.
