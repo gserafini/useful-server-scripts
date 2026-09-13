@@ -55,7 +55,8 @@ export PATH
 #    The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
 # 4. --blacklist <IP> [MESSAGE] / --block <IP> [MESSAGE]: Immediately adds the specified IP address to the IPSET ban list
 #    and the tracking file. It skips whitelisted IPs. The MESSAGE is optional but must be quoted if it contains spaces. (Requires setup)
-# 5. --blacklist-file <FILE|-> [MESSAGE]: Preflights, deduplicates, and blacklists every IPv4 address in a file or stdin.
+# 5. --blacklist-file <FILE|-> [MESSAGE]: Preflights, deduplicates, and blacklists bare IPv4 addresses
+#    supplied one per line; MESSAGE is one shared reason passed as the optional argument after FILE or -.
 # 6. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
 #    It installs live parent coverage before deduplication, refuses unsafe capacity changes, and rolls back on failure.
 # 7. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
@@ -2674,7 +2675,7 @@ while true; do
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
-            echo "  --blacklist-file <FILE|-> [MSG]  Preflight, deduplicate, and blacklist IPv4 addresses from a file or stdin"
+            echo "  --blacklist-file <FILE|-> [MSG]  Ban bare IPv4 addresses (one per line); MSG is one shared reason"
             echo "  --promote-cidr <CIDR> [MSG]  Atomically replace covered child bans with a persistent IPv4 /24"
             echo "  --migrate-lfd-distributed  Move recent LF_DISTATTACK blocks into persistent ipset coverage"
             echo "  --logs \"<path1> <path2>\"    Override default log paths to scan"
