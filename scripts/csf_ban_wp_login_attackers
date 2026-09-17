@@ -62,8 +62,10 @@ export PATH
 # 7. --check-ip <IP>: Reports exact live ipset, tracking, CSF deny, and CSF allow coverage without mutation.
 # 8. --promote-cidr <CIDR> [MESSAGE]: Atomically replaces covered CSF child IP bans with a canonical IPv4 /24.
 #    It installs live parent coverage before deduplication, refuses unsafe capacity changes, and rolls back on failure.
-# 9. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
-# 10. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
+# 9. --reconcile-allowlist: Removes local, csf.allow, and csf.ignore IPv4 addresses from the
+#    live high-volume set and its tracking file without reloading CSF.
+# 10. --logs "<path1> <path2>": Overrides the default log paths to scan. (Used in cron job or manual runs).
+# 11. --clear: **DANGER** Flushes all IPs from the live IPSET table and clears the tracking file.
 #
 # Additional reporting / abuse-evidence options (read-only):
 # - --abuse-report <IP> [MIN_HITS]  (alias: --abuse)
@@ -118,6 +120,7 @@ TEMP_UNIQUE_IPS=""
 TEMP_TRACKING_FILE=""
 TEMP_GEOIP_MAPPING=""
 TEMP_CACHE_EXTRACTION=""
+TEMP_LOG_FILE_LIST=""
 
 # --- TIMING VARIABLE ---
 START_TIME_CMD=$(date +%s)
@@ -152,6 +155,145 @@ validate_ip() {
     done
 
     return 0
+}
+
+# Keyword rules are stored as "<threshold> <pattern>". Preserve the complete
+# pattern because signatures such as "union select" must not degrade to the
+# substring "union" (which also occurs in Jetpack's legitimate grunion.css).
+keyword_rule_pattern() {
+    local rule="$1"
+    printf '%s\n' "${rule#* }"
+}
+
+# Build one scan target per underlying file. cPanel exposes many domlogs twice
+# through hard links (top-level and account subdirectories); scanning both
+# aliases inflates a single request into multiple violations.
+build_unique_log_file_list() {
+    local output_file="$1"
+    local configured_path
+    local log_file
+    local inode_key
+    local -A seen_log_inodes=()
+
+    : > "$output_file" || return 1
+
+    # LOG_PATHS is intentionally a space-delimited operator setting.
+    # shellcheck disable=SC2086
+    for configured_path in $LOG_PATHS; do
+        while IFS= read -r -d '' log_file; do
+            inode_key=$(stat -Lc '%d:%i' -- "$log_file" 2>/dev/null) || continue
+            if [ -z "${seen_log_inodes[$inode_key]+x}" ]; then
+                seen_log_inodes["$inode_key"]=1
+                printf '%s\n' "$log_file" >> "$output_file"
+            fi
+        done < <(
+            if [ -f "$configured_path" ]; then
+                printf '%s\0' "$configured_path"
+            elif [ -d "$configured_path" ]; then
+                find -H "$configured_path" -type f -print0 2>/dev/null
+            fi
+        )
+    done
+}
+
+# Grep the inode-deduplicated inventory in bounded batches so large cPanel
+# installations do not exceed the process argument limit.
+scan_log_file_list_for_keyword() {
+    local keyword="$1"
+    local log_file_list="$2"
+    local log_file
+    local -a batch=()
+
+    while IFS= read -r log_file; do
+        [ -f "$log_file" ] || continue
+        batch+=("$log_file")
+        if [ "${#batch[@]}" -ge 128 ]; then
+            grep -H -- "$keyword" "${batch[@]}" 2>/dev/null || true
+            batch=()
+        fi
+    done < "$log_file_list"
+
+    if [ "${#batch[@]}" -gt 0 ]; then
+        grep -H -- "$keyword" "${batch[@]}" 2>/dev/null || true
+    fi
+}
+
+# Write exact protected IPv4 addresses: loopback, every address assigned to the
+# host, and exact first-field entries from csf.allow/csf.ignore. CIDRs and CSF
+# advanced-rule syntax are intentionally excluded from exact ipset cleanup.
+build_protected_ipv4_file() {
+    local output_file="$1"
+
+    {
+        echo "127.0.0.1"
+        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
+        awk '
+            function valid_ipv4(ip, parts, count, i) {
+                count = split(ip, parts, ".")
+                if (count != 4) return 0
+                for (i = 1; i <= 4; i++) {
+                    if (parts[i] !~ /^[0-9]+$/ || parts[i] < 0 || parts[i] > 255) return 0
+                }
+                return 1
+            }
+            /^[[:space:]]*($|#)/ { next }
+            valid_ipv4($1) { print $1 }
+        ' "$CSF_ALLOW_FILE" "$CSF_IGNORE_FILE" 2>/dev/null
+    } | sort -u > "$output_file"
+}
+
+# Make CSF trust policy authoritative over this auxiliary deny set. This is
+# deliberately restart-free: live ipset removals take effect immediately and
+# the atomic tracking rewrite prevents a later CSF rebuild from restoring them.
+reconcile_protected_bans() {
+    local protected_ip_file
+    local cleaned_tracking_file
+    local protected_ip
+    local before_count
+    local after_count
+    local removed_count
+
+    protected_ip_file=$(mktemp /tmp/high_volume_protected_ips.XXXXXX) || return 1
+    cleaned_tracking_file=$(mktemp "${IP_TRACKING_FILE}.reconcile.XXXXXX") || {
+        rm -f "$protected_ip_file"
+        return 1
+    }
+
+    if ! build_protected_ipv4_file "$protected_ip_file"; then
+        rm -f "$protected_ip_file" "$cleaned_tracking_file"
+        echo "ERROR: Could not build the protected IPv4 inventory."
+        return 1
+    fi
+
+    while IFS= read -r protected_ip; do
+        [ -z "$protected_ip" ] && continue
+        if ! ipset del "$IP_SET_NAME" "$protected_ip" -exist >/dev/null 2>&1; then
+            rm -f "$protected_ip_file" "$cleaned_tracking_file"
+            echo "ERROR: Could not remove protected IP $protected_ip from $IP_SET_NAME."
+            return 1
+        fi
+    done < "$protected_ip_file"
+
+    before_count=$(wc -l < "$IP_TRACKING_FILE")
+    awk 'NR == FNR { protected[$1] = 1; next } !($1 in protected)' \
+        "$protected_ip_file" "$IP_TRACKING_FILE" > "$cleaned_tracking_file"
+    after_count=$(wc -l < "$cleaned_tracking_file")
+    removed_count=$((before_count - after_count))
+
+    if [ "$removed_count" -gt 0 ]; then
+        chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
+        chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
+        if ! mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"; then
+            rm -f "$protected_ip_file" "$cleaned_tracking_file"
+            echo "ERROR: Could not atomically reconcile $IP_TRACKING_FILE."
+            return 1
+        fi
+    else
+        rm -f "$cleaned_tracking_file"
+    fi
+
+    rm -f "$protected_ip_file"
+    echo "Removed $removed_count protected tracking entries and cleared protected IPs from $IP_SET_NAME."
 }
 
 # Report the exact live and persistent policy coverage used during incident
@@ -1070,14 +1212,14 @@ report_ban_counts() {
 # This is needed after csf reloads because the custom ipset can be recreated
 # empty even though the tracking file still contains the intended bans.
 repopulate_ipset_from_tracking_file() {
-    local local_ip_file
-    local local_ip
+    local protected_ip_file
+    local protected_ip
     local restore_file
     local stats_file
     local tracked_count=0
     local restored_count=0
     local skipped_count=0
-    local local_skipped_count=0
+    local protected_skipped_count=0
 
     if ! ipset list "$IP_SET_NAME" &> /dev/null; then
         echo "ERROR: ipset '$IP_SET_NAME' does not exist; cannot repopulate from tracking file."
@@ -1089,31 +1231,26 @@ repopulate_ipset_from_tracking_file() {
         return 0
     fi
 
-    local_ip_file=$(mktemp /tmp/high_volume_rebuild_local_ips.XXXXXX) || return 1
+    protected_ip_file=$(mktemp /tmp/high_volume_rebuild_protected_ips.XXXXXX) || return 1
     restore_file=$(mktemp /tmp/high_volume_rebuild_restore.XXXXXX) || {
-        rm -f "$local_ip_file"
+        rm -f "$protected_ip_file"
         return 1
     }
     stats_file=$(mktemp /tmp/high_volume_rebuild_stats.XXXXXX) || {
-        rm -f "$local_ip_file" "$restore_file"
+        rm -f "$protected_ip_file" "$restore_file"
         return 1
     }
 
-    {
-        echo "127.0.0.1"
-        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
-    } | sort -u > "$local_ip_file"
-
-    if [ ! -s "$local_ip_file" ]; then
-        echo "ERROR: Could not discover local IPv4 addresses before rebuilding '$IP_SET_NAME'."
-        rm -f "$local_ip_file" "$restore_file" "$stats_file"
+    if ! build_protected_ipv4_file "$protected_ip_file" || [ ! -s "$protected_ip_file" ]; then
+        echo "ERROR: Could not build the protected IPv4 inventory before rebuilding '$IP_SET_NAME'."
+        rm -f "$protected_ip_file" "$restore_file" "$stats_file"
         return 1
     fi
 
-    while IFS= read -r local_ip; do
-        [ -z "$local_ip" ] && continue
-        ipset del "$IP_SET_NAME" "$local_ip" -exist >/dev/null 2>&1 || true
-    done < "$local_ip_file"
+    while IFS= read -r protected_ip; do
+        [ -z "$protected_ip" ] && continue
+        ipset del "$IP_SET_NAME" "$protected_ip" -exist >/dev/null 2>&1 || true
+    done < "$protected_ip_file"
 
     awk -v set_name="$IP_SET_NAME" -v stats_file="$stats_file" '
         function valid_ipv4(ip, parts, count, i) {
@@ -1136,7 +1273,7 @@ repopulate_ipset_from_tracking_file() {
             }
             tracked++
             if (ip in protected) {
-                local_skipped++
+                protected_skipped++
                 next
             }
             if (!seen[ip]++) {
@@ -1145,28 +1282,28 @@ repopulate_ipset_from_tracking_file() {
             }
         }
         END {
-            print tracked + 0, restored + 0, malformed + 0, local_skipped + 0 > stats_file
+            print tracked + 0, restored + 0, malformed + 0, protected_skipped + 0 > stats_file
         }
-    ' "$local_ip_file" "$IP_TRACKING_FILE" > "$restore_file"
+    ' "$protected_ip_file" "$IP_TRACKING_FILE" > "$restore_file"
 
-    read -r tracked_count restored_count skipped_count local_skipped_count < "$stats_file"
+    read -r tracked_count restored_count skipped_count protected_skipped_count < "$stats_file"
 
     echo "Repopulating live ipset '$IP_SET_NAME' from $IP_TRACKING_FILE..."
     if [ -s "$restore_file" ] && ! ipset restore < "$restore_file"; then
         echo "ERROR: Bulk restore into '$IP_SET_NAME' failed."
         echo "Remedy: run '$0 --resize-live-set $MAX_BANS' and retry the rebuild."
-        rm -f "$local_ip_file" "$restore_file" "$stats_file"
+        rm -f "$protected_ip_file" "$restore_file" "$stats_file"
         return 1
     fi
 
-    rm -f "$local_ip_file" "$restore_file" "$stats_file"
+    rm -f "$protected_ip_file" "$restore_file" "$stats_file"
 
     echo "Repopulated $restored_count unique tracked IPs into '$IP_SET_NAME' from $tracked_count valid tracking entries."
     if [ "$skipped_count" -gt 0 ]; then
         echo "Skipped $skipped_count malformed tracking entries."
     fi
-    if [ "$local_skipped_count" -gt 0 ]; then
-        echo "Skipped and removed $local_skipped_count assigned local-address entries."
+    if [ "$protected_skipped_count" -gt 0 ]; then
+        echo "Skipped and removed $protected_skipped_count protected local/allowlisted entries."
     fi
 
     return 0
@@ -1730,23 +1867,9 @@ perform_whitelist() {
         echo "$ip is already present in $CSF_ALLOW_FILE."
     fi
 
-    if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
-        ipset del "$IP_SET_NAME" "$ip"
-        echo "Removed $ip from ipset: $IP_SET_NAME."
-    else
-        echo "$ip was not found in ipset: $IP_SET_NAME (no action taken)."
-    fi
-
-    local line_number_cmd
-    line_number_cmd=$(grep -n "^$ip " "$IP_TRACKING_FILE" 2>/dev/null | cut -d: -f1 | head -1)
-    local line_number=${line_number_cmd}
-
-    if [ -n "$line_number" ]; then
-        sed -i "${line_number}d" "$IP_TRACKING_FILE"
-        echo "Removed $ip from tracking file: $IP_TRACKING_FILE (Line: $line_number)."
-    else
-        echo "$ip was not found in tracking file (no action taken)."
-    fi
+    # Reconcile every trusted exact IPv4 entry so duplicate tracking rows cannot
+    # reintroduce this address after the CSF reload below.
+    reconcile_protected_bans || exit 1
 
     # Remove any per-IP iptables DROP fallback rule we may have inserted earlier
     # No per-IP iptables cleanup here — conntrack is preferred. If you want immediate
@@ -1979,6 +2102,17 @@ perform_rebuild_live_set() {
     end_time_cmd=$(date +%s)
     local end_time=${end_time_cmd}
     report_ban_counts "Post-Rebuild Report" 0 "$end_time"
+    exit 0
+}
+
+perform_reconcile_allowlist() {
+    ensure_setup
+    echo "--- Reconcile CSF Trust Policy with $IP_SET_NAME ---"
+    reconcile_protected_bans || exit 1
+    local end_time_cmd
+    end_time_cmd=$(date +%s)
+    local end_time=${end_time_cmd}
+    report_ban_counts "Post-Allowlist-Reconciliation Report" 0 "$end_time"
     exit 0
 }
 
@@ -2748,7 +2882,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,unblacklist:,check-ip:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,reconcile-allowlist,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,unblacklist:,check-ip:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -2762,6 +2896,9 @@ while true; do
       ;;
     --rebuild-live-set )
       perform_rebuild_live_set
+      ;;
+    --reconcile-allowlist )
+      perform_reconcile_allowlist
       ;;
     --resize-live-set )
       perform_resize_live_set "$2"
@@ -2777,6 +2914,7 @@ while true; do
             echo "Options:"
             echo "  --init                    Initialize ipset and CSF hooks"
             echo "  --rebuild-live-set        Repopulate the live ipset from the tracking file"
+            echo "  --reconcile-allowlist     Remove local/csf.allow/csf.ignore IPs from live and tracked bans"
             echo "  --resize-live-set <MAX>   Atomically resize the live ipset and restore tracked bans"
             echo "  --whitelist-local-addresses  Remove assigned local IPv4 addresses from bans with one CSF reload"
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
@@ -3538,6 +3676,7 @@ cleanup_temp_files() {
     [ -n "$TEMP_TRACKING_FILE" ] && [ -f "$TEMP_TRACKING_FILE" ] && rm -f "$TEMP_TRACKING_FILE"
     [ -n "$TEMP_GEOIP_MAPPING" ] && [ -f "$TEMP_GEOIP_MAPPING" ] && rm -f "$TEMP_GEOIP_MAPPING"
     [ -n "$TEMP_CACHE_EXTRACTION" ] && [ -f "$TEMP_CACHE_EXTRACTION" ] && rm -f "$TEMP_CACHE_EXTRACTION"
+    [ -n "$TEMP_LOG_FILE_LIST" ] && [ -f "$TEMP_LOG_FILE_LIST" ] && rm -f "$TEMP_LOG_FILE_LIST"
 }
 
 trap cleanup_temp_files EXIT
@@ -3546,74 +3685,7 @@ trap cleanup_temp_files EXIT
 report_ban_counts "Pre-Run Ban Report"
 
 echo "--- 🧹 1. START: PROACTIVE WHITELIST CLEANUP (CSF Allow vs. IPSET Ban List) ---"
-
-TOTAL_TRACKING_LINES_CMD=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
-TOTAL_TRACKING_LINES=${TOTAL_TRACKING_LINES_CMD}
-
-# The cleanup logic is kept here for the regular cron job run.
-gawk -v ip_set_name="$IP_SET_NAME" \
-    -v tracking_file="$IP_TRACKING_FILE" \
-    -v allow_file="$CSF_ALLOW_FILE" \
-    -v total_lines="$TOTAL_TRACKING_LINES" \
-    '
-    BEGIN {
-        # 1. READ CSF.ALLOW INTO AN AWK ARRAY for fast lookup
-        while ((getline line < allow_file) > 0) {
-            # Check the line itself ($0 is set to the content of '\''line'\'' when getline is used)
-            if ($0 !~ /^#/) {
-                match($0, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/)
-                if (RSTART > 0) {
-                    whitelisted_ips[$1] = 1
-                }
-            }
-        }
-        close(allow_file)
-        
-        num_allowed = length(whitelisted_ips)
-        if (num_allowed == 0) {
-            print "Allow list is empty. No cleanup needed." > "/dev/stderr"
-        }
-        
-        print "Checking " total_lines " banned entries against " num_allowed " whitelisted IPs..." > "/dev/stderr"
-        processed = 0
-    }
-    {
-        processed++
-        
-        # Print a simple progress bar/counter to stderr
-        if (total_lines > 0 && (processed % 1000 == 0 || processed == total_lines)) {
-            printf "Progress: %d of %d (%.2f%%)\r" , processed, total_lines, (processed / total_lines * 100) > "/dev/stderr"
-            fflush("/dev/stderr") # Force progress bar to show
-        }
-        
-        ip_to_check = $1
-        
-        # 2. CHECK AGAINST AWK ARRAY (fast memory lookup)
-        if (ip_to_check in whitelisted_ips) {
-            system("ipset del \"" ip_set_name "\" \"" ip_to_check "\" > /dev/null 2>&1")
-            print "CLEANED: Removed whitelisted IP " ip_to_check " from ipset." > "/dev/stderr"
-        } else {
-            # IP is not whitelisted. Print the line back to stdout for the new tracking file.
-            print $0
-        }
-    }
-    END {
-        if (total_lines > 0) {
-            # Print final status update with a newline
-            printf "Progress: %d of %d (100.00%%) - Complete.\n" , total_lines, total_lines > "/dev/stderr"
-        }
-    }' "$IP_TRACKING_FILE" > /tmp/ipset_tracking_new.log
-
-GWAWK_EXIT_STATUS=$? # Capture the exit status of the gawk command
-
-# FIX FOR REGRESSION: Check gawk exit status before replacing file
-if [ $GWAWK_EXIT_STATUS -eq 0 ] && [ -f /tmp/ipset_tracking_new.log ]; then
-    mv /tmp/ipset_tracking_new.log "$IP_TRACKING_FILE"
-    echo "Tracking file updated. Whitelisted IPs removed from the blacklist."
-else
-    # If gawk failed, or the file wasn't created, we skip the move to preserve existing data.
-    echo "WARNING: Cleanup failed (gawk exit status $GWAWK_EXIT_STATUS or file not created). Skipping file replacement to preserve existing bans."
-fi
+reconcile_protected_bans || exit 1
 
 echo "--- 🧹 1. END: PROACTIVE WHITELIST CLEANUP ---"
 echo " "
@@ -3630,6 +3702,14 @@ TEMP_UNIQUE_IPS=$(mktemp)
 TEMP_TRACKING_FILE=$(mktemp)
 TEMP_GEOIP_MAPPING=$(mktemp)
 TEMP_CACHE_EXTRACTION=$(mktemp)
+TEMP_LOG_FILE_LIST=$(mktemp)
+
+if ! build_unique_log_file_list "$TEMP_LOG_FILE_LIST"; then
+    echo "ERROR: Could not build a unique log-file inventory."
+    exit 1
+fi
+UNIQUE_LOG_FILE_COUNT=$(wc -l < "$TEMP_LOG_FILE_LIST")
+echo "Unique underlying log files: $UNIQUE_LOG_FILE_COUNT"
 
 TOTAL_KEYWORDS=${#keywords[@]}
 KEYWORD_COUNT=0
@@ -3639,20 +3719,16 @@ echo "Scanning for $TOTAL_KEYWORDS malicious keywords..."
 for key in "${!keywords[@]}"; do
     KEYWORD_COUNT=$((KEYWORD_COUNT + 1))
     
-    # SC2086 Fix: Quote command substitutions
-    current_keyword=$(echo "${key}" | cut -d" " -f2)
+    current_keyword=$(keyword_rule_pattern "$key")
     echo " "
     echo "👀 [$KEYWORD_COUNT/$TOTAL_KEYWORDS] Scanning logs for keyword: '${current_keyword}'" > /dev/stderr
 
-    # SC2086 Fix: Quote command substitutions
-    frequency=$(( $( echo "${key}" | cut -d" " -f1) ))
-    # SC2086 Fix: Quote command substitutions
-    keyword=$( echo "${key}" | cut -d" " -f2)
-    description=${keywords[${key}]}
+    frequency=${key%% *}
+    keyword="$current_keyword"
+    description="${keywords[$key]}"
 
   
-    # shellcheck disable=SC2086 # $LOG_PATHS must be unquoted for intentional word splitting (to scan multiple log paths)
-    grep -r "$keyword" $LOG_PATHS 2>/dev/null |
+    scan_log_file_list_for_keyword "$keyword" "$TEMP_LOG_FILE_LIST" |
 # SC2196 Fix: Replace deprecated egrep with grep -E
     grep -E -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
     sed 's/://' |

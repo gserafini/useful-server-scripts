@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-17
+
+- Preserve complete multiword attack signatures during log scanning, preventing legitimate substrings such as Jetpack's `grunion.css` from matching the `union select` detector.
+- Deduplicate cPanel log aliases by device/inode so hard-linked domlogs cannot multiply one request into a threshold-crossing violation count.
+- Make exact local, `csf.allow`, and `csf.ignore` IPv4 entries authoritative over `high_volume_bans` during scans and rebuilds, with a restart-free `--reconcile-allowlist` repair command.
+
 ## 2026-09-13
 
 - Add read-only `--check-ip` output for live ipset, tracking, exact CSF deny, parent `/24`, and exact CSF allow coverage during incident response.

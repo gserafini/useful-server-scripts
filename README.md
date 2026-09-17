@@ -180,7 +180,8 @@ get_nameservers.sh --csv
 - Handles 50,000+ bans efficiently using IPSET
 - Integrates with CSF firewall via `/etc/csf/csfpost.sh`
 - Replays the persistent tracking file automatically after every CSF rebuild
-- Excludes assigned local IPv4 addresses from both manual bans and replay
+- Excludes assigned local, `csf.allow`, and `csf.ignore` IPv4 addresses from replay
+- Preserves complete multiword signatures and scans each hard-linked cPanel log only once
 - Terminates existing connections when banning (requires conntrack-tools)
 - Supports safe ModSecurity `exec` bans through a no-argument CGI adapter
 - Generates abuse evidence reports with WHOIS integration
@@ -226,6 +227,10 @@ sudo csf_ban_wp_login_attackers --check-ip 1.2.3.4
 # Whitelist an IP (adds to /etc/csf/csf.allow)
 sudo csf_ban_wp_login_attackers --whitelist 1.2.3.4 "Trusted admin"
 # Alias: --unblock
+
+# Remove every exact local/csf.allow/csf.ignore IP from live and tracked bans
+# without restarting or reloading CSF
+sudo csf_ban_wp_login_attackers --reconcile-allowlist
 
 # Clear all bans (DANGEROUS - requires confirmation)
 sudo csf_ban_wp_login_attackers --clear
@@ -310,7 +315,8 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | Flag | Description |
 |------|-------------|
 | `--init` | Initialize IPSET table and CSF integration (one-time setup) |
-| `--rebuild-live-set` | Bulk-replay tracked bans while excluding assigned local addresses |
+| `--rebuild-live-set` | Bulk-replay tracked bans while excluding assigned local and exact CSF-protected addresses |
+| `--reconcile-allowlist` | Remove exact local, `csf.allow`, and `csf.ignore` IPv4 addresses from live and tracked bans without a CSF reload |
 | `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`) |

@@ -15,7 +15,10 @@ setup_block=$(sed -n '/^is_setup_complete() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$setup_block" | grep -q 'CSF_REBUILD_LINE' || fail "setup check does not require the rebuild hook"
 
 repopulate_block=$(sed -n '/^repopulate_ipset_from_tracking_file() {/,/^}/p' "$SCRIPT")
-printf '%s\n' "$repopulate_block" | grep -q 'ip -4 -o addr show' || fail "rebuild does not discover local addresses"
+protected_block=$(sed -n '/^build_protected_ipv4_file() {/,/^}/p' "$SCRIPT")
+printf '%s\n' "$protected_block" | grep -q 'ip -4 -o addr show' || fail "rebuild protection does not discover local addresses"
+printf '%s\n' "$protected_block" | grep -q 'CSF_ALLOW_FILE' || fail "rebuild protection does not load csf.allow"
+printf '%s\n' "$protected_block" | grep -q 'CSF_IGNORE_FILE' || fail "rebuild protection does not load csf.ignore"
 printf '%s\n' "$repopulate_block" | grep -q 'ipset restore' || fail "rebuild does not use atomic bulk restore"
 printf '%s\n' "$repopulate_block" | grep -q 'protected' || fail "rebuild does not skip local addresses"
 
@@ -25,11 +28,17 @@ cat > "$sandbox/tracking.log" <<'EOF'
 203.0.113.10 # malicious source
 10.20.30.40 # stale local self-ban
 203.0.113.10 # duplicate source
+192.0.2.50 # stale allowlisted source
+192.0.2.60 # stale ignored source
 999.0.0.1 # malformed source
 EOF
+printf '%s\n' '192.0.2.50 # trusted client' > "$sandbox/csf.allow"
+printf '%s\n' '192.0.2.60 # trusted monitor' > "$sandbox/csf.ignore"
 
 IP_SET_NAME="high_volume_bans"
 IP_TRACKING_FILE="$sandbox/tracking.log"
+CSF_ALLOW_FILE="$sandbox/csf.allow"
+CSF_IGNORE_FILE="$sandbox/csf.ignore"
 MAX_BANS=250000
 
 ip() {
@@ -50,6 +59,7 @@ ipset() {
     return 1
 }
 
+eval "$protected_block"
 eval "$repopulate_block"
 rebuild_output=$(repopulate_ipset_from_tracking_file)
 
@@ -65,10 +75,15 @@ grep -q '^add high_volume_bans 203\.0\.113\.10 -exist$' "$sandbox/restore-input.
 if grep -q '10\.20\.30\.40' "$sandbox/restore-input.log"; then
     fail "bulk restore included assigned local IP"
 fi
+if grep -Eq '192\.0\.2\.(50|60)' "$sandbox/restore-input.log"; then
+    fail "bulk restore included a CSF-protected IP"
+fi
 [ "$(grep -c '203\.0\.113\.10' "$sandbox/restore-input.log")" -eq 1 ] || fail "bulk restore did not deduplicate tracked IPs"
 grep -q '^del high_volume_bans 10\.20\.30\.40 -exist$' "$sandbox/ipset-calls.log" || fail "rebuild did not remove stale live self-ban"
+grep -q '^del high_volume_bans 192\.0\.2\.50 -exist$' "$sandbox/ipset-calls.log" || fail "rebuild did not remove stale live allowlisted ban"
+grep -q '^del high_volume_bans 192\.0\.2\.60 -exist$' "$sandbox/ipset-calls.log" || fail "rebuild did not remove stale live ignored ban"
 printf '%s\n' "$rebuild_output" | grep -q 'Skipped 1 malformed tracking entries' || fail "rebuild did not report malformed entry"
-printf '%s\n' "$rebuild_output" | grep -q 'Skipped and removed 1 assigned local-address entries' || fail "rebuild did not report local self-ban"
+printf '%s\n' "$rebuild_output" | grep -q 'Skipped and removed 3 protected local/allowlisted entries' || fail "rebuild did not report protected entries"
 
 unset -f ip ipset
 rm -rf "$sandbox"
