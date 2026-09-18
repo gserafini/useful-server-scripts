@@ -218,6 +218,41 @@ scan_log_file_list_for_keyword() {
     fi
 }
 
+# Extract the request source once from each matched log event. Error logs may
+# repeat the same address in both [remote ...] and [client ...], while request
+# data can contain unrelated IPv4 values. Prefer Apache's client field, fall
+# back to remote, then accept only the leading field of a standard access log.
+extract_source_ipv4_from_matched_log_lines() {
+    gawk --re-interval '
+        function valid_ipv4(ip, parts, count, i) {
+            count = split(ip, parts, ".")
+            if (count != 4) return 0
+            for (i = 1; i <= 4; i++) {
+                if (parts[i] !~ /^[0-9]+$/ || parts[i] < 0 || parts[i] > 255) return 0
+            }
+            return 1
+        }
+        {
+            line = $0
+            sub(/^[^:]*:/, "", line)
+            source = ""
+
+            if (match(line, /\[client [0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?\]/)) {
+                source = substr(line, RSTART + 8, RLENGTH - 9)
+                sub(/:[0-9]+$/, "", source)
+            } else if (match(line, /\[remote [0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?\]/)) {
+                source = substr(line, RSTART + 8, RLENGTH - 9)
+                sub(/:[0-9]+$/, "", source)
+            } else if (match(line, /^[0-9]{1,3}(\.[0-9]{1,3}){3}([[:space:]]|$)/)) {
+                source = substr(line, RSTART, RLENGTH)
+                sub(/[[:space:]]$/, "", source)
+            }
+
+            if (valid_ipv4(source)) print source
+        }
+    '
+}
+
 # Write exact protected IPv4 addresses: loopback, every address assigned to the
 # host, and exact first-field entries from csf.allow/csf.ignore. CIDRs and CSF
 # advanced-rule syntax are intentionally excluded from exact ipset cleanup.
@@ -3206,15 +3241,11 @@ keywords=(
   # --- ModSecurity Violations (High Frequency) ---
   ["5 AH01797"]="error_log ModSecurity AH01797: client denied by server configuration"
   ["5 AH10244"]="error_log ModSecurity AH10244: invalid URI path"
-  ["5 AH01071"]="error_log ModSecurity AH01071: Got error Primary script unknown - requesting missing php file"
+  ["5 Primary script unknown"]="error_log Apache missing-script probe: Primary script unknown"
+  # Generic OWASP 9xxxxx Warning IDs are anomaly evidence, not proof of a
+  # hostile request. Only custom blocking rules belong in this ban section.
   ["1 1234123440"]="error_log ModSecurity 1234123440: Access denied with code 406 - URL Encoding Abuse Attack Attempt"
   ["1 1234123438"]="error_log ModSecurity 1234123438: Access denied with code 400 - Proxy access attempt"
-  ["1 941120"]="error_log ModSecurity 941120: Warning. Pattern match - XSS Filter - Category 2: Event Handler Vector"
-  ["1 941130"]="error_log ModSecurity 941130: Warning. Pattern match - XSS Filter - Category 3: Attribute Vector"
-  ["1 941160"]="error_log ModSecurity 941160: Pattern match - NoScript XSS InjectionChecker: HTML Injection"
-  ["1 942270"]="error_log ModSecurity 942270: Pattern match - Looking for basic sql injection. Common attack string for mysql, oracle and others."
-  ["1 933160"]="error_log ModSecurity 933160: Pattern match - PHP Injection Attack: High-Risk PHP Function Call Found"
-  ["1 933150"]="error_log ModSecurity 933150: Pattern match - PHP Injection Attack: High-Risk PHP Function Name Found"
   ["5 1234123429"]="error_log ModSecurity 1234123429: Warning. Pattern match - Request Indicates an automated program explored the site"
   ["1 1234123443"]="error_log ModSecurity 1234123443: Access denied with code 400 - GET or HEAD requests with bodies"
   ["1 1234123415"]="error_log ModSecurity 1234123415: Access denied with code 406 - SQL Injection Attack"
@@ -3766,9 +3797,7 @@ for key in "${!keywords[@]}"; do
 
   
     scan_log_file_list_for_keyword "$keyword" "$TEMP_LOG_FILE_LIST" |
-# SC2196 Fix: Replace deprecated egrep with grep -E
-    grep -E -o '[ :][[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}\.[[:digit:]]{1,3}' |
-    sed 's/://' |
+    extract_source_ipv4_from_matched_log_lines |
     sort | 
     uniq -c |
     gawk -v frequency="${frequency}" \

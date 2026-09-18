@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-18
+
+- Restrict the Apache `AH01071` detector to the actual `Primary script unknown` missing-file message so ordinary PHP application errors cannot count as probes.
+- Stop promoting non-blocking OWASP ModSecurity warning IDs into persistent IP bans; disruptive custom rules and high-confidence request signatures remain enforced.
+- Extract one validated source address per matched log event, preferring Apache's client metadata and ignoring duplicate remote fields or IPv4 values embedded in request data.
+
 ## 2026-09-17
 
 - Preserve complete multiword attack signatures during log scanning, preventing legitimate substrings such as Jetpack's `grunion.css` from matching the `union select` detector.

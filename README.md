@@ -182,7 +182,8 @@ get_nameservers.sh --csv
 - Replays the persistent tracking file automatically after every CSF rebuild
 - Excludes assigned local, `csf.allow`, and `csf.ignore` IPv4 addresses from replay
 - Refuses manual, batch, delegated, and LF_DISTATTACK migration bans for exact `csf.allow` or `csf.ignore` IPv4 entries
-- Preserves complete multiword signatures and scans each hard-linked cPanel log only once
+- Preserves complete multiword signatures, scans each hard-linked cPanel log only once, and counts one validated source IP per matched event
+- Treats only precise missing-script messages and high-confidence blocking signatures as ban triggers, not generic PHP errors or non-blocking OWASP warnings
 - Terminates existing connections when banning (requires conntrack-tools)
 - Supports safe ModSecurity `exec` bans through a no-argument CGI adapter
 - Generates abuse evidence reports with WHOIS integration

@@ -11,18 +11,22 @@ fail() {
 grep -q '^keyword_rule_pattern()' "$SCRIPT" || fail "missing multiword keyword parser"
 grep -q '^build_unique_log_file_list()' "$SCRIPT" || fail "missing hard-link-aware log inventory"
 grep -q '^scan_log_file_list_for_keyword()' "$SCRIPT" || fail "missing unique log scanner"
+grep -q '^extract_source_ipv4_from_matched_log_lines()' "$SCRIPT" || fail "missing source-IP extractor"
+grep -q 'gawk --re-interval' "$SCRIPT" || fail "source-IP extractor is not compatible with legacy GNU Awk"
 grep -q '^reconcile_protected_bans()' "$SCRIPT" || fail "missing allowlist reconciliation helper"
 grep -q -- '--reconcile-allowlist' "$SCRIPT" || fail "missing explicit allowlist reconciliation command"
 
 keyword_block=$(sed -n '/^keyword_rule_pattern() {/,/^}/p' "$SCRIPT")
 inventory_block=$(sed -n '/^build_unique_log_file_list() {/,/^}/p' "$SCRIPT")
 scan_block=$(sed -n '/^scan_log_file_list_for_keyword() {/,/^}/p' "$SCRIPT")
+source_ip_block=$(sed -n '/^extract_source_ipv4_from_matched_log_lines() {/,/^}/p' "$SCRIPT")
 protected_block=$(sed -n '/^build_protected_ipv4_file() {/,/^}/p' "$SCRIPT")
 reconcile_block=$(sed -n '/^reconcile_protected_bans() {/,/^}/p' "$SCRIPT")
 
 eval "$keyword_block"
 eval "$inventory_block"
 eval "$scan_block"
+eval "$source_ip_block"
 eval "$protected_block"
 eval "$reconcile_block"
 
@@ -52,6 +56,46 @@ if grep -q '73\.25\.161\.125' <<< "$scan_output"; then
 fi
 [ "$(grep -c '198\.51\.100\.44' <<< "$scan_output")" -eq 1 ] ||
     fail "real union-select request was not matched exactly once"
+
+cat > "$sandbox/matched-lines.txt" <<'EOF'
+/tmp/error_log:[Sun Sep 13 12:50:00.000000 2026] [security2:error] [remote 68.160.159.123:54321] [client 68.160.159.123] ModSecurity: Warning. Matched 203.0.113.99 in request data.
+/tmp/access_log:198.51.100.44 - - [13/Sep/2026:12:50:01 -0400] "GET /probe?target=203.0.113.77 HTTP/1.1" 404 123
+/tmp/error_log:[Sun Sep 13 12:50:02.000000 2026] [client 999.1.1.1] malformed source must not pass validation
+EOF
+
+source_ips=$(extract_source_ipv4_from_matched_log_lines < "$sandbox/matched-lines.txt")
+[ "$source_ips" = $'68.160.159.123\n198.51.100.44' ] ||
+    fail "source extraction duplicated a client or captured a payload/invalid IP: $source_ips"
+
+cat > "$sandbox/logs/proxy-errors" <<'EOF'
+[Sun Sep 13 12:50:10.000000 2026] [proxy_fcgi:error] [client 68.160.159.123:50001] AH01071: Got error 'WordPress database error Table cache does not exist'
+[Sun Sep 13 12:50:11.000000 2026] [proxy_fcgi:error] [client 68.160.159.123:50002] AH01071: Got error 'WordPress database error Table cache does not exist'
+[Sun Sep 13 12:50:12.000000 2026] [proxy_fcgi:error] [client 68.160.159.123:50003] AH01071: Got error 'WordPress database error Table cache does not exist'
+[Sun Sep 13 12:50:13.000000 2026] [proxy_fcgi:error] [client 68.160.159.123:50004] AH01071: Got error 'WordPress database error Table cache does not exist'
+[Sun Sep 13 12:50:14.000000 2026] [proxy_fcgi:error] [client 68.160.159.123:50005] AH01071: Got error 'WordPress database error Table cache does not exist'
+[Sun Sep 13 12:51:10.000000 2026] [proxy_fcgi:error] [remote 198.51.100.88:51001] [client 198.51.100.88] AH01071: Got error 'Primary script unknown'
+[Sun Sep 13 12:51:11.000000 2026] [proxy_fcgi:error] [remote 198.51.100.88:51002] [client 198.51.100.88] AH01071: Got error 'Primary script unknown'
+[Sun Sep 13 12:51:12.000000 2026] [proxy_fcgi:error] [remote 198.51.100.88:51003] [client 198.51.100.88] AH01071: Got error 'Primary script unknown'
+[Sun Sep 13 12:51:13.000000 2026] [proxy_fcgi:error] [remote 198.51.100.88:51004] [client 198.51.100.88] AH01071: Got error 'Primary script unknown'
+[Sun Sep 13 12:51:14.000000 2026] [proxy_fcgi:error] [remote 198.51.100.88:51005] [client 198.51.100.88] AH01071: Got error 'Primary script unknown'
+EOF
+printf '%s\n' "$sandbox/logs/proxy-errors" > "$sandbox/proxy-log-inventory.txt"
+
+primary_script_ips=$(
+    scan_log_file_list_for_keyword 'Primary script unknown' "$sandbox/proxy-log-inventory.txt" |
+        extract_source_ipv4_from_matched_log_lines
+)
+[ "$(grep -c '^198\.51\.100\.88$' <<< "$primary_script_ips")" -eq 5 ] ||
+    fail "real missing-script probes were not counted once per log event"
+if grep -q '^68\.160\.159\.123$' <<< "$primary_script_ips"; then
+    fail "ordinary AH01071 application errors matched the missing-script signature"
+fi
+
+grep -Fq '["5 Primary script unknown"]=' "$SCRIPT" ||
+    fail "missing-script rule still uses the broad AH01071 error code"
+if grep -Eq '^[[:space:]]*\["[0-9]+ (941120|941130|941160|942270|933150|933160)"\]=' "$SCRIPT"; then
+    fail "non-blocking vendor ModSecurity warning IDs still trigger automatic bans"
+fi
 
 IP_TRACKING_FILE="$sandbox/tracking.log"
 CSF_ALLOW_FILE="$sandbox/csf.allow"
@@ -97,4 +141,4 @@ grep -Fqx 'del test_bans 10.20.30.40 -exist' "$calls" ||
 grep -q 'Removed 4 protected tracking entries' <<< "$reconcile_output" ||
     fail "reconciliation summary did not report every removed entry"
 
-echo "PASS: multiword signatures, hard-linked logs, and allowlist reconciliation prevent false-positive bans"
+echo "PASS: precise signatures, one-source-per-event counting, unique logs, and allowlist reconciliation prevent false-positive bans"
