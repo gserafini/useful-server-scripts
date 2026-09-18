@@ -14,6 +14,7 @@ grep -q '^PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"$' 
 
 for function_name in \
     validate_ip \
+    build_protected_ipv4_file \
     get_csf_deny_limit \
     count_active_csf_deny_entries \
     collect_lfd_distributed_ips \
@@ -29,6 +30,7 @@ grep -q -- '--migrate-lfd-distributed' "$SCRIPT" || fail "help output missing --
 function_blocks=""
 for function_name in \
     validate_ip \
+    build_protected_ipv4_file \
     get_csf_deny_limit \
     count_active_csf_deny_entries \
     collect_lfd_distributed_ips \
@@ -49,6 +51,8 @@ IP_TRACKING_FILE="$sandbox/tracking.log"
 CSF_DENY_FILE="$sandbox/csf.deny"
 CSF_CONF_FILE="$sandbox/csf.conf"
 CSF_TEMPIP_FILE="$sandbox/csf.tempip"
+CSF_ALLOW_FILE="$sandbox/csf.allow"
+CSF_IGNORE_FILE="$sandbox/csf.ignore"
 CSF_BIN="csf"
 CSF_CHAIN_DENY_SET="chain_DENY"
 CSF_PROMOTE_LOCK_FILE="$sandbox/policy.lock"
@@ -104,6 +108,14 @@ ipset() {
     return 1
 }
 
+ip() {
+    if [ "$*" = "-4 -o addr show" ]; then
+        printf '%s\n' '2: eth0    inet 192.0.2.2/24 brd 192.0.2.255 scope global eth0'
+        return 0
+    fi
+    return 1
+}
+
 eval "$function_blocks"
 
 # dc2-5 runs GNU awk 3.1.7, where interval quantifiers are disabled by
@@ -118,6 +130,8 @@ awk() {
 
 : > "$CSF_DENY_FILE"
 : > "$CSF_TEMPIP_FILE"
+: > "$CSF_ALLOW_FILE"
+: > "$CSF_IGNORE_FILE"
 : > "$IP_TRACKING_FILE"
 : > "$EVENT_LOG"
 : > "$HIGH_SET"
@@ -129,6 +143,36 @@ set -e
 [ "$missing_log_status" -ne 0 ] || fail "migration succeeded with an unreadable LFD log"
 printf '%s\n' "$missing_log_output" | grep -q 'Cannot read LFD log' ||
     fail "unreadable-log failure omitted the exact cause"
+
+cat > "$LFD_LOG_FILE" <<'EOF'
+Aug 22 05:59:59 host lfd[99]: 203.0.113.55 (US/Example/-) has 10 failures *Blocked in csf* [LF_DISTATTACK]
+EOF
+cat > "$CSF_ALLOW_FILE" <<'EOF'
+203.0.113.55 # trusted administrator
+EOF
+cat > "$CSF_DENY_FILE" <<'EOF'
+203.0.113.55 # stale distributed auth block
+EOF
+cat > "$CSF_TEMPIP_FILE" <<'EOF'
+203.0.113.55|1|123457|stale distributed auth
+EOF
+printf '%s\n' 203.0.113.55 > "$CHAIN_SET"
+: > "$IP_TRACKING_FILE"
+: > "$HIGH_SET"
+: > "$EVENT_LOG"
+
+protected_output=$(perform_migrate_lfd_distributed)
+! grep -Fqx '203.0.113.55' "$HIGH_SET" || fail "allowlisted LF_DISTATTACK source entered high_volume_bans"
+! awk '$1 == "203.0.113.55" { found=1 } END { exit !found }' "$IP_TRACKING_FILE" ||
+    fail "allowlisted LF_DISTATTACK source entered persistent tracking"
+grep -q '^203\.0\.113\.55 ' "$CSF_DENY_FILE" || fail "allowlisted CSF policy was changed"
+grep -q '^203\.0\.113\.55|' "$CSF_TEMPIP_FILE" || fail "allowlisted CSF history was changed"
+grep -Fqx '203.0.113.55' "$CHAIN_SET" || fail "allowlisted live CSF coverage was changed"
+printf '%s\n' "$protected_output" | grep -q 'skipped 1 protected source' ||
+    fail "protected-source skip was not reported"
+
+: > "$CSF_ALLOW_FILE"
+: > "$CSF_IGNORE_FILE"
 
 cat > "$LFD_LOG_FILE" <<'EOF'
 Aug 22 06:00:00 host lfd[100]: 203.0.113.10 (US/Example/-) has 10 failures *Blocked in csf* [LF_DISTATTACK]

@@ -131,13 +131,18 @@ cat > "$blacklist_sandbox/csf.allow" <<'EOF'
 203.0.113.77 # trusted management endpoint
 EOF
 
+cat > "$blacklist_sandbox/csf.ignore" <<'EOF'
+203.0.113.78 # trusted monitoring endpoint
+EOF
+
 CSF_ALLOW_FILE="$blacklist_sandbox/csf.allow"
+CSF_IGNORE_FILE="$blacklist_sandbox/csf.ignore"
 IP_SET_NAME="high_volume_bans"
 ensure_setup() { return 0; }
 ensure_live_ipset_capacity() { return 0; }
 validate_ip() { return 0; }
 ipset() {
-    fail "allowlisted blacklist request touched ipset"
+    fail "protected blacklist request touched ipset"
 }
 
 eval "$blacklist_block"
@@ -150,6 +155,16 @@ set -e
     fail "allowlisted blacklist request exited $allowlisted_status instead of 3"
 printf '%s\n' "$allowlisted_output" | grep -q 'csf -ar 203\.0\.113\.77' ||
     fail "allowlisted blacklist refusal did not provide the exact removal remedy"
+
+set +e
+ignored_output=$(perform_blacklist "203.0.113.78" "regression test" 2>&1)
+ignored_status=$?
+set -e
+
+[ "$ignored_status" -eq 3 ] ||
+    fail "ignored blacklist request exited $ignored_status instead of 3"
+printf '%s\n' "$ignored_output" | grep -q 'csf -ir 203\.0\.113\.78' ||
+    fail "ignored blacklist refusal did not provide the exact removal remedy"
 
 unset -f ensure_setup ensure_live_ipset_capacity validate_ip ipset perform_blacklist
 rm -rf "$blacklist_sandbox"

@@ -181,6 +181,7 @@ get_nameservers.sh --csv
 - Integrates with CSF firewall via `/etc/csf/csfpost.sh`
 - Replays the persistent tracking file automatically after every CSF rebuild
 - Excludes assigned local, `csf.allow`, and `csf.ignore` IPv4 addresses from replay
+- Refuses manual, batch, delegated, and LF_DISTATTACK migration bans for exact `csf.allow` or `csf.ignore` IPv4 entries
 - Preserves complete multiword signatures and scans each hard-linked cPanel log only once
 - Terminates existing connections when banning (requires conntrack-tools)
 - Supports safe ModSecurity `exec` bans through a no-argument CGI adapter
@@ -319,7 +320,7 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | `--reconcile-allowlist` | Remove exact local, `csf.allow`, and `csf.ignore` IPv4 addresses from live and tracked bans without a CSF reload |
 | `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
-| `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`) |
+| `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`); refuses exact `csf.allow` and `csf.ignore` entries |
 | `--blacklist-file FILE|- [MSG]` | Preflight and deduplicate a file or stdin list, then process every IPv4 address through the guarded blacklist path |
 | `--unblacklist IP [MSG]` | Remove an exact IP from `high_volume_bans` and its tracking file without adding it to `csf.allow` or changing independent CSF deny policy |
 | `--check-ip IP` | Report exact live ipset, tracking, CSF deny, parent `/24`, and CSF allow coverage without mutation |

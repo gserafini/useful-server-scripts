@@ -5,6 +5,7 @@
 - Preserve complete multiword attack signatures during log scanning, preventing legitimate substrings such as Jetpack's `grunion.css` from matching the `union select` detector.
 - Deduplicate cPanel log aliases by device/inode so hard-linked domlogs cannot multiply one request into a threshold-crossing violation count.
 - Make exact local, `csf.allow`, and `csf.ignore` IPv4 entries authoritative over `high_volume_bans` during scans and rebuilds, with a restart-free `--reconcile-allowlist` repair command.
+- Reject exact `csf.allow` and `csf.ignore` entries at the central manual/batch blacklist boundary and the LF_DISTATTACK migration path so delegated callers cannot recreate protected bans.
 
 ## 2026-09-13
 

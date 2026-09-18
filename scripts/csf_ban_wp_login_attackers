@@ -786,15 +786,18 @@ perform_migrate_lfd_distributed() {
     local tempip_backup_file=""
     local policy_temp=""
     local tempip_temp=""
+    local protected_ip_file=""
     local deny_limit
     local final_count
     local headroom
     local has_tempip=0
     local ip
     local collected_output
+    local protected_skipped_count=0
     local tracked_added=0
     local removed_count=0
     local -a candidates=()
+    local -a filtered_candidates=()
     local -a removable_ips=()
 
     if [ ! -f "$CSF_DENY_FILE" ] || [ ! -f "$CSF_CONF_FILE" ]; then
@@ -813,6 +816,31 @@ perform_migrate_lfd_distributed() {
     fi
     if [ "${#candidates[@]}" -eq 0 ]; then
         echo "LF_DISTATTACK migration: no sources found in the last $LFD_MIGRATE_TAIL_LINES LFD log lines."
+        return 0
+    fi
+
+    protected_ip_file=$(mktemp "${TMPDIR:-/tmp}/lfd-migrate-protected.XXXXXX") || {
+        echo "ERROR: Could not create the protected IPv4 inventory."
+        return 1
+    }
+    if ! build_protected_ipv4_file "$protected_ip_file"; then
+        rm -f "$protected_ip_file"
+        echo "ERROR: Could not build the protected IPv4 inventory before LF_DISTATTACK migration."
+        return 1
+    fi
+    for ip in "${candidates[@]}"; do
+        if grep -Fqx "$ip" "$protected_ip_file"; then
+            protected_skipped_count=$((protected_skipped_count + 1))
+            continue
+        fi
+        filtered_candidates+=("$ip")
+    done
+    rm -f "$protected_ip_file"
+    protected_ip_file=""
+    candidates=("${filtered_candidates[@]}")
+
+    if [ "${#candidates[@]}" -eq 0 ]; then
+        echo "LF_DISTATTACK migration: skipped $protected_skipped_count protected source(s); no unprotected sources require migration."
         return 0
     fi
 
@@ -1649,9 +1677,16 @@ perform_blacklist() {
         return 1
     fi
 
-    if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_ALLOW_FILE"; then
+    if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_ALLOW_FILE" 2>/dev/null; then
         echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Refusing blacklist action."
         echo "If the allow entry is obsolete, run: csf -ar $ip"
+        echo "Then retry: $0 --blacklist $ip \"${message:-reason}\""
+        return 3
+    fi
+
+    if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_IGNORE_FILE" 2>/dev/null; then
+        echo "IP $ip is **IGNORED** in $CSF_IGNORE_FILE. Refusing blacklist action."
+        echo "If the ignore entry is obsolete, run: csf -ir $ip"
         echo "Then retry: $0 --blacklist $ip \"${message:-reason}\""
         return 3
     fi
