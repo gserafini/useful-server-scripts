@@ -793,6 +793,7 @@ perform_migrate_lfd_distributed() {
     local has_tempip=0
     local ip
     local collected_output
+    local filtered_candidate_count=0
     local protected_skipped_count=0
     local tracked_added=0
     local removed_count=0
@@ -834,15 +835,16 @@ perform_migrate_lfd_distributed() {
             continue
         fi
         filtered_candidates+=("$ip")
+        filtered_candidate_count=$((filtered_candidate_count + 1))
     done
     rm -f "$protected_ip_file"
     protected_ip_file=""
-    candidates=("${filtered_candidates[@]}")
 
-    if [ "${#candidates[@]}" -eq 0 ]; then
+    if [ "$filtered_candidate_count" -eq 0 ]; then
         echo "LF_DISTATTACK migration: skipped $protected_skipped_count protected source(s); no unprotected sources require migration."
         return 0
     fi
+    candidates=("${filtered_candidates[@]}")
 
     exec 9>"$CSF_PROMOTE_LOCK_FILE" || {
         echo "ERROR: Cannot open CSF policy lock $CSF_PROMOTE_LOCK_FILE."
