@@ -60,6 +60,18 @@ set -e
 printf '%s\n' "$invalid_output" | grep -q 'line 2' || fail "invalid batch did not report its source line"
 
 : > "$calls"
+printf '%s\n' '203.0.113.10\n198.51.100.20' > "$sandbox/escaped-newlines.txt"
+
+set +e
+escaped_output=$(perform_blacklist_file "$sandbox/escaped-newlines.txt" "escaped newline regression" 2>&1)
+escaped_status=$?
+set -e
+[ "$escaped_status" -ne 0 ] || fail "escaped-newline batch unexpectedly succeeded"
+[ ! -s "$calls" ] || fail "escaped-newline batch mutated firewall state before preflight completed"
+printf '%s\n' "$escaped_output" | grep -q 'real newline' || fail "escaped-newline error omitted the exact newline remedy"
+printf '%s\n' "$escaped_output" | grep -q 'quoted heredoc' || fail "escaped-newline error omitted the safe shell example"
+
+: > "$calls"
 cat > "$sandbox/partial.txt" <<'EOF'
 203.0.113.10
 203.0.113.99

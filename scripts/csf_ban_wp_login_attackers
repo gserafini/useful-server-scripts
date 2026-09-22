@@ -1812,7 +1812,15 @@ perform_blacklist_file() {
         [ -z "$entry" ] && continue
 
         if ! validate_ip "$entry"; then
-            echo "Error: Invalid IPv4 address at $source_file line $line_number: $entry" >&2
+            case "$entry" in
+                *'\n'*)
+                    echo "Error: Invalid IPv4 batch at $source_file line $line_number: literal \\n separators were supplied." >&2
+                    echo "Remedy: feed one IPv4 per real newline; from a shell, use a quoted heredoc with --blacklist-file - instead of JSON-escaped text." >&2
+                    ;;
+                *)
+                    echo "Error: Invalid IPv4 address at $source_file line $line_number: $entry" >&2
+                    ;;
+            esac
             invalid_count=$((invalid_count + 1))
             continue
         fi

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-22
+
+- Explain how to replace literal JSON-escaped `\n` separators with real newline-delimited input when `--blacklist-file` rejects a malformed batch.
+
 ## 2026-09-18
 
 - Restrict the Apache `AH01071` detector to the actual `Primary script unknown` missing-file message so ordinary PHP application errors cannot count as probes.
