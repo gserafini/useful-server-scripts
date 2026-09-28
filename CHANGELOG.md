@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-28
+
+- Preserve local and remote `high_volume_bans` membership and tracking reasons in WhitelistMyIP notification emails before allowlist reconciliation erases the transient deny evidence.
+- Validate the requested IPv4 address before running firewall evidence checks or sending the notification.
+
 ## 2026-09-22
 
 - Explain how to replace literal JSON-escaped `\n` separators with real newline-delimited input when `--blacklist-file` rejects a malformed batch.

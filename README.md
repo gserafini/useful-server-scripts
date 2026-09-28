@@ -515,6 +515,19 @@ Monitors a file using `inotify` and adds IPs to CSF whitelist when detected.
 
 Monitors for whitelist requests and processes them.
 
+#### whitelist_notify.sh
+
+Sends the owner a whitelist audit message after a WhitelistMyIP request. In
+addition to CSF deny files and external blocklists, it captures live and tracked
+`high_volume_bans` evidence on both hosting servers. This preserves the original
+automated-ban reason before the next allowlist reconciliation removes the
+trusted address from the auxiliary deny set.
+
+```bash
+sudo ./scripts/whitelist_notify.sh 203.0.113.10 "Client Name" \
+  "client@example.com" "example.com"
+```
+
 ---
 
 #### restart_sshd.sh
