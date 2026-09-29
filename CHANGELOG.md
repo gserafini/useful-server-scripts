@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-29
+
+- Queue a privacy-safe ClaudeGram server-operations investigation whenever WhitelistMyIP processes a client request, carrying the pre-reconciliation firewall evidence needed to explain the original block and eliminate false-positive detectors.
+- Collapse repeated requests for the same IP into one investigation over ten minutes and retain email as a fallback if wake delivery is unavailable.
+
 ## 2026-09-28
 
 - Preserve local and remote `high_volume_bans` membership and tracking reasons in WhitelistMyIP notification emails before allowlist reconciliation erases the transient deny evidence.

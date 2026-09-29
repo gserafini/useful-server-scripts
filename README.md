@@ -523,6 +523,14 @@ addition to CSF deny files and external blocklists, it captures live and tracked
 automated-ban reason before the next allowlist reconciliation removes the
 trusted address from the auxiliary deny set.
 
+The notifier also queues a ClaudeGram wake in the server-operations chat with
+the client name, site, IP, and captured block evidence. The wake asks the ops
+agent to reconstruct the original block, classify a false positive versus real
+abuse, fix a faulty detector when appropriate, and verify the allowlist and site
+health. Client email addresses are intentionally excluded from the wake prompt.
+Repeated requests for the same IP are collapsed into one investigation during a
+10-minute window, while the existing email remains as a delivery fallback.
+
 ```bash
 sudo ./scripts/whitelist_notify.sh 203.0.113.10 "Client Name" \
   "client@example.com" "example.com"

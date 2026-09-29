@@ -14,6 +14,15 @@ MAIL_BIN="${MAIL_BIN:-/bin/mail}"
 MAIL_TO="${MAIL_TO:-gserafini@gmail.com}"
 REMOTE_TARGET="${REMOTE_TARGET:-root@dc3-1.serafinihosting.com}"
 REMOTE_PORT="${REMOTE_PORT:-22022}"
+WAKE_SSH_BIN="${WAKE_SSH_BIN:-$SSH_BIN}"
+WAKE_TARGET="${WAKE_TARGET:-$REMOTE_TARGET}"
+WAKE_PORT="${WAKE_PORT:-$REMOTE_PORT}"
+WAKE_CHAT_ID="${WAKE_CHAT_ID:--5190961854}"
+WAKE_DELAY="${WAKE_DELAY:-10s}"
+WAKE_STATE_DIR="${WAKE_STATE_DIR:-/var/run/whitelist-notify}"
+WAKE_DEDUPE_SECONDS="${WAKE_DEDUPE_SECONDS:-600}"
+WAKE_ENABLED="${WAKE_ENABLED:-1}"
+FLOCK_BIN="${FLOCK_BIN:-flock}"
 
 validate_ipv4() {
     local ip=$1
@@ -45,6 +54,101 @@ exact_reason() {
             exit
         }
     ' "$file" 2>/dev/null
+}
+
+queue_claudegram_wake() {
+    local message=$1
+    local encoded
+    local lock_file
+    local now
+    local previous=0
+    local state_file
+    local state_tmp
+
+    [ "$WAKE_ENABLED" = "1" ] || return 0
+
+    if ! [[ $WAKE_CHAT_ID =~ ^-?[0-9]+$ ]]; then
+        echo "Warning: Invalid ClaudeGram wake chat ID: $WAKE_CHAT_ID" >&2
+        return 1
+    fi
+    if ! [[ $WAKE_DELAY =~ ^[0-9]+[smhd]$ ]]; then
+        echo "Warning: Invalid ClaudeGram wake delay: $WAKE_DELAY" >&2
+        return 1
+    fi
+    if ! [[ $WAKE_DEDUPE_SECONDS =~ ^[0-9]+$ ]]; then
+        echo "Warning: Invalid wake dedupe interval: $WAKE_DEDUPE_SECONDS" >&2
+        return 1
+    fi
+    if ! mkdir -p "$WAKE_STATE_DIR"; then
+        echo "Warning: Could not create wake state directory: $WAKE_STATE_DIR" >&2
+        return 1
+    fi
+
+    lock_file="$WAKE_STATE_DIR/.lock"
+    exec 9>"$lock_file" || {
+        echo "Warning: Could not open wake lock: $lock_file" >&2
+        return 1
+    }
+    if command -v "$FLOCK_BIN" >/dev/null 2>&1; then
+        "$FLOCK_BIN" -x 9 || {
+            echo "Warning: Could not acquire wake lock: $lock_file" >&2
+            return 1
+        }
+    fi
+
+    state_file="$WAKE_STATE_DIR/$IP"
+    now=$(date +%s)
+    if [ -f "$state_file" ]; then
+        read -r previous < "$state_file" || previous=0
+    fi
+    if [[ $previous =~ ^[0-9]+$ ]] &&
+        [ "$WAKE_DEDUPE_SECONDS" -gt 0 ] &&
+        [ "$((now - previous))" -lt "$WAKE_DEDUPE_SECONDS" ]; then
+        echo "ClaudeGram wake suppressed for duplicate whitelist request: $IP" >&2
+        return 0
+    fi
+
+    encoded=$(printf '%s' "$message" | base64 | tr -d '\n')
+    if ! "$WAKE_SSH_BIN" -p "$WAKE_PORT" "$WAKE_TARGET" bash -s -- \
+        "$encoded" "$WAKE_CHAT_ID" "$WAKE_DELAY" <<'REMOTE_WAKE'
+set -euo pipefail
+
+encoded=$1
+chat_id=$2
+delay=$3
+pending_dir=/root/claudegram/pending
+filename="whitelist-$(date +%s)-$$.json"
+temp_path="$pending_dir/.${filename}.tmp"
+final_path="$pending_dir/$filename"
+node_bin=$(command -v node)
+
+mkdir -p "$pending_dir"
+WAKE_MESSAGE_B64="$encoded" WAKE_CHAT_ID="$chat_id" WAKE_DELAY="$delay" \
+    "$node_bin" - "$temp_path" "$final_path" <<'NODE'
+const fs = require('fs');
+const tempPath = process.argv[2];
+const finalPath = process.argv[3];
+const payload = {
+  chatId: process.env.WAKE_CHAT_ID,
+  delay: process.env.WAKE_DELAY,
+  message: Buffer.from(process.env.WAKE_MESSAGE_B64, 'base64').toString('utf8'),
+};
+fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2), { mode: 0o600 });
+fs.renameSync(tempPath, finalPath);
+NODE
+REMOTE_WAKE
+    then
+        echo "Warning: Could not queue ClaudeGram whitelist investigation for $IP" >&2
+        return 1
+    fi
+
+    state_tmp="${state_file}.tmp.$$"
+    if printf '%s\n' "$now" > "$state_tmp"; then
+        mv -f "$state_tmp" "$state_file"
+    else
+        rm -f "$state_tmp"
+        echo "Warning: ClaudeGram wake queued but dedupe state could not be saved for $IP" >&2
+    fi
 }
 
 IP="${1:-}"
@@ -123,6 +227,7 @@ if command -v "$GEOIP_BIN" >/dev/null 2>&1; then
     GEOIP=${GEOIP:-Unknown}
 fi
 
+MAIL_STATUS=0
 {
     printf 'WhitelistMyIP.com Request\n'
     printf '============================\n\n'
@@ -140,4 +245,30 @@ fi
     printf '%s\n' "$REMOTE_EVIDENCE"
     printf '%s\n\n' '---------------------------------------'
     printf 'IP has been allowlisted on both servers.\n'
-} | "$MAIL_BIN" -s "[WhitelistMyIP.com] $IP unblocked for $NAME" "$MAIL_TO"
+} | "$MAIL_BIN" -s "[WhitelistMyIP.com] $IP unblocked for $NAME" "$MAIL_TO" || MAIL_STATUS=$?
+
+WAKE_MESSAGE=$(printf '%s\n' \
+    '[WhitelistMyIP client request]' \
+    "Client: $NAME" \
+    "Website: $WEBSITE" \
+    "IP: $IP" \
+    "GeoIP: $GEOIP" \
+    '' \
+    'Block evidence captured before allowlist reconciliation:' \
+    "dc2-5 CSF deny: ${LOCAL_CSF_REASON:-not found}" \
+    "dc2-5 high_volume_bans live: $LOCAL_HIGH_VOLUME_LIVE" \
+    "dc2-5 high_volume_bans tracking: ${LOCAL_TRACKING_REASON:-not found}" \
+    "dc2-5 external blocklists: ${LOCAL_BLOCKLISTS:-none}" \
+    "$REMOTE_EVIDENCE" \
+    '' \
+    'Investigate why this IP was blocked. Correlate the preserved reason with bounded current or rotated logs on the correct origin. Classify hostile activity versus a false positive. If it is a false positive, fix the underlying detector safely and verify the regression. Confirm the IP is allowlisted on both servers, absent from deny sets, and that the client site is healthy. Reply in this ops chat with a concise evidence-backed report. Do not expose the client email address or secret query parameters.')
+
+WAKE_STATUS=0
+queue_claudegram_wake "$WAKE_MESSAGE" || WAKE_STATUS=$?
+
+if [ "$MAIL_STATUS" -ne 0 ] && [ "$WAKE_STATUS" -ne 0 ]; then
+    echo "Error: Both email and ClaudeGram whitelist notifications failed for $IP" >&2
+    exit 1
+fi
+
+exit 0
