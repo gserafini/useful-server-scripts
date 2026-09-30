@@ -14,6 +14,8 @@ grep -q '^scan_log_file_list_for_keyword()' "$SCRIPT" || fail "missing unique lo
 grep -q '^extract_source_ipv4_from_matched_log_lines()' "$SCRIPT" || fail "missing source-IP extractor"
 grep -q 'gawk --re-interval' "$SCRIPT" || fail "source-IP extractor is not compatible with legacy GNU Awk"
 grep -q '^reconcile_protected_bans()' "$SCRIPT" || fail "missing allowlist reconciliation helper"
+grep -q '^ipv4_matches_policy_file()' "$SCRIPT" || fail "missing CIDR-aware protected-source matcher"
+grep -q '^filter_ipv4_records_against_policy()' "$SCRIPT" || fail "missing CIDR-aware protected-record filter"
 grep -q -- '--reconcile-allowlist' "$SCRIPT" || fail "missing explicit allowlist reconciliation command"
 
 keyword_block=$(sed -n '/^keyword_rule_pattern() {/,/^}/p' "$SCRIPT")
@@ -21,14 +23,20 @@ inventory_block=$(sed -n '/^build_unique_log_file_list() {/,/^}/p' "$SCRIPT")
 scan_block=$(sed -n '/^scan_log_file_list_for_keyword() {/,/^}/p' "$SCRIPT")
 source_ip_block=$(sed -n '/^extract_source_ipv4_from_matched_log_lines() {/,/^}/p' "$SCRIPT")
 protected_block=$(sed -n '/^build_protected_ipv4_file() {/,/^}/p' "$SCRIPT")
+policy_match_block=$(sed -n '/^ipv4_matches_policy_file() {/,/^}/p' "$SCRIPT")
+policy_filter_block=$(sed -n '/^filter_ipv4_records_against_policy() {/,/^}/p' "$SCRIPT")
 reconcile_block=$(sed -n '/^reconcile_protected_bans() {/,/^}/p' "$SCRIPT")
+blacklist_block=$(sed -n '/^perform_blacklist() {/,/^}/p' "$SCRIPT")
 
 eval "$keyword_block"
 eval "$inventory_block"
 eval "$scan_block"
 eval "$source_ip_block"
 eval "$protected_block"
+eval "$policy_match_block"
+eval "$policy_filter_block"
 eval "$reconcile_block"
+eval "$blacklist_block"
 
 [ "$(keyword_rule_pattern '1 union select')" = 'union select' ] ||
     fail "multiword signature was truncated"
@@ -111,7 +119,7 @@ cat > "$IP_TRACKING_FILE" <<'EOF'
 10.20.30.40 # stale local self-ban
 EOF
 printf '%s\n' '73.25.161.125 # Pam via WhiteListMyIP' > "$CSF_ALLOW_FILE"
-printf '%s\n' '192.0.2.10 # trusted monitoring' > "$CSF_IGNORE_FILE"
+printf '%s\n' '192.0.2.0/24 # trusted reverse-proxy network' > "$CSF_IGNORE_FILE"
 
 ip() {
     printf '%s\n' '2: eth0    inet 10.20.30.40/24 brd 10.20.30.255 scope global eth0'
@@ -121,6 +129,46 @@ ipset() {
     printf '%s\n' "$*" >> "$calls"
     return 0
 }
+
+policy_file="$sandbox/protected-policy.txt"
+build_protected_ipv4_file "$policy_file"
+grep -Fqx '192.0.2.0/24' "$policy_file" ||
+    fail "CIDR entry from csf.ignore was omitted from protected policy"
+ipv4_matches_policy_file '192.0.2.10' "$policy_file" ||
+    fail "IP inside protected CIDR did not match policy"
+if ipv4_matches_policy_file '198.51.100.20' "$policy_file"; then
+    fail "unrelated IP falsely matched protected CIDR"
+fi
+
+cat > "$sandbox/candidates.tsv" <<'EOF'
+192.0.2.11	8	shared proxy probe
+198.51.100.21	8	real scanner
+EOF
+filter_ipv4_records_against_policy \
+    "$policy_file" \
+    "$sandbox/candidates.tsv" \
+    "$sandbox/unprotected.tsv" \
+    "$sandbox/protected.tsv"
+grep -q '^198\.51\.100\.21' "$sandbox/unprotected.tsv" ||
+    fail "unprotected candidate was removed by CIDR filter"
+if grep -q '^192\.0\.2\.11' "$sandbox/unprotected.tsv"; then
+    fail "protected CIDR candidate survived CIDR filter"
+fi
+grep -q '^192\.0\.2\.11' "$sandbox/protected.tsv" ||
+    fail "CIDR filter did not report the protected candidate"
+
+ensure_setup() { :; }
+ensure_live_ipset_capacity() { :; }
+validate_ip() { return 0; }
+if blacklist_output=$(perform_blacklist '192.0.2.44' 'must stay trusted' 2>&1); then
+    fail "manual blacklist accepted an IP covered by csf.ignore CIDR"
+else
+    blacklist_status=$?
+fi
+[ "$blacklist_status" -eq 3 ] ||
+    fail "CIDR-protected blacklist returned $blacklist_status instead of policy-refusal status 3"
+grep -q 'protected by a local/csf.allow/csf.ignore IPv4 policy' <<< "$blacklist_output" ||
+    fail "manual blacklist did not explain the CIDR policy refusal"
 
 reconcile_output=$(reconcile_protected_bans)
 
@@ -135,10 +183,10 @@ reconcile_output=$(reconcile_protected_bans)
 grep -Fqx 'del test_bans 73.25.161.125 -exist' "$calls" ||
     fail "allowlisted IP was not removed from the live set"
 grep -Fqx 'del test_bans 192.0.2.10 -exist' "$calls" ||
-    fail "ignored IP was not removed from the live set"
+    fail "IP covered by ignored CIDR was not removed from the live set"
 grep -Fqx 'del test_bans 10.20.30.40 -exist' "$calls" ||
     fail "local IP was not removed from the live set"
 grep -q 'Removed 4 protected tracking entries' <<< "$reconcile_output" ||
     fail "reconciliation summary did not report every removed entry"
 
-echo "PASS: precise signatures, one-source-per-event counting, unique logs, and allowlist reconciliation prevent false-positive bans"
+echo "PASS: precise signatures, one-source-per-event counting, unique logs, and CIDR-aware allowlist reconciliation prevent false-positive bans"

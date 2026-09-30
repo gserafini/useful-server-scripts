@@ -16,6 +16,8 @@ printf '%s\n' "$setup_block" | grep -q 'CSF_REBUILD_LINE' || fail "setup check d
 
 repopulate_block=$(sed -n '/^repopulate_ipset_from_tracking_file() {/,/^}/p' "$SCRIPT")
 protected_block=$(sed -n '/^build_protected_ipv4_file() {/,/^}/p' "$SCRIPT")
+policy_match_block=$(sed -n '/^ipv4_matches_policy_file() {/,/^}/p' "$SCRIPT")
+policy_filter_block=$(sed -n '/^filter_ipv4_records_against_policy() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$protected_block" | grep -q 'ip -4 -o addr show' || fail "rebuild protection does not discover local addresses"
 printf '%s\n' "$protected_block" | grep -q 'CSF_ALLOW_FILE' || fail "rebuild protection does not load csf.allow"
 printf '%s\n' "$protected_block" | grep -q 'CSF_IGNORE_FILE' || fail "rebuild protection does not load csf.ignore"
@@ -33,7 +35,7 @@ cat > "$sandbox/tracking.log" <<'EOF'
 999.0.0.1 # malformed source
 EOF
 printf '%s\n' '192.0.2.50 # trusted client' > "$sandbox/csf.allow"
-printf '%s\n' '192.0.2.60 # trusted monitor' > "$sandbox/csf.ignore"
+printf '%s\n' '192.0.2.0/24 # trusted proxy range' > "$sandbox/csf.ignore"
 
 IP_SET_NAME="high_volume_bans"
 IP_TRACKING_FILE="$sandbox/tracking.log"
@@ -60,6 +62,8 @@ ipset() {
 }
 
 eval "$protected_block"
+eval "$policy_match_block"
+eval "$policy_filter_block"
 eval "$repopulate_block"
 rebuild_output=$(repopulate_ipset_from_tracking_file)
 
@@ -121,8 +125,8 @@ printf '%s\n' "$persistence_block" | grep -q 'CSF_POST_FILE' || fail "capacity p
 
 blacklist_block=$(sed -n '/^perform_blacklist() {/,/^}/p' "$SCRIPT")
 printf '%s\n' "$blacklist_block" | grep -q 'ensure_live_ipset_capacity' || fail "blacklist does not repair undersized live sets"
-printf '%s\n' "$blacklist_block" | grep -q 'awk -v target="\$ip"' ||
-    fail "blacklist allow check does not use exact first-field matching"
+printf '%s\n' "$blacklist_block" | grep -q 'ipv4_matches_policy_file' ||
+    fail "blacklist allow check is not CIDR-aware"
 
 blacklist_sandbox=$(mktemp -d)
 trap 'rm -rf "$blacklist_sandbox"' EXIT
@@ -132,7 +136,7 @@ cat > "$blacklist_sandbox/csf.allow" <<'EOF'
 EOF
 
 cat > "$blacklist_sandbox/csf.ignore" <<'EOF'
-203.0.113.78 # trusted monitoring endpoint
+203.0.113.0/24 # trusted reverse-proxy range
 EOF
 
 CSF_ALLOW_FILE="$blacklist_sandbox/csf.allow"
@@ -153,8 +157,8 @@ set -e
 
 [ "$allowlisted_status" -eq 3 ] ||
     fail "allowlisted blacklist request exited $allowlisted_status instead of 3"
-printf '%s\n' "$allowlisted_output" | grep -q 'csf -ar 203\.0\.113\.77' ||
-    fail "allowlisted blacklist refusal did not provide the exact removal remedy"
+printf '%s\n' "$allowlisted_output" | grep -q 'protected by a local/csf.allow/csf.ignore IPv4 policy' ||
+    fail "allowlisted blacklist refusal did not explain the trust-policy match"
 
 set +e
 ignored_output=$(perform_blacklist "203.0.113.78" "regression test" 2>&1)
@@ -163,8 +167,8 @@ set -e
 
 [ "$ignored_status" -eq 3 ] ||
     fail "ignored blacklist request exited $ignored_status instead of 3"
-printf '%s\n' "$ignored_output" | grep -q 'csf -ir 203\.0\.113\.78' ||
-    fail "ignored blacklist refusal did not provide the exact removal remedy"
+printf '%s\n' "$ignored_output" | grep -q 'protected by a local/csf.allow/csf.ignore IPv4 policy' ||
+    fail "CIDR-ignored blacklist refusal did not explain the trust-policy match"
 
 unset -f ensure_setup ensure_live_ipset_capacity validate_ip ipset perform_blacklist
 rm -rf "$blacklist_sandbox"

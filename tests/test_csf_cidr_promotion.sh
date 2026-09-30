@@ -12,6 +12,7 @@ for function_name in \
     validate_ipv4_24_cidr \
     get_csf_deny_limit \
     count_active_csf_deny_entries \
+    report_ban_counts \
     list_covered_csf_children \
     rollback_csf_cidr_promotion \
     perform_promote_cidr
@@ -27,6 +28,7 @@ for function_name in \
     validate_ipv4_24_cidr \
     get_csf_deny_limit \
     count_active_csf_deny_entries \
+    report_ban_counts \
     list_covered_csf_children \
     rollback_csf_cidr_promotion \
     perform_promote_cidr
@@ -46,6 +48,14 @@ CSF_CHAIN_DENY_SET="chain_DENY"
 CSF_PROMOTE_LOCK_FILE="$sandbox/promote.lock"
 EVENT_LOG="$sandbox/events.log"
 LIVE_SET="$sandbox/live-set"
+IP_SET_NAME="high_volume_bans"
+IP_TRACKING_FILE="$sandbox/tracking.log"
+CSF_ALLOW_FILE="$sandbox/csf.allow"
+MAX_BANS=250000
+MAX_PERMANENT_BANS=5000
+START_TIME=0
+: > "$IP_TRACKING_FILE"
+: > "$CSF_ALLOW_FILE"
 
 cat > "$CSF_CONF_FILE" <<'EOF'
 DENY_IP_LIMIT = "3"
@@ -111,6 +121,14 @@ Include /etc/csf/csf.deny.d/external
 EOF
 [ "$(count_active_csf_deny_entries)" -eq 1 ] ||
     fail "capacity accounting does not match CSF's DENY_IP_LIMIT behavior"
+
+cat > "$CSF_DENY_FILE" <<'EOF'
+  203.0.113.10 # valid leading-whitespace entry
+198.51.100.9 # ordinary entry
+EOF
+report_output=$(report_ban_counts "Count Regression")
+printf '%s\n' "$report_output" | grep -q "Total IPs in CSF Deny File '$CSF_DENY_FILE': 2" ||
+    fail "action report undercounted leading-whitespace CSF deny entries"
 
 cat > "$CSF_DENY_FILE" <<'EOF'
 203.0.113.10 # first child

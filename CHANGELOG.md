@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-30
+
+- Treat IPv4 CIDRs in `csf.allow` and `csf.ignore` as authoritative trust policy across automated scans, manual and batch blacklists, LF_DISTATTACK migration, reconciliation, and live-set rebuilds.
+- Remove already tracked addresses covered by trusted CIDRs from `high_volume_bans`, preventing shared reverse-proxy ranges such as Cloudflare from becoming persistent false-positive blocks.
+- Report CSF deny usage with the same active-entry accounting as the capacity guard, including valid leading-whitespace entries.
+
 ## 2026-09-29
 
 - Queue a privacy-safe ClaudeGram server-operations investigation whenever WhitelistMyIP processes a client request, carrying the pre-reconciliation firewall evidence needed to explain the original block and eliminate false-positive detectors.

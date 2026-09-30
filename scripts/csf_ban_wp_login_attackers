@@ -121,6 +121,9 @@ TEMP_TRACKING_FILE=""
 TEMP_GEOIP_MAPPING=""
 TEMP_CACHE_EXTRACTION=""
 TEMP_LOG_FILE_LIST=""
+TEMP_PROTECTED_POLICY=""
+TEMP_FILTERED_UNIQUE_IPS=""
+TEMP_PROTECTED_CANDIDATES=""
 
 # --- TIMING VARIABLE ---
 START_TIME_CMD=$(date +%s)
@@ -253,9 +256,9 @@ extract_source_ipv4_from_matched_log_lines() {
     '
 }
 
-# Write exact protected IPv4 addresses: loopback, every address assigned to the
-# host, and exact first-field entries from csf.allow/csf.ignore. CIDRs and CSF
-# advanced-rule syntax are intentionally excluded from exact ipset cleanup.
+# Write protected IPv4 policy entries: loopback, every address assigned to the
+# host, and exact IPv4/CIDR first-field entries from csf.allow/csf.ignore. CSF
+# advanced-rule syntax is intentionally excluded.
 build_protected_ipv4_file() {
     local output_file="$1"
 
@@ -272,9 +275,122 @@ build_protected_ipv4_file() {
                 return 1
             }
             /^[[:space:]]*($|#)/ { next }
-            valid_ipv4($1) { print $1 }
+            {
+                entry = $1
+                if (valid_ipv4(entry)) {
+                    print entry
+                    next
+                }
+                if (entry ~ /^[0-9.]+\/[0-9]+$/) {
+                    split(entry, cidr, "/")
+                    if (valid_ipv4(cidr[1]) && cidr[2] ~ /^[0-9]+$/ && cidr[2] >= 0 && cidr[2] <= 32) {
+                        print cidr[1] "/" (cidr[2] + 0)
+                    }
+                }
+            }
         ' "$CSF_ALLOW_FILE" "$CSF_IGNORE_FILE" 2>/dev/null
     } | sort -u > "$output_file"
+}
+
+# Return success when an exact IPv4 is covered by an exact or CIDR policy entry.
+# IPv4 values fit exactly within awk's integer-safe numeric range.
+ipv4_matches_policy_file() {
+    local ip="$1"
+    local policy_file="$2"
+
+    gawk -v target="$ip" '
+        function valid_ipv4(ip, parts, count, i) {
+            count = split(ip, parts, ".")
+            if (count != 4) return 0
+            for (i = 1; i <= 4; i++) {
+                if (parts[i] !~ /^[0-9]+$/ || parts[i] < 0 || parts[i] > 255) return 0
+            }
+            return 1
+        }
+        function ipv4_number(ip, parts) {
+            split(ip, parts, ".")
+            return parts[1] * 16777216 + parts[2] * 65536 + parts[3] * 256 + parts[4]
+        }
+        BEGIN {
+            target_number = ipv4_number(target)
+        }
+        {
+            entry = $1
+            if (entry == target) {
+                matched = 1
+                next
+            }
+            if (entry ~ /^[0-9.]+\/[0-9]+$/) {
+                split(entry, cidr, "/")
+                prefix = cidr[2] + 0
+                if (valid_ipv4(cidr[1]) && prefix >= 0 && prefix <= 32) {
+                    block_size = 2 ^ (32 - prefix)
+                    if (int(target_number / block_size) == int(ipv4_number(cidr[1]) / block_size)) {
+                        matched = 1
+                    }
+                }
+            }
+        }
+        END { exit matched ? 0 : 1 }
+    ' "$policy_file"
+}
+
+# Preserve full input records while splitting them into protected and
+# unprotected outputs according to an exact/CIDR policy inventory.
+filter_ipv4_records_against_policy() {
+    local policy_file="$1"
+    local input_file="$2"
+    local unprotected_file="$3"
+    local protected_file="$4"
+
+    : > "$unprotected_file"
+    : > "$protected_file"
+    gawk -v unprotected_file="$unprotected_file" -v protected_file="$protected_file" '
+        function valid_ipv4(ip, parts, count, i) {
+            count = split(ip, parts, ".")
+            if (count != 4) return 0
+            for (i = 1; i <= 4; i++) {
+                if (parts[i] !~ /^[0-9]+$/ || parts[i] < 0 || parts[i] > 255) return 0
+            }
+            return 1
+        }
+        function ipv4_number(ip, parts) {
+            split(ip, parts, ".")
+            return parts[1] * 16777216 + parts[2] * 65536 + parts[3] * 256 + parts[4]
+        }
+        function add_policy(entry, cidr, prefix) {
+            if (valid_ipv4(entry)) {
+                exact[entry] = 1
+                return
+            }
+            if (entry ~ /^[0-9.]+\/[0-9]+$/) {
+                split(entry, cidr, "/")
+                prefix = cidr[2] + 0
+                if (valid_ipv4(cidr[1]) && prefix >= 0 && prefix <= 32) {
+                    cidr_count++
+                    cidr_base[cidr_count] = ipv4_number(cidr[1])
+                    cidr_block[cidr_count] = 2 ^ (32 - prefix)
+                }
+            }
+        }
+        function is_protected(ip, number, i) {
+            if (ip in exact) return 1
+            if (!valid_ipv4(ip)) return 0
+            number = ipv4_number(ip)
+            for (i = 1; i <= cidr_count; i++) {
+                if (int(number / cidr_block[i]) == int(cidr_base[i] / cidr_block[i])) return 1
+            }
+            return 0
+        }
+        NR == FNR {
+            add_policy($1)
+            next
+        }
+        {
+            if (is_protected($1)) print $0 > protected_file
+            else print $0 > unprotected_file
+        }
+    ' "$policy_file" "$input_file"
 }
 
 # Make CSF trust policy authoritative over this auxiliary deny set. This is
@@ -282,6 +398,7 @@ build_protected_ipv4_file() {
 # the atomic tracking rewrite prevents a later CSF rebuild from restoring them.
 reconcile_protected_bans() {
     local protected_ip_file
+    local protected_record_file
     local cleaned_tracking_file
     local protected_ip
     local before_count
@@ -289,29 +406,46 @@ reconcile_protected_bans() {
     local removed_count
 
     protected_ip_file=$(mktemp /tmp/high_volume_protected_ips.XXXXXX) || return 1
-    cleaned_tracking_file=$(mktemp "${IP_TRACKING_FILE}.reconcile.XXXXXX") || {
+    protected_record_file=$(mktemp /tmp/high_volume_protected_records.XXXXXX) || {
         rm -f "$protected_ip_file"
+        return 1
+    }
+    cleaned_tracking_file=$(mktemp "${IP_TRACKING_FILE}.reconcile.XXXXXX") || {
+        rm -f "$protected_ip_file" "$protected_record_file"
         return 1
     }
 
     if ! build_protected_ipv4_file "$protected_ip_file"; then
-        rm -f "$protected_ip_file" "$cleaned_tracking_file"
+        rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
         echo "ERROR: Could not build the protected IPv4 inventory."
+        return 1
+    fi
+
+    if ! filter_ipv4_records_against_policy \
+        "$protected_ip_file" \
+        "$IP_TRACKING_FILE" \
+        "$cleaned_tracking_file" \
+        "$protected_record_file"; then
+        rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
+        echo "ERROR: Could not reconcile protected IPv4 policy with $IP_TRACKING_FILE."
         return 1
     fi
 
     while IFS= read -r protected_ip; do
         [ -z "$protected_ip" ] && continue
         if ! ipset del "$IP_SET_NAME" "$protected_ip" -exist >/dev/null 2>&1; then
-            rm -f "$protected_ip_file" "$cleaned_tracking_file"
+            rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
             echo "ERROR: Could not remove protected IP $protected_ip from $IP_SET_NAME."
             return 1
         fi
-    done < "$protected_ip_file"
+    done < <(
+        {
+            awk '$1 !~ /\// { print $1 }' "$protected_ip_file"
+            awk '{ print $1 }' "$protected_record_file"
+        } | sort -u
+    )
 
     before_count=$(wc -l < "$IP_TRACKING_FILE")
-    awk 'NR == FNR { protected[$1] = 1; next } !($1 in protected)' \
-        "$protected_ip_file" "$IP_TRACKING_FILE" > "$cleaned_tracking_file"
     after_count=$(wc -l < "$cleaned_tracking_file")
     removed_count=$((before_count - after_count))
 
@@ -319,7 +453,7 @@ reconcile_protected_bans() {
         chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
         chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
         if ! mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"; then
-            rm -f "$protected_ip_file" "$cleaned_tracking_file"
+            rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
             echo "ERROR: Could not atomically reconcile $IP_TRACKING_FILE."
             return 1
         fi
@@ -327,7 +461,7 @@ reconcile_protected_bans() {
         rm -f "$cleaned_tracking_file"
     fi
 
-    rm -f "$protected_ip_file"
+    rm -f "$protected_ip_file" "$protected_record_file"
     echo "Removed $removed_count protected tracking entries and cleared protected IPs from $IP_SET_NAME."
 }
 
@@ -865,7 +999,7 @@ perform_migrate_lfd_distributed() {
         return 1
     fi
     for ip in "${candidates[@]}"; do
-        if grep -Fqx "$ip" "$protected_ip_file"; then
+        if ipv4_matches_policy_file "$ip" "$protected_ip_file"; then
             protected_skipped_count=$((protected_skipped_count + 1))
             continue
         fi
@@ -1245,7 +1379,7 @@ report_ban_counts() {
     permanent_ban_count=${permanent_ban_count:-0}
 
     local csf_deny_count
-    csf_deny_count=$(grep -cE '^[0-9]' "$CSF_DENY_FILE" 2>/dev/null)
+    csf_deny_count=$(count_active_csf_deny_entries 2>/dev/null)
     csf_deny_count=${csf_deny_count:-0}
 
     local csf_allow_count
@@ -1278,6 +1412,8 @@ report_ban_counts() {
 # empty even though the tracking file still contains the intended bans.
 repopulate_ipset_from_tracking_file() {
     local protected_ip_file
+    local protected_record_file
+    local unprotected_tracking_file
     local protected_ip
     local restore_file
     local stats_file
@@ -1297,27 +1433,51 @@ repopulate_ipset_from_tracking_file() {
     fi
 
     protected_ip_file=$(mktemp /tmp/high_volume_rebuild_protected_ips.XXXXXX) || return 1
-    restore_file=$(mktemp /tmp/high_volume_rebuild_restore.XXXXXX) || {
+    protected_record_file=$(mktemp /tmp/high_volume_rebuild_protected_records.XXXXXX) || {
         rm -f "$protected_ip_file"
         return 1
     }
+    unprotected_tracking_file=$(mktemp /tmp/high_volume_rebuild_unprotected.XXXXXX) || {
+        rm -f "$protected_ip_file" "$protected_record_file"
+        return 1
+    }
+    restore_file=$(mktemp /tmp/high_volume_rebuild_restore.XXXXXX) || {
+        rm -f "$protected_ip_file" "$protected_record_file" "$unprotected_tracking_file"
+        return 1
+    }
     stats_file=$(mktemp /tmp/high_volume_rebuild_stats.XXXXXX) || {
-        rm -f "$protected_ip_file" "$restore_file"
+        rm -f "$protected_ip_file" "$protected_record_file" "$unprotected_tracking_file" "$restore_file"
         return 1
     }
 
     if ! build_protected_ipv4_file "$protected_ip_file" || [ ! -s "$protected_ip_file" ]; then
         echo "ERROR: Could not build the protected IPv4 inventory before rebuilding '$IP_SET_NAME'."
-        rm -f "$protected_ip_file" "$restore_file" "$stats_file"
+        rm -f "$protected_ip_file" "$protected_record_file" "$unprotected_tracking_file" "$restore_file" "$stats_file"
         return 1
     fi
+
+    if ! filter_ipv4_records_against_policy \
+        "$protected_ip_file" \
+        "$IP_TRACKING_FILE" \
+        "$unprotected_tracking_file" \
+        "$protected_record_file"; then
+        echo "ERROR: Could not filter protected IPv4 entries before rebuilding '$IP_SET_NAME'."
+        rm -f "$protected_ip_file" "$protected_record_file" "$unprotected_tracking_file" "$restore_file" "$stats_file"
+        return 1
+    fi
+    protected_skipped_count=$(wc -l < "$protected_record_file")
 
     while IFS= read -r protected_ip; do
         [ -z "$protected_ip" ] && continue
         ipset del "$IP_SET_NAME" "$protected_ip" -exist >/dev/null 2>&1 || true
-    done < "$protected_ip_file"
+    done < <(
+        {
+            awk '$1 !~ /\// { print $1 }' "$protected_ip_file"
+            awk '{ print $1 }' "$protected_record_file"
+        } | sort -u
+    )
 
-    awk -v set_name="$IP_SET_NAME" -v stats_file="$stats_file" '
+    awk -v set_name="$IP_SET_NAME" -v stats_file="$stats_file" -v protected_count="$protected_skipped_count" '
         function valid_ipv4(ip, parts, count, i) {
             count = split(ip, parts, ".")
             if (count != 4) return 0
@@ -1326,10 +1486,6 @@ repopulate_ipset_from_tracking_file() {
             }
             return 1
         }
-        NR == FNR {
-            protected[$1] = 1
-            next
-        }
         NF {
             ip = $1
             if (!valid_ipv4(ip)) {
@@ -1337,19 +1493,15 @@ repopulate_ipset_from_tracking_file() {
                 next
             }
             tracked++
-            if (ip in protected) {
-                protected_skipped++
-                next
-            }
             if (!seen[ip]++) {
                 print "add " set_name " " ip " -exist"
                 restored++
             }
         }
         END {
-            print tracked + 0, restored + 0, malformed + 0, protected_skipped + 0 > stats_file
+            print tracked + protected_count, restored + 0, malformed + 0, protected_count + 0 > stats_file
         }
-    ' "$protected_ip_file" "$IP_TRACKING_FILE" > "$restore_file"
+    ' "$unprotected_tracking_file" > "$restore_file"
 
     read -r tracked_count restored_count skipped_count protected_skipped_count < "$stats_file"
 
@@ -1357,11 +1509,11 @@ repopulate_ipset_from_tracking_file() {
     if [ -s "$restore_file" ] && ! ipset restore < "$restore_file"; then
         echo "ERROR: Bulk restore into '$IP_SET_NAME' failed."
         echo "Remedy: run '$0 --resize-live-set $MAX_BANS' and retry the rebuild."
-        rm -f "$protected_ip_file" "$restore_file" "$stats_file"
+        rm -f "$protected_ip_file" "$protected_record_file" "$unprotected_tracking_file" "$restore_file" "$stats_file"
         return 1
     fi
 
-    rm -f "$protected_ip_file" "$restore_file" "$stats_file"
+    rm -f "$protected_ip_file" "$protected_record_file" "$unprotected_tracking_file" "$restore_file" "$stats_file"
 
     echo "Repopulated $restored_count unique tracked IPs into '$IP_SET_NAME' from $tracked_count valid tracking entries."
     if [ "$skipped_count" -gt 0 ]; then
@@ -1700,6 +1852,7 @@ perform_blacklist() {
     ensure_live_ipset_capacity || return 1
     local ip="$1"
     local message="$2"
+    local protected_ip_file
     
     local timestamp_cmd
     timestamp_cmd=$(date "+%Y-%m-%d %H:%M:%S")
@@ -1714,19 +1867,20 @@ perform_blacklist() {
         return 1
     fi
 
-    if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_ALLOW_FILE" 2>/dev/null; then
-        echo "IP $ip is **WHITELISTED** in $CSF_ALLOW_FILE. Refusing blacklist action."
-        echo "If the allow entry is obsolete, run: csf -ar $ip"
+    protected_ip_file=$(mktemp /tmp/high_volume_blacklist_policy.XXXXXX) || return 1
+    if ! build_protected_ipv4_file "$protected_ip_file"; then
+        rm -f "$protected_ip_file"
+        echo "ERROR: Could not build protected IPv4 policy before blacklist action."
+        return 1
+    fi
+    if ipv4_matches_policy_file "$ip" "$protected_ip_file"; then
+        rm -f "$protected_ip_file"
+        echo "IP $ip is protected by a local/csf.allow/csf.ignore IPv4 policy. Refusing blacklist action."
+        echo "If the trust entry or range is obsolete, remove it from CSF policy first."
         echo "Then retry: $0 --blacklist $ip \"${message:-reason}\""
         return 3
     fi
-
-    if awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$CSF_IGNORE_FILE" 2>/dev/null; then
-        echo "IP $ip is **IGNORED** in $CSF_IGNORE_FILE. Refusing blacklist action."
-        echo "If the ignore entry is obsolete, run: csf -ir $ip"
-        echo "Then retry: $0 --blacklist $ip \"${message:-reason}\""
-        return 3
-    fi
+    rm -f "$protected_ip_file"
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
         echo "IP $ip is already in ipset: $IP_SET_NAME. Refreshing live-session teardown."
@@ -2101,6 +2255,7 @@ perform_init() {
     echo "6. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
     ensure_live_ipset_capacity || exit 1
+    reconcile_protected_bans || exit 1
     repopulate_ipset_from_tracking_file || exit 1
     
     echo "Initialization complete. The system is ready for the high-volume ban script to run."
@@ -2177,6 +2332,7 @@ perform_rebuild_live_set() {
     ensure_setup
     echo "--- 🔄 Rebuild Live IPSET Action ---"
     ensure_live_ipset_capacity || exit 1
+    reconcile_protected_bans || exit 1
     repopulate_ipset_from_tracking_file || exit 1
     local end_time_cmd
     end_time_cmd=$(date +%s)
@@ -3753,6 +3909,9 @@ cleanup_temp_files() {
     [ -n "$TEMP_GEOIP_MAPPING" ] && [ -f "$TEMP_GEOIP_MAPPING" ] && rm -f "$TEMP_GEOIP_MAPPING"
     [ -n "$TEMP_CACHE_EXTRACTION" ] && [ -f "$TEMP_CACHE_EXTRACTION" ] && rm -f "$TEMP_CACHE_EXTRACTION"
     [ -n "$TEMP_LOG_FILE_LIST" ] && [ -f "$TEMP_LOG_FILE_LIST" ] && rm -f "$TEMP_LOG_FILE_LIST"
+    [ -n "$TEMP_PROTECTED_POLICY" ] && [ -f "$TEMP_PROTECTED_POLICY" ] && rm -f "$TEMP_PROTECTED_POLICY"
+    [ -n "$TEMP_FILTERED_UNIQUE_IPS" ] && [ -f "$TEMP_FILTERED_UNIQUE_IPS" ] && rm -f "$TEMP_FILTERED_UNIQUE_IPS"
+    [ -n "$TEMP_PROTECTED_CANDIDATES" ] && [ -f "$TEMP_PROTECTED_CANDIDATES" ] && rm -f "$TEMP_PROTECTED_CANDIDATES"
 }
 
 trap cleanup_temp_files EXIT
@@ -3898,6 +4057,35 @@ END {
         }
     } 
 }' "$TEMP_AGGREGATE_FILE" > "$TEMP_UNIQUE_IPS"
+
+# Enforce exact and CIDR trust policy before GeoIP work or final insertion.
+# The proactive reconciliation above removes old conflicts; this filter keeps
+# the current scan from immediately recreating them.
+TEMP_PROTECTED_POLICY=$(mktemp)
+TEMP_FILTERED_UNIQUE_IPS=$(mktemp)
+TEMP_PROTECTED_CANDIDATES=$(mktemp)
+if ! build_protected_ipv4_file "$TEMP_PROTECTED_POLICY"; then
+    echo "ERROR: Could not build protected IPv4 policy before candidate filtering." >&2
+    exit 1
+fi
+if ! filter_ipv4_records_against_policy \
+    "$TEMP_PROTECTED_POLICY" \
+    "$TEMP_UNIQUE_IPS" \
+    "$TEMP_FILTERED_UNIQUE_IPS" \
+    "$TEMP_PROTECTED_CANDIDATES"; then
+    echo "ERROR: Could not filter protected IPv4 candidates." >&2
+    exit 1
+fi
+PROTECTED_CANDIDATE_COUNT_CMD=$(wc -l < "$TEMP_PROTECTED_CANDIDATES")
+PROTECTED_CANDIDATE_COUNT=${PROTECTED_CANDIDATE_COUNT_CMD}
+mv -f "$TEMP_FILTERED_UNIQUE_IPS" "$TEMP_UNIQUE_IPS"
+TEMP_FILTERED_UNIQUE_IPS=""
+rm -f "$TEMP_PROTECTED_POLICY" "$TEMP_PROTECTED_CANDIDATES"
+TEMP_PROTECTED_POLICY=""
+TEMP_PROTECTED_CANDIDATES=""
+if [ "$PROTECTED_CANDIDATE_COUNT" -gt 0 ]; then
+    echo "SKIPPED: $PROTECTED_CANDIDATE_COUNT source(s) covered by local/csf.allow/csf.ignore IPv4 policy." >&2
+fi
 
 # Count total unique IPs detected for reporting and progress tracking
 TOTAL_UNIQUE_IPS_CMD=$(wc -l < "$TEMP_UNIQUE_IPS")

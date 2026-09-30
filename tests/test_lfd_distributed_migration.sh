@@ -15,6 +15,7 @@ grep -q '^PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"$' 
 for function_name in \
     validate_ip \
     build_protected_ipv4_file \
+    ipv4_matches_policy_file \
     get_csf_deny_limit \
     count_active_csf_deny_entries \
     collect_lfd_distributed_ips \
@@ -31,6 +32,7 @@ function_blocks=""
 for function_name in \
     validate_ip \
     build_protected_ipv4_file \
+    ipv4_matches_policy_file \
     get_csf_deny_limit \
     count_active_csf_deny_entries \
     collect_lfd_distributed_ips \
@@ -148,7 +150,7 @@ cat > "$LFD_LOG_FILE" <<'EOF'
 Aug 22 05:59:59 host lfd[99]: 203.0.113.55 (US/Example/-) has 10 failures *Blocked in csf* [LF_DISTATTACK]
 EOF
 cat > "$CSF_ALLOW_FILE" <<'EOF'
-203.0.113.55 # trusted administrator
+203.0.113.0/24 # trusted reverse-proxy range
 EOF
 cat > "$CSF_DENY_FILE" <<'EOF'
 203.0.113.55 # stale distributed auth block
