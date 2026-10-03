@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-03
+
+- Repair missing persistent tracking when a reviewed manual or batch blacklist is already live, preserving existing tracking reasons and uninterrupted firewall coverage.
+- Return failure when the persistence repair cannot be written, while retaining protected-address checks and repeated session teardown.
+
 ## 2026-09-30
 
 - Treat IPv4 CIDRs in `csf.allow` and `csf.ignore` as authoritative trust policy across automated scans, manual and batch blacklists, LF_DISTATTACK migration, reconciliation, and live-set rebuilds.

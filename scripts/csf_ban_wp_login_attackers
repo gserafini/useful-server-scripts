@@ -1883,6 +1883,14 @@ perform_blacklist() {
     rm -f "$protected_ip_file"
 
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
+        if ! awk -v target="$ip" '$1 == target {found=1} END {exit !found}' "$IP_TRACKING_FILE"; then
+            if ! printf '%s # [%s] Manual Blacklist: %s (live ban persistence repair)\n' \
+                "$ip" "$timestamp" "${message:-Manually blacklisted via --blacklist}" >> "$IP_TRACKING_FILE"; then
+                echo "ERROR: Could not repair tracking for live IP $ip in $IP_TRACKING_FILE. Live coverage is unchanged."
+                return 1
+            fi
+            echo "Repaired missing tracking for live IP $ip in $IP_TRACKING_FILE."
+        fi
         echo "IP $ip is already in ipset: $IP_SET_NAME. Refreshing live-session teardown."
         terminate_live_sessions_for_ip "$ip"
         local end_time_cmd
@@ -3156,6 +3164,7 @@ while true; do
             echo "  --install-mod-security-triggers  Generate and install ModSecurity rules for instant banning"
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
+            echo "                               Repairs missing tracking for an already-live reviewed ban"
             echo "  --blacklist-file <FILE|-> [MSG]  Ban bare IPv4 addresses (one per line); MSG is one shared reason"
             echo "  --unblacklist <IP> [MSG]  Remove IP from this tool's live/tracked deny without adding csf.allow"
             echo "  --check-ip <IP>           Report live and persistent deny/allow coverage (read-only)"
