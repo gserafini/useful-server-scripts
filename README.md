@@ -230,13 +230,31 @@ sudo csf_ban_wp_login_attackers --check-ip 1.2.3.4
 sudo csf_ban_wp_login_attackers --whitelist 1.2.3.4 "Trusted admin"
 # Alias: --unblock
 
-# Remove every exact local/csf.allow/csf.ignore IP from live and tracked bans
+# Remove sources protected by local or CSF numeric trust policy from live/tracked bans
 # without restarting or reloading CSF
 sudo csf_ban_wp_login_attackers --reconcile-allowlist
 
 # Clear all bans (DANGEROUS - requires confirmation)
 sudo csf_ban_wp_login_attackers --clear
 ```
+
+Numeric trust policy covers exact IPv4 addresses and CIDRs in `csf.allow` and
+`csf.ignore`, recursive `Include` files, and numeric address operands in `s=` or
+`d=` advanced-filter fields. Ports, owner fields, comments, IPv6, and hostnames
+do not add IPv4 protection; this helper performs no DNS lookups. Address operands
+conservatively protect the whole address/range regardless of port or direction;
+standalone `s=`/`d=` address fields also receive this protection, without claiming
+to validate a complete CSF rule.
+
+CSF documents absolute Include paths with no trailing comments. The protection
+helper also accepts relative paths resolved against the including file's directory
+as a conservative extension. An Include must name one literal, unquoted path;
+trailing comments are rejected. Missing/unreadable files (including either root
+file), include cycles, and malformed numeric IPv4/CIDR entries abort the operation
+before a partial policy can be used. The builder publishes only after validation;
+on failure its output stays unchanged, including an already empty output. Builder
+destinations must be regular private temporary files (or absent); symlinks and
+directories are rejected.
 
 **Automated scanning** (default mode, no flags):
 
@@ -317,8 +335,8 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | Flag | Description |
 |------|-------------|
 | `--init` | Initialize IPSET table and CSF integration (one-time setup) |
-| `--rebuild-live-set` | Bulk-replay tracked bans while excluding assigned local and exact CSF-protected addresses |
-| `--reconcile-allowlist` | Remove exact local, `csf.allow`, and `csf.ignore` IPv4 addresses from live and tracked bans without a CSF reload |
+| `--rebuild-live-set` | Bulk-replay tracked bans while excluding local and CSF-protected IPv4 addresses/CIDRs |
+| `--reconcile-allowlist` | Remove local and `csf.allow`/`csf.ignore` protected IPv4 addresses/CIDRs from live and tracked bans without a CSF reload |
 | `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`); refuses exact `csf.allow` and `csf.ignore` entries |

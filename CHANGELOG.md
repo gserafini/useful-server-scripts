@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Protect numeric IPv4/CIDR trust entries in recursive CSF Include files and advanced-filter address operands across scans, blacklist operations, reconciliation, migration, and rebuilds.
+- Abort safely when trust policy files cannot be read, Includes cycle, or numeric address entries are malformed; publish the protected inventory only after complete validation.
+- Run firewall regression tests against their own checkout by default, with an explicit `SCRIPT` override available for candidate verification.
+
 ## 2026-10-03
 
 - Repair missing persistent tracking when a reviewed manual or batch blacklist is already live, preserving existing tracking reasons and uninterrupted firewall coverage.

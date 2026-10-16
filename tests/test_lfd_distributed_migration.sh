@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT="/usr/local/useful-server-scripts/scripts/csf_ban_wp_login_attackers"
+SCRIPT="${SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/csf_ban_wp_login_attackers}"
 SYSTEM_AWK=$(command -v awk)
 
 fail() {

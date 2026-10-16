@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT="/usr/local/useful-server-scripts/scripts/modsecurity_persistent_blacklist"
+SCRIPT="${SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/modsecurity_persistent_blacklist}"
 
 fail() {
     echo "FAIL: $1" >&2

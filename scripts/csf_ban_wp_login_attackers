@@ -256,16 +256,66 @@ extract_source_ipv4_from_matched_log_lines() {
     '
 }
 
-# Write protected IPv4 policy entries: loopback, every address assigned to the
-# host, and exact IPv4/CIDR first-field entries from csf.allow/csf.ignore. CSF
-# advanced-rule syntax is intentionally excluded.
+# Write numeric IPv4 trust policy from local interfaces and CSF allow/ignore,
+# including recursive Includes and address operands of advanced filters. Relative
+# Includes are resolved against their containing file (a conservative extension
+# of CSF's documented absolute-path syntax). No hostnames are resolved.
+# Publish atomically only after all sources validate. On failure the destination
+# stays unchanged, including an already empty destination; callers must abort.
 build_protected_ipv4_file() {
-    local output_file="$1"
+    (
+        local output_file="$1" input_file pending_file local_addresses
+        if [[ -L "$output_file" || ( -e "$output_file" && ! -f "$output_file" ) ]]; then
+            echo "Error: protected-policy destination must be a regular file; use a private temporary file before retrying" >&2
+            return 1
+        fi
+        input_file=$(mktemp) || return 1
+        pending_file=$(mktemp "${output_file}.tmp.XXXXXX") || { rm -f "$input_file"; return 1; }
+        trap 'rm -f "$input_file" "$pending_file"' EXIT
+        local -A active_policy_files=()
 
-    {
-        echo "127.0.0.1"
-        ip -4 -o addr show | awk '{split($4, address, "/"); print address[1]}'
-        awk '
+        # Canonical paths detect cycles through ../ components and symlink aliases.
+        # Read files literally: no eval, command interpolation, globs or DNS.
+        collect_protected_policy_sources() {
+            local source="$1" canonical line include
+            canonical=$(readlink -e -- "$source") || {
+                echo "Error: cannot resolve protected-policy source: $source; repair the CSF source/Include path before retrying" >&2
+                return 1
+            }
+            if [[ ! -f "$canonical" || ! -r "$canonical" ]]; then
+                echo "Error: protected-policy source is not a readable file: $source; restore a readable regular file before retrying" >&2
+                return 1
+            fi
+            if [[ ${active_policy_files[$canonical]:-} ]]; then
+                echo "Error: protected-policy Include cycle: $source; remove the circular Include before retrying" >&2
+                return 1
+            fi
+            active_policy_files[$canonical]=1
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                line="${line#"${line%%[![:space:]]*}"}"
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                if [[ "$line" =~ ^Include([[:space:]]|$) ]]; then
+                    # CSF explicitly disallows trailing comments on Include lines.
+                    if [[ ! "$line" =~ ^Include[[:space:]]+([^[:space:]\#]+)[[:space:]]*$ ]]; then
+                        echo "Error: malformed protected-policy Include in $source; use one literal filename without a trailing comment before retrying" >&2
+                        return 1
+                    fi
+                    include="${BASH_REMATCH[1]}"
+                    [[ "$include" == /* ]] || include="${canonical%/*}/$include"
+                    collect_protected_policy_sources "$include" || return 1
+                else
+                    printf '%s\n' "$line" >> "$input_file" || return 1
+                fi
+            done < "$canonical" || return 1
+            unset 'active_policy_files[$canonical]'
+        }
+
+        collect_protected_policy_sources "$CSF_ALLOW_FILE" || return 1
+        collect_protected_policy_sources "$CSF_IGNORE_FILE" || return 1
+        local_addresses=$(ip -4 -o addr show) || return 1
+        printf '%s\n' '127.0.0.1' >> "$input_file" || return 1
+        printf '%s\n' "$local_addresses" | awk '{split($4, address, "/"); if (address[1] != "") print address[1]}' >> "$input_file" || return 1
+        gawk '
             function valid_ipv4(ip, parts, count, i) {
                 count = split(ip, parts, ".")
                 if (count != 4) return 0
@@ -274,22 +324,40 @@ build_protected_ipv4_file() {
                 }
                 return 1
             }
-            /^[[:space:]]*($|#)/ { next }
-            {
-                entry = $1
-                if (valid_ipv4(entry)) {
-                    print entry
-                    next
+            function address_operand(entry, cidr, count) {
+                # Ignore IPv6, hostnames and port operands. A dotted numeric
+                # address with any mask suffix must validate or abort the build.
+                if (entry ~ /:/ || entry !~ /^[0-9.]+(\/.*)?$/ || entry !~ /[.\/]/) return
+                count = split(entry, cidr, "/")
+                if (count > 2 || !valid_ipv4(cidr[1]) ||
+                    (count == 2 && (cidr[2] !~ /^[0-9]+$/ || cidr[2] + 0 > 32))) {
+                    invalid = 1
+                    return
                 }
-                if (entry ~ /^[0-9.]+\/[0-9]+$/) {
-                    split(entry, cidr, "/")
-                    if (valid_ipv4(cidr[1]) && cidr[2] ~ /^[0-9]+$/ && cidr[2] >= 0 && cidr[2] <= 32) {
-                        print cidr[1] "/" (cidr[2] + 0)
+                print cidr[1] (count == 2 ? "/" (cidr[2] + 0) : "")
+            }
+            {
+                sub(/#.*/, "")
+                entry = $1
+                if (index(entry, "|") || entry ~ /^[sd]=/) {
+                    count = split(entry, fields, "|")
+                    for (i = 1; i <= count; i++) {
+                        if (fields[i] ~ /^[sd]=/) address_operand(substr(fields[i], 3))
                     }
+                } else {
+                    address_operand(entry)
                 }
             }
-        ' "$CSF_ALLOW_FILE" "$CSF_IGNORE_FILE" 2>/dev/null
-    } | sort -u > "$output_file"
+            END {
+                if (invalid) {
+                    print "Error: malformed numeric IPv4 protected-policy entry; repair the CSF source before retrying" > "/dev/stderr"
+                    exit 1
+                }
+            }
+        ' "$input_file" > "$pending_file" || return 1
+        LC_ALL=C sort -u -o "$pending_file" "$pending_file" || return 1
+        mv -fT -- "$pending_file" "$output_file" || return 1
+    )
 }
 
 # Return success when an exact IPv4 is covered by an exact or CIDR policy entry.
