@@ -53,8 +53,9 @@ class TransactionTests(unittest.TestCase):
  def test_two_process_stale_writer_cannot_overwrite_winner(self):
   worker='source "$1"; ctx=$(tracking_snapshot) || exit; printf "%s\\n" "$ctx" > "$2"; while [ ! -e "$3" ]; do sleep 0.02; done; cp "$ctx/source" "$ctx/next"; printf "%s\\n" "$4" >> "$ctx/next"; tracking_publish "$ctx"'
   processes=[]
-  for n in [1,2]:processes.append(spawn_fixture(['bash','-c',worker,'fixture',str(self.lib),str(self.root/('ready'+str(n))),str(self.root/('go'+str(n))),'203.0.113.'+str(n)+' # writer'+str(n)],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE))
-  for proc in processes:self.addCleanup(self.cleanup_worker,proc)
+  for n in [1,2]:
+   processes.append(spawn_fixture(['bash','-c',worker,'fixture',str(self.lib),str(self.root/('ready'+str(n))),str(self.root/('go'+str(n))),'203.0.113.'+str(n)+' # writer'+str(n)],env=self.env,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE))
+   self.addCleanup(self.cleanup_worker,processes[-1])
   import time
   deadline=time.monotonic()+5
   while not all((self.root/('ready'+str(n))).exists() for n in [1,2]):
