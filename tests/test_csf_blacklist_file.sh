@@ -16,6 +16,23 @@ validate_block=$(sed -n '/^validate_ip() {/,/^}/p' "$SCRIPT")
 batch_block=$(sed -n '/^perform_blacklist_file() {/,/^}/p' "$SCRIPT")
 eval "$validate_block"
 eval "$batch_block"
+for fixture_function in blacklist_preflight blacklist_report_inputs; do
+    eval "$(sed -n "/^${fixture_function}() {/,/^}/p" "$SCRIPT")"
+done
+# Parser boundary only: native bulk/partial semantics have separate process tests.
+execute_blacklist_batch() {
+    local stage="$1" message="$2" ip failed=0
+    : > "$stage/results"
+    while IFS= read -r ip; do
+        if perform_blacklist "$ip" "$message"; then
+            printf '%s\tlive_persisted\n' "$ip" >> "$stage/results"
+        else
+            printf '%s\tnative_failed_not_persisted\n' "$ip" >> "$stage/results"
+            failed=1
+        fi
+    done < "$stage/unique"
+    return "$failed"
+}
 
 validate_ip "203.0.113.5" || fail "valid IPv4 address was rejected"
 if validate_ip "999.0.0.1"; then

@@ -9,6 +9,7 @@ trap 'rm -rf "$sandbox"' EXIT
 fail() { echo "FAIL: $1" >&2; exit 1; }
 eval "$(sed -n '/^validate_ip() {/,/^}/p' "$script")"
 eval "$(sed -n '/^perform_blacklist() {/,/^}/p' "$script")"
+source "$(dirname "${BASH_SOURCE[0]}")/tracking_fixture_functions.sh"
 
 IP_SET_NAME=high_volume_bans
 IP_TRACKING_FILE="$sandbox/tracking.log"
@@ -53,6 +54,6 @@ perform_blacklist 203.0.113.8 "write failure" > "$sandbox/output" 2>&1
 write_status=$?
 set -e
 [ "$write_status" -ne 0 ] || fail "tracking write failure returned success"
-grep -Fq 'tracking' "$sandbox/output" || fail "tracking failure omitted a useful error"
+grep -Eiq 'tracking|tracker' "$sandbox/output" || fail "tracking failure omitted a useful error"
 
 echo "PASS: existing live bans repair persistence idempotently, preserve trust, and report write failures"

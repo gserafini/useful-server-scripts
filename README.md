@@ -205,6 +205,28 @@ This creates:
 - post-rebuild replay command in `/etc/csf/csfpost.sh`
 - Tracking file at `/etc/csf/ipset_tracking_high_volume_bans.log`
 
+#### Batch persistence and concurrent writers
+
+`--blacklist-file` validates all nonempty inputs before setup or firewall work, canonicalizes IPv4 addresses, and reports each original input line, including duplicates, protected addresses and errors. It loads protected policy once and normalizes one private tracker snapshot once. Duplicate tracker rows keep the first permanent (`DO NOT DELETE`) reason when present; unrelated comments and unique reasons remain. Unsupported tracker rows stop the batch before its native add.
+
+There are **two complete reads of the live tracker**, independent of batch size: the snapshot copy and a final SHA-256 beforeimage guard. Parsing/normalization happens once on the private snapshot. One `ipset restore` is attempted, followed by individual live membership checks. A native restore error can leave later commands unattempted; it is never replayed automatically. Only verified members receive missing persistent entries. The result for every input separates live/persistence qualification from session-cleanup status. Existing single-IP syntax and existing reasons remain supported.
+
+All eight tracker writer families use a stable private sidecar lock for snapshot/publication: blacklist, distributed-LFD migration, unblacklist, protected reconciliation, local whitelist, initialization, clear, and automatic scan. Publication checks canonical path, device/inode, owner/group, link count, mode, size, timestamps and SHA-256; it atomically renames a same-filesystem candidate while preserving owner/group/mode. Symlinks, multiple links and foreign ownership are refused. Setup, kernel actions and recursive CSF reload hooks run outside this lock. A stale writer stops rather than overwriting another writer. This is file-publication protection, **not an atomic firewall transaction**. External editors must honor the sidecar lock; an uncoordinated write after the final guard is outside this protocol.
+
+Kernel success followed by persistence failure returns nonzero and retains a root-private transaction directory with source/planned afterimage, hashes, metadata, native results and per-input failure receipt. Do not roll back or retry automatically: concurrent changes and live coverage must be reviewed first. Successful transactions discard their own known temporary files. The automatic scanner retains its existing native kernel planner; this change guards its tracker publication and reports unqualified kernel-plan outcomes rather than asserting every kernel operation succeeded.
+
+Batch session cleanup has a ten-second aggregate scheduling budget and a two-second native KILL timeout per attempted IP. After the budget, remaining cleanup is explicitly `deferred_budget`, with no background leftovers. Exit 124/137 means bounded timeout; other unexpected exits are errors. Invoking cleanup does not prove active connections closed. Coverage and persistence remain independently reported. The runtime uses installed Bash/coreutils/flock/gawk, including legacy Bash 4.1/coreutils 8.4; Python and strace are fixture-test dependencies only.
+
+Run only the isolated fixtures in a new private directory, never a live ban to test this feature:
+
+```bash
+fixture_dir=$(mktemp -d "$PWD/.fixture-run.XXXXXX")
+chmod 700 "$fixture_dir"
+TMPDIR="$fixture_dir" python3.12 -B -m unittest discover -s tests -p 'test_tracking_*.py'
+TMPDIR="$fixture_dir" python3.12 -B tests/test_csf_blacklist_batch.py
+TMPDIR="$fixture_dir" python3.12 -B tests/test_batch_cleanup.py
+```
+
 #### Daily Operations
 
 **Manual IP management**:
@@ -217,8 +239,9 @@ sudo csf_ban_wp_login_attackers --blacklist 1.2.3.4 "Brute force wp-login"
 # Ban a reviewed list after validating the entire input before any mutation
 sudo csf_ban_wp_login_attackers --blacklist-file campaign-ips.txt "Distributed crawler campaign"
 
-# File input currently uses the guarded single-IP path for each unique address.
-# It is not a single-pass tracker update or an atomic multi-IP transaction.
+# One private tracker normalization, one native ipset restore, one guarded publication.
+# Inspect every BATCH_INPUT disposition; nonzero may leave verified live coverage.
+# Never blindly retry a partial failure: inspect the retained private evidence first.
 
 # Read the reviewed list from stdin
 printf '%s\n' 1.2.3.4 5.6.7.8 | sudo csf_ban_wp_login_attackers --blacklist-file - "Distributed crawler campaign"
@@ -343,7 +366,7 @@ sudo csf_ban_wp_login_attackers --raw-grep '1.2.3.4'
 | `--resize-live-set MAX` | Atomically resize the live set and persist its capacity |
 | `--whitelist-local-addresses` | Remove assigned local addresses from bans and persist them in `csf.allow` |
 | `--blacklist IP [MSG]` | Manually ban an IP (alias: `--block`); refuses exact `csf.allow` and `csf.ignore` entries |
-| `--blacklist-file FILE|- [MSG]` | Preflight and deduplicate a file or stdin list, then process every IPv4 address through the guarded blacklist path |
+| `--blacklist-file FILE|- [MSG]` | Preflight a file/stdin list, normalize the tracker once, bulk-add eligible IPs and itemize every input |
 | `--unblacklist IP [MSG]` | Remove an exact IP from `high_volume_bans` and its tracking file without adding it to `csf.allow` or changing independent CSF deny policy |
 | `--check-ip IP` | Report exact live ipset, tracking, CSF deny, parent `/24`, and CSF allow coverage without mutation |
 | `--promote-cidr CIDR [MSG]` | Atomically replace covered CSF child bans with a canonical IPv4 `/24`; refuses unsafe capacity changes and rolls back on failure |

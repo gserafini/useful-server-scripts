@@ -15,6 +15,7 @@ validate_block=$(sed -n '/^validate_ip() {/,/^}/p' "$SCRIPT")
 unblacklist_block=$(sed -n '/^perform_unblacklist() {/,/^}/p' "$SCRIPT")
 eval "$validate_block"
 eval "$unblacklist_block"
+source "$(dirname "${BASH_SOURCE[0]}")/tracking_fixture_functions.sh"
 
 sandbox=$(mktemp -d)
 trap 'rm -rf "$sandbox"' EXIT

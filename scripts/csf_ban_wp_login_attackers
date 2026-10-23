@@ -466,6 +466,7 @@ filter_ipv4_records_against_policy() {
 # the atomic tracking rewrite prevents a later CSF rebuild from restoring them.
 reconcile_protected_bans() {
     local protected_ip_file
+    local tracking_context
     local protected_record_file
     local cleaned_tracking_file
     local protected_ip
@@ -489,9 +490,11 @@ reconcile_protected_bans() {
         return 1
     fi
 
+    tracking_context=$(tracking_snapshot) || return 1
+
     if ! filter_ipv4_records_against_policy \
         "$protected_ip_file" \
-        "$IP_TRACKING_FILE" \
+        "$tracking_context/source" \
         "$cleaned_tracking_file" \
         "$protected_record_file"; then
         rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
@@ -499,28 +502,29 @@ reconcile_protected_bans() {
         return 1
     fi
 
+    {
+        awk '$1 !~ /\// { print $1 }' "$protected_ip_file"
+        awk '{ print $1 }' "$protected_record_file"
+    } | sort -u > "$tracking_context/affected" || return 1
     while IFS= read -r protected_ip; do
         [ -z "$protected_ip" ] && continue
         if ! ipset del "$IP_SET_NAME" "$protected_ip" -exist >/dev/null 2>&1; then
+            printf '%s\tdelete-command-failed\n' "$protected_ip" >> "$tracking_context/kernel.tsv"
+            tracking_record_failure "$tracking_context" "$tracking_context/affected" reconcile not-attempted || true
             rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
             echo "ERROR: Could not remove protected IP $protected_ip from $IP_SET_NAME."
             return 1
         fi
-    done < <(
-        {
-            awk '$1 !~ /\// { print $1 }' "$protected_ip_file"
-            awk '{ print $1 }' "$protected_record_file"
-        } | sort -u
-    )
+        printf '%s\tdelete-command-succeeded\n' "$protected_ip" >> "$tracking_context/kernel.tsv"
+    done < "$tracking_context/affected"
 
-    before_count=$(wc -l < "$IP_TRACKING_FILE")
+    before_count=$(wc -l < "$tracking_context/source")
     after_count=$(wc -l < "$cleaned_tracking_file")
     removed_count=$((before_count - after_count))
 
     if [ "$removed_count" -gt 0 ]; then
-        chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
-        chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
-        if ! mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"; then
+        if ! cp -- "$cleaned_tracking_file" "$tracking_context/next" || ! tracking_publish "$tracking_context"; then
+            tracking_record_failure "$tracking_context" "$tracking_context/affected" reconcile not-attempted || true
             rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
             echo "ERROR: Could not atomically reconcile $IP_TRACKING_FILE."
             return 1
@@ -529,7 +533,8 @@ reconcile_protected_bans() {
         rm -f "$cleaned_tracking_file"
     fi
 
-    rm -f "$protected_ip_file" "$protected_record_file"
+    rm -f "$protected_ip_file" "$protected_record_file" "$cleaned_tracking_file"
+    tracking_discard "$tracking_context" || return 1
     echo "Removed $removed_count protected tracking entries and cleared protected IPs from $IP_SET_NAME."
 }
 
@@ -1133,6 +1138,12 @@ perform_migrate_lfd_distributed() {
         return 1
     }
 
+    local tracking_context
+    tracking_context=$(tracking_snapshot) || return 1
+    cp -- "$tracking_context/source" "$tracking_context/next" || return 1
+
+    printf '%s\n' "${candidates[@]}" > "$candidate_file" || return 1
+    cp -- "$candidate_file" "$tracking_context/affected" || return 1
     timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     for ip in "${candidates[@]}"; do
         if ! validate_ip "$ip"; then
@@ -1143,7 +1154,6 @@ perform_migrate_lfd_distributed() {
             echo "ERROR: LFD supplied an invalid source address: $ip"
             return 1
         fi
-        printf '%s\n' "$ip" >> "$candidate_file"
 
         if ! ipset add "$IP_SET_NAME" "$ip" -exist ||
             ! ipset test "$IP_SET_NAME" "$ip" >/dev/null 2>&1; then
@@ -1151,12 +1161,15 @@ perform_migrate_lfd_distributed() {
             [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
             flock -u 8 >/dev/null 2>&1 || true
             flock -u 9 >/dev/null 2>&1 || true
+            printf '%s\tadd-or-verify-failed\n' "$ip" >> "$tracking_context/kernel.tsv"
+            tracking_record_failure "$tracking_context" "$tracking_context/affected" lfd-migration not-attempted || true
             echo "ERROR: Could not verify high-volume coverage for $ip; CSF policy was not changed."
             return 1
         fi
 
-        if ! LC_ALL=C awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$IP_TRACKING_FILE"; then
-            if ! printf '%s # [%s] Migrated LFD distributed-auth block\n' "$ip" "$timestamp" >> "$IP_TRACKING_FILE"; then
+        printf '%s\tlive-verified\n' "$ip" >> "$tracking_context/kernel.tsv"
+        if ! LC_ALL=C awk -v target="$ip" '$1 == target { found=1; exit } END { exit !found }' "$tracking_context/next"; then
+            if ! printf '%s # [%s] Migrated LFD distributed-auth block\n' "$ip" "$timestamp" >> "$tracking_context/next"; then
                 rm -f "$candidate_file" "$removable_file"
                 [ "$has_tempip" -eq 0 ] || flock -u 7 >/dev/null 2>&1 || true
                 flock -u 8 >/dev/null 2>&1 || true
@@ -1177,6 +1190,12 @@ perform_migrate_lfd_distributed() {
             printf '%s\n' "$ip" >> "$removable_file"
         fi
     done
+
+    if ! tracking_publish "$tracking_context"; then
+        tracking_record_failure "$tracking_context" "$tracking_context/affected" lfd-migration not-attempted || true
+        return 1
+    fi
+    tracking_discard "$tracking_context" || return 1
 
     if [ -s "$removable_file" ]; then
         mapfile -t removable_ips < "$removable_file"
@@ -1913,6 +1932,184 @@ kill_lingering_phpfpm_processes() {
     fi
 }
 
+# Initialization and failure receipts use the same file-only boundary.
+tracking_initialize() {
+    (
+        umask 077
+        tracking_lock || return 1
+        if [[ -e "$IP_TRACKING_FILE" || -L "$IP_TRACKING_FILE" ]]; then
+            if [[ -L "$IP_TRACKING_FILE" || ! -f "$IP_TRACKING_FILE" || "$(readlink -e -- "$IP_TRACKING_FILE")" != "$IP_TRACKING_FILE" || "$(stat -c '%h:%u:%g' -- "$IP_TRACKING_FILE")" != '1:0:0' ]]; then
+                echo "ERROR: Existing tracker identity/owner is unsafe; initialization stopped." >&2
+                return 1
+            fi
+        else
+            if [[ "$(readlink -e -- "${IP_TRACKING_FILE%/*}")" != "${IP_TRACKING_FILE%/*}" ]]; then
+                echo "ERROR: Tracker parent must be canonical before initialization." >&2
+                return 1
+            fi
+            ( set -o noclobber; : > "$IP_TRACKING_FILE" ) || return 1
+        fi
+    )
+}
+
+# No live commands here: record all affected inputs in retained private evidence.
+tracking_record_failure() {
+    local context="$1" input_file="$2" operation="$3" kernel_state="${4:-not-qualified}"
+    if [[ ! -d "$context" || -L "$context" || "$(stat -c '%u:%g:%a' -- "$context")" != '0:0:700' ]]; then
+        echo "ERROR: Cannot record tracker failure in an unsafe context." >&2
+        return 1
+    fi
+    [[ -f "$context/kernel.tsv" ]] || ( umask 077; : > "$context/kernel.tsv" ) || return 1
+    ( umask 077; awk -v operation="$operation" -v kernel="$kernel_state" '
+        FILENAME == ARGV[1] { status[$1]=$2; next }
+        NF && $1 !~ /^#/ { print FNR "\t" $1 "\t" operation "\t" (($1 in status) ? status[$1] : kernel) "\tpersistence-not-qualified" }
+    ' "$context/kernel.tsv" "$input_file" > "$context/failure.tsv" ) || return 1
+    echo "ERROR: Tracker transaction incomplete; per-input receipt retained: $context/failure.tsv. No automatic rollback or retry." >&2
+}
+
+# Shared tracker I/O only. Never hold this mutex around CSF, kernel or session work.
+tracking_lock() {
+    local lock_file="${IP_TRACKING_FILE}.lock" info path_info
+    if [[ -L "$lock_file" || ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
+        echo "ERROR: Tracker lock must be a regular non-symlink file." >&2
+        return 1
+    fi
+    ( umask 077; : >> "$lock_file" ) || return 1
+    exec 6>>"$lock_file" || return 1
+    info=$(stat -Lc '%d:%i:%h:%u:%g:%a' /proc/self/fd/6) || return 1
+    path_info=$(stat -c '%d:%i:%h:%u:%g:%a' -- "$lock_file") || return 1
+    if [[ "$info" != "$path_info" || "$info" != *:1:0:0:600 ]]; then
+        echo "ERROR: Tracker lock identity, owner, link count or private mode is unsafe." >&2
+        return 1
+    fi
+    if ! flock -w 10 6; then
+        echo "ERROR: Tracker I/O lock unavailable; stop without retry." >&2
+        return 1
+    fi
+    [[ ! -L "$lock_file" && "$(stat -c '%d:%i:%h:%u:%g:%a' -- "$lock_file")" == "$info" ]] || {
+        echo "ERROR: Tracker lock identity changed." >&2
+        return 1
+    }
+}
+
+tracking_snapshot() {
+    (
+        umask 077
+        local metadata after context identity digest ignored
+        tracking_lock || return 1
+        if [[ -L "$IP_TRACKING_FILE" || ! -f "$IP_TRACKING_FILE" || "$(readlink -e -- "$IP_TRACKING_FILE")" != "$IP_TRACKING_FILE" ]]; then
+            echo "ERROR: Tracker must be an existing canonical regular non-symlink file." >&2
+            return 1
+        fi
+        identity=$(stat -c '%h:%u:%g' -- "$IP_TRACKING_FILE") || return 1
+        if [[ "$identity" != '1:0:0' ]]; then
+            echo "ERROR: Tracker owner must be root:root with exactly one link." >&2
+            return 1
+        fi
+        metadata=$(stat -c '%d|%i|%h|%u|%g|%a|%s|%y|%z' -- "$IP_TRACKING_FILE") || return 1
+        context=$(mktemp -d "${IP_TRACKING_FILE}.txn.XXXXXX") || return 1
+        if ! cp -p -- "$IP_TRACKING_FILE" "$context/source"; then
+            echo "ERROR: Tracker snapshot failed; evidence retained: $context" >&2
+            return 1
+        fi
+        after=$(stat -c '%d|%i|%h|%u|%g|%a|%s|%y|%z' -- "$IP_TRACKING_FILE") || return 1
+        if [[ "$after" != "$metadata" ]]; then
+            echo "ERROR: Tracker beforeimage drift during snapshot; evidence retained: $context" >&2
+            return 1
+        fi
+        read -r digest ignored < <(sha256sum -- "$context/source")
+        [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+        printf '%s\n' "$metadata" > "$context/metadata" || return 1
+        printf '%s\n' "$digest" > "$context/sha" || return 1
+        printf '%s\n' "$context"
+    )
+}
+
+tracking_publish() {
+    (
+        umask 077
+        local context="$1" suffix metadata current expected digest ignored item identity next_identity
+        suffix=${context#"${IP_TRACKING_FILE}.txn."}
+        if [[ ! "$suffix" =~ ^[A-Za-z0-9]{6}$ || -L "$context" || ! -d "$context" || "$(readlink -e -- "$context")" != "$context" || "$(stat -c '%u:%g:%a' -- "$context")" != '0:0:700' ]]; then
+            echo "ERROR: Invalid private tracker context; retain it for review." >&2
+            return 1
+        fi
+        for item in source metadata sha next; do
+            if [[ -L "$context/$item" || ! -f "$context/$item" || "$(stat -c '%h:%u:%g' -- "$context/$item")" != '1:0:0' ]]; then
+                echo "ERROR: Tracker context files must be regular, single-link and root-owned: $item" >&2
+                return 1
+            fi
+        done
+        IFS= read -r metadata < "$context/metadata" || return 1
+        local original_device original_inode original_links original_uid original_gid original_mode original_size original_mtime original_ctime
+        IFS='|' read -r original_device original_inode original_links original_uid original_gid original_mode original_size original_mtime original_ctime <<< "$metadata"
+        if [[ "$(stat -c '%h|%u|%g|%a|%s' -- "$context/source")" != "$original_links|$original_uid|$original_gid|$original_mode|$original_size" ]]; then
+            echo "ERROR: Private tracker snapshot metadata changed; evidence retained: $context" >&2
+            return 1
+        fi
+        IFS= read -r expected < "$context/sha" || return 1
+        read -r digest ignored < <(sha256sum -- "$context/source")
+        if [[ ! "$expected" =~ ^[a-f0-9]{64}$ || "$digest" != "$expected" ]]; then
+            echo "ERROR: Private tracker snapshot hash changed; evidence retained: $context" >&2
+            return 1
+        fi
+        tracking_lock || return 1
+        if [[ -L "$IP_TRACKING_FILE" || ! -f "$IP_TRACKING_FILE" || "$(readlink -e -- "$IP_TRACKING_FILE")" != "$IP_TRACKING_FILE" ]]; then
+            echo "ERROR: Tracker beforeimage identity changed; evidence retained: $context" >&2
+            return 1
+        fi
+        current=$(stat -c '%d|%i|%h|%u|%g|%a|%s|%y|%z' -- "$IP_TRACKING_FILE") || return 1
+        if [[ "$current" != "$metadata" ]]; then
+            echo "ERROR: Tracker beforeimage drift; no stale replacement or retry; evidence retained: $context" >&2
+            return 1
+        fi
+        if ! chmod --reference="$context/source" "$context/next" || ! chown --reference="$context/source" "$context/next"; then
+            echo "ERROR: Cannot preserve tracker owner/group/mode; evidence retained: $context" >&2
+            return 1
+        fi
+        next_identity=$(stat -c '%d|%i|%h|%u|%g|%a|%s' -- "$context/next") || return 1
+        if [[ "${next_identity%%|*}" != "$original_device" ]]; then
+            echo "ERROR: Tracker candidate is not on the original filesystem; no rename attempted." >&2
+            return 1
+        fi
+        local after_digest copied_digest completed
+        read -r after_digest ignored < <(sha256sum -- "$context/next")
+        [[ "$after_digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+        cp -p -- "$context/next" "$context/published" || return 1
+        read -r copied_digest ignored < <(sha256sum -- "$context/published")
+        [[ "$copied_digest" == "$after_digest" ]] || return 1
+        printf '%s\n' "$after_digest" > "$context/after.sha" || return 1
+        printf '%s\n' "$next_identity" > "$context/after.meta" || return 1
+        read -r digest ignored < <(sha256sum -- "$IP_TRACKING_FILE")
+        if [[ "$digest" != "$expected" || "$(stat -c '%d|%i|%h|%u|%g|%a|%s|%y|%z' -- "$IP_TRACKING_FILE")" != "$metadata" ]]; then
+            echo "ERROR: Tracker beforeimage hash/stat drift; evidence retained: $context" >&2
+            return 1
+        fi
+        if ! mv -fT -- "$context/next" "$IP_TRACKING_FILE"; then
+            echo "ERROR: Atomic tracker publication failed; inspect current tracker and retained evidence: $context" >&2
+            return 1
+        fi
+        identity=$(stat -c '%d|%i|%h|%u|%g|%a|%s' -- "$IP_TRACKING_FILE") || return 1
+        if [[ "$identity" != "$next_identity" ]]; then
+            echo "ERROR: Tracker publication readback changed; do not roll back or retry; evidence: $context" >&2
+            return 1
+        fi
+        completed=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+        printf 'published %s\n' "$completed" > "$context/commit" || return 1
+    )
+}
+
+tracking_discard() {
+    local context="$1" suffix
+    suffix=${context#"${IP_TRACKING_FILE}.txn."}
+    if [[ ! "$suffix" =~ ^[A-Za-z0-9]{6}$ || -L "$context" || ! -d "$context" || "$(readlink -e -- "$context")" != "$context" || "$(stat -c '%u:%g:%a' -- "$context")" != '0:0:700' ]]; then
+        echo "ERROR: Refusing to discard an unverified tracker context." >&2
+        return 1
+    fi
+    rm -f -- "$context/source" "$context/metadata" "$context/sha" "$context/next" "$context/affected" "$context/kernel.tsv" "$context/existing" "$context/stats" "$context/restore" "$context/restore.stdout" "$context/restore.stderr" "$context/native-calls" "$context/cleanup.tsv" "$context/published" "$context/after.sha" "$context/after.meta" "$context/commit" || return 1
+    rmdir -- "$context"
+}
+
 # Function to perform the blacklist action (Manual Ban)
 # UPDATED to accept an optional message
 perform_blacklist() {
@@ -1921,6 +2118,7 @@ perform_blacklist() {
     local ip="$1"
     local message="$2"
     local protected_ip_file
+    local tracking_context
     
     local timestamp_cmd
     timestamp_cmd=$(date "+%Y-%m-%d %H:%M:%S")
@@ -1950,15 +2148,25 @@ perform_blacklist() {
     fi
     rm -f "$protected_ip_file"
 
+    tracking_context=$(tracking_snapshot) || return 1
+    cp -- "$tracking_context/source" "$tracking_context/next" || return 1
+
     if ipset test "$IP_SET_NAME" "$ip" &> /dev/null; then
-        if ! awk -v target="$ip" '$1 == target {found=1} END {exit !found}' "$IP_TRACKING_FILE"; then
+        printf '%s\talready-live-verified\n' "$ip" >> "$tracking_context/kernel.tsv"
+        if ! awk -v target="$ip" '$1 == target {found=1} END {exit !found}' "$tracking_context/source"; then
             if ! printf '%s # [%s] Manual Blacklist: %s (live ban persistence repair)\n' \
-                "$ip" "$timestamp" "${message:-Manually blacklisted via --blacklist}" >> "$IP_TRACKING_FILE"; then
+                "$ip" "$timestamp" "${message:-Manually blacklisted via --blacklist}" >> "$tracking_context/next"; then
                 echo "ERROR: Could not repair tracking for live IP $ip in $IP_TRACKING_FILE. Live coverage is unchanged."
+                return 1
+            fi
+            if ! tracking_publish "$tracking_context"; then
+                printf '%s\n' "$ip" > "$tracking_context/affected"
+                tracking_record_failure "$tracking_context" "$tracking_context/affected" blacklist already-live || true
                 return 1
             fi
             echo "Repaired missing tracking for live IP $ip in $IP_TRACKING_FILE."
         fi
+        tracking_discard "$tracking_context" || return 1
         echo "IP $ip is already in ipset: $IP_SET_NAME. Refreshing live-session teardown."
         terminate_live_sessions_for_ip "$ip"
         local end_time_cmd
@@ -1978,7 +2186,7 @@ perform_blacklist() {
     local ban_reason="Manual Blacklist: ${message:-"Manually blacklisted via --blacklist"}"
     
     local current_ban_count_cmd
-    current_ban_count_cmd=$(wc -l < "$IP_TRACKING_FILE")
+    current_ban_count_cmd=$(wc -l < "$tracking_context/source")
     local current_ban_count=${current_ban_count_cmd}
   
     if [ "$current_ban_count" -ge "$MAX_BANS" ]; then
@@ -1989,6 +2197,7 @@ perform_blacklist() {
 
     if ipset add "$IP_SET_NAME" "$ip" -exist; then
         echo "Added $ip to ipset: $IP_SET_NAME."
+        printf '%s\tadd-command-succeeded\n' "$ip" >> "$tracking_context/kernel.tsv"
     else
         echo "ERROR: Failed to add $ip to ipset. Check ipset utility and permissions."
         return 1
@@ -1996,10 +2205,18 @@ perform_blacklist() {
 
     terminate_live_sessions_for_ip "$ip"
 
-    if ! printf '%s # [%s] %s\n' "$ip" "$timestamp" "$ban_reason" >> "$IP_TRACKING_FILE"; then
+    if ! printf '%s # [%s] %s\n' "$ip" "$timestamp" "$ban_reason" >> "$tracking_context/next"; then
         echo "ERROR: Could not persist tracking for new live IP $ip in $IP_TRACKING_FILE. Live coverage is retained; repair persistent tracking before reporting containment complete."
+        printf '%s\n' "$ip" > "$tracking_context/affected"
+        tracking_record_failure "$tracking_context" "$tracking_context/affected" blacklist live-add-succeeded || true
         return 1
     fi
+    if ! tracking_publish "$tracking_context"; then
+        printf '%s\n' "$ip" > "$tracking_context/affected"
+        tracking_record_failure "$tracking_context" "$tracking_context/affected" blacklist live-add-succeeded || true
+        return 1
+    fi
+    tracking_discard "$tracking_context" || return 1
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     local end_time_cmd
     end_time_cmd=$(date +%s)
@@ -2008,87 +2225,201 @@ perform_blacklist() {
     return 0
 }
 
-# Preflight an entire IPv4 list before mutating firewall state, then process
-# every unique entry through the same guarded single-IP path used by --blacklist.
-perform_blacklist_file() {
-    local source_file="$1"
-    local message="$2"
-    local normalized_file
-    local line=""
-    local entry=""
-    local line_number=0
-    local invalid_count=0
-    local total=0
-    local succeeded=0
-    local failed=0
-
-    if [ "$source_file" != "-" ] && [ ! -r "$source_file" ]; then
-        echo "Error: --blacklist-file cannot read: $source_file" >&2
-        return 1
-    fi
-
-    normalized_file=$(mktemp "${TMPDIR:-/tmp}/csf-blacklist-file.XXXXXX") || {
-        echo "Error: Unable to create blacklist batch staging file." >&2
-        return 1
-    }
-
-    if [ "$source_file" = "-" ]; then
-        exec 3<&0
-    else
-        exec 3<"$source_file"
-    fi
-
-    while IFS= read -r line <&3 || [ -n "$line" ]; do
+# Preflight the full IPv4 list before the shared snapshot/bulk-add transaction.
+# Parse every original input before setup/kernel work; retain duplicate line identity.
+blacklist_preflight() {
+    local source_file="$1" stage="$2" line entry canonical first line_number=0 invalid=0
+    local -a octets=()
+    local -A seen=()
+    : > "$stage/unique" || return 1
+    : > "$stage/inputs" || return 1
+    if [[ "$source_file" == - ]]; then exec 3<&0; else exec 3<"$source_file" || return 1; fi
+    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
         line_number=$((line_number + 1))
         entry=${line%%#*}
-        entry=$(printf '%s\n' "$entry" | awk '{$1=$1; print}')
-        [ -z "$entry" ] && continue
-
+        entry=${entry#"${entry%%[![:space:]]*}"}
+        entry=${entry%"${entry##*[![:space:]]}"}
+        [[ -n "$entry" ]] || continue
         if ! validate_ip "$entry"; then
-            case "$entry" in
-                *'\n'*)
-                    echo "Error: Invalid IPv4 batch at $source_file line $line_number: literal \\n separators were supplied." >&2
-                    echo "Remedy: feed one IPv4 per real newline; from a shell, use a quoted heredoc with --blacklist-file - instead of JSON-escaped text." >&2
-                    ;;
-                *)
-                    echo "Error: Invalid IPv4 address at $source_file line $line_number: $entry" >&2
-                    ;;
-            esac
-            invalid_count=$((invalid_count + 1))
+            printf '%s\t-\t%s\tinvalid\n' "$line_number" "$line_number" >> "$stage/inputs" || return 1
+            if [[ "$entry" == *'\n'* ]]; then
+                echo "Error: literal \\n separators at line $line_number. Remedy: feed one IPv4 per real newline; use a quoted heredoc with --blacklist-file -." >&2
+            else
+                echo "Error: Invalid IPv4 batch input at line $line_number; no mutations permitted." >&2
+            fi
+            invalid=$((invalid + 1))
             continue
         fi
-
-        if ! grep -Fqx "$entry" "$normalized_file"; then
-            printf '%s\n' "$entry" >> "$normalized_file"
+        IFS=. read -r -a octets <<< "$entry"
+        printf -v canonical '%d.%d.%d.%d' "$((10#${octets[0]}))" "$((10#${octets[1]}))" "$((10#${octets[2]}))" "$((10#${octets[3]}))"
+        first=${seen[$canonical]:-}
+        if [[ -n "$first" ]]; then
+            printf '%s\t%s\t%s\tduplicate\n' "$line_number" "$canonical" "$first" >> "$stage/inputs" || return 1
+        else
+            seen[$canonical]=$line_number
+            printf '%s\n' "$canonical" >> "$stage/unique" || return 1
+            printf '%s\t%s\t%s\tpending\n' "$line_number" "$canonical" "$line_number" >> "$stage/inputs" || return 1
         fi
     done
     exec 3<&-
-
-    if [ "$invalid_count" -ne 0 ]; then
-        rm -f "$normalized_file"
-        echo "Error: Refusing batch; $invalid_count invalid entr$( [ "$invalid_count" -eq 1 ] && printf 'y' || printf 'ies' ) found during preflight." >&2
+    if [[ "$invalid" -gt 0 ]]; then
+        echo "Error: Refusing batch; $invalid invalid input(s) found during preflight." >&2
         return 1
     fi
+    [[ -s "$stage/unique" ]] || { echo "Error: --blacklist-file contained no IPv4 addresses." >&2; return 1; }
+}
 
-    if [ ! -s "$normalized_file" ]; then
-        rm -f "$normalized_file"
-        echo "Error: --blacklist-file contained no IPv4 addresses." >&2
+blacklist_report_inputs() {
+    local stage="$1" fallback="${2:-not_completed}"
+    awk -F '\t' -v fallback="$fallback" '
+        FILENAME == ARGV[1] { status[$1]=$2; next }
+        FILENAME == ARGV[2] { cleanup[$1]=$2; next }
+        {
+            outcome=($4 == "invalid" ? "invalid" : (($2 in status) ? status[$2] : fallback))
+            printf "BATCH_INPUT %s %s disposition=%s cleanup=%s", $1, $2, outcome, (($2 in cleanup) ? cleanup[$2] : "not_attempted")
+            if ($4 == "duplicate") printf " duplicate-of=%s", $3
+            printf "\n"
+        }
+    ' "$stage/results" "$stage/cleanup" "$stage/inputs"
+}
+
+# A bounded best-effort attempt, never a claim that established sockets closed.
+blacklist_cleanup_ip() {
+    local body
+    body=$(declare -f terminate_live_sessions_for_ip) || return 1
+    env -i PATH="$PATH" LANG=C timeout -s KILL 2 bash -c "$body"$'\n''terminate_live_sessions_for_ip "$1"' -- "$1"
+}
+
+execute_blacklist_batch() {
+    local stage="$1" message="$2" context ip status country timestamp restore_status=0 failed=0 cleanup_start verified=0 cleanup_exit
+    local -A existing=()
+    ensure_setup
+    ensure_live_ipset_capacity || return 1
+    build_protected_ipv4_file "$stage/policy" || return 1
+    filter_ipv4_records_against_policy "$stage/policy" "$stage/unique" "$stage/eligible" "$stage/protected" || return 1
+    while IFS= read -r ip; do printf '%s\tprotected\n' "$ip" >> "$stage/results"; failed=1; done < "$stage/protected"
+    [[ -s "$stage/eligible" ]] || return 1
+    context=$(tracking_snapshot) || return 1
+    printf '%s\n' "$context" > "$stage/context" || return 1
+    cp -- "$stage/eligible" "$context/affected" || return 1
+    # One normalization pass over the private beforeimage; no per-IP tracker scans.
+    if ! gawk -v membership="$context/existing" -v stats="$context/stats" '
+        function valid(ip, a,n,i) {
+            n=split(ip,a,"."); if(n != 4) return 0
+            for(i=1;i<=4;i++) if(a[i] !~ /^[0-9]+$/ || a[i]+0 > 255) return 0
+            return 1
+        }
+        function canonical(ip,a) { split(ip,a,".");return sprintf("%d.%d.%d.%d",a[1]+0,a[2]+0,a[3]+0,a[4]+0) }
+        FILENAME == ARGV[1] { candidate[$1]=1; next }
+        {
+            if(!NF || $1 ~ /^#/) { order[++count]="comment:" FNR; row[order[count]]=$0; next }
+            if(!valid($1)) { bad=1; print "Error: Unsupported tracker entry at line " FNR "; review retained snapshot before retrying" > "/dev/stderr"; next }
+            ip=canonical($1); line=$0; sub(/^[[:space:]]*[^[:space:]]+/,ip,line)
+            if(!(ip in row)) { order[++count]=ip; row[ip]=line; unique++ }
+            else { duplicates++; if(tolower(line) ~ /do not delete/ && tolower(row[ip]) !~ /do not delete/) row[ip]=line }
+        }
+        END {
+            if(bad) exit 2
+            for(i=1;i<=count;i++) print row[order[i]]
+            for(ip in candidate) print ip "\t" ((ip in row) ? 1 : 0) > membership
+            print unique "\t" duplicates > stats
+        }
+    ' "$stage/eligible" "$context/source" > "$context/next"; then
+        tracking_record_failure "$context" "$stage/eligible" blacklist-batch not-applied-invalid-tracker || true
         return 1
     fi
-
-    total=$(wc -l < "$normalized_file")
-    while IFS= read -r entry; do
-        if perform_blacklist "$entry" "$message"; then
-            succeeded=$((succeeded + 1))
+    while IFS=$'\t' read -r ip status; do existing[$ip]=$status; done < "$context/existing"
+    : > "$context/restore" || return 1
+    while IFS= read -r ip; do printf 'add %s %s -exist\n' "$IP_SET_NAME" "$ip" >> "$context/restore" || return 1; done < "$stage/eligible"
+    if ipset restore < "$context/restore" > "$context/restore.stdout" 2> "$context/restore.stderr"; then restore_status=0; else restore_status=$?; failed=1; fi
+    printf 'restore\texit=%s\n' "$restore_status" > "$context/native-calls"
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    cleanup_start=$SECONDS
+    while IFS= read -r ip; do
+        if ipset test "$IP_SET_NAME" "$ip" >> "$context/native-calls" 2>&1; then
+            printf '%s\tlive-verified\n' "$ip" >> "$context/kernel.tsv"
+            verified=$((verified + 1))
+            if [[ "${existing[$ip]}" == 0 ]]; then
+                country=$(geoiplookup "$ip" 2>/dev/null | sed -n -e 's/GeoIP Country Edition: //p' | gawk -F', ' '{print $2}' | sed 's/^[[:space:]]*//')
+                country=${country:-Unknown_Country}
+                printf '%s # [%s] Manual Blacklist: %s (%s)\n' "$ip" "$timestamp" "${message:-Manually blacklisted via --blacklist}" "$country" >> "$context/next" || return 1
+            fi
+            printf '%s\tlive_verified_tracking_not_qualified\n' "$ip" >> "$stage/results"
+            if (( SECONDS - cleanup_start < 10 )); then
+                if blacklist_cleanup_ip "$ip"; then
+                    status=exit_0
+                else
+                    cleanup_exit=$?
+                    status="exit_$cleanup_exit"
+                    case "$cleanup_exit" in 124|137) : ;; *) failed=1 ;; esac
+                fi
+            else status=deferred_budget; fi
+            printf '%s\t%s\n' "$ip" "$status" >> "$stage/cleanup"
         else
-            failed=$((failed + 1))
-            echo "Error: Blacklist action failed for $entry; continuing batch." >&2
+            status=$?
+            printf '%s\tnot-live-after-restore-exit-%s\n' "$ip" "$status" >> "$context/kernel.tsv"
+            printf '%s\tnot_live_after_restore\n' "$ip" >> "$stage/results"
+            failed=1
         fi
-    done < "$normalized_file"
-    rm -f "$normalized_file"
+    done < "$stage/eligible"
+    if [[ "$verified" -eq 0 ]]; then
+        tracking_record_failure "$context" "$stage/eligible" blacklist-batch no-verified-native-members || true
+        return 1
+    fi
+    if ! tracking_publish "$context"; then
+        tracking_record_failure "$context" "$stage/eligible" blacklist-batch native-status-in-kernel-ledger || true
+        return 1
+    fi
+    # Independent readback after persistence; no automatic replay of a failed add.
+    while IFS= read -r ip; do
+        if ipset test "$IP_SET_NAME" "$ip" >> "$context/native-calls" 2>&1; then
+            # Only addresses verified before the commit were admitted to the new image.
+            if awk -F '\t' -v target="$ip" '$1==target && $2=="live-verified" {found=1} END {exit !found}' "$context/kernel.tsv"; then
+                printf '%s\tlive_persisted\n' "$ip" >> "$stage/results"
+            else
+                printf '%s\ttracking_not_qualified\n' "$ip" >> "$stage/results"; failed=1
+            fi
+        else
+            printf '%s\tpersisted_readback_not_live\n' "$ip" >> "$stage/results"; failed=1
+        fi
+    done < "$stage/eligible"
+    if [[ "$failed" -ne 0 ]]; then
+        echo "Error: Batch has protected/native/readback failures; retained context: $context. No automatic retry or rollback." >&2
+        return 1
+    fi
+    tracking_discard "$context" || return 1
+}
 
-    echo "Blacklist batch complete: $total unique IPs; $succeeded succeeded, $failed failed."
-    [ "$failed" -eq 0 ]
+# Existing CLI spelling, now a genuine batch transaction rather than a per-IP loop.
+perform_blacklist_file() {
+    (
+        umask 077
+        local source_file="$1" message="$2" stage status=0 fallback=not_completed total succeeded failed
+        if [[ "$source_file" != - && ! -r "$source_file" ]]; then echo "Error: --blacklist-file cannot read: $source_file" >&2; return 1; fi
+        if [[ "$message" == *$'\n'* || "$message" == *$'\r'* ]]; then echo "Error: Batch reason must be one line." >&2; return 1; fi
+        stage=$(mktemp -d "${TMPDIR:-/tmp}/csf-blacklist-file.XXXXXX") || return 1
+        : > "$stage/results" || return 1
+        : > "$stage/cleanup" || return 1
+        if blacklist_preflight "$source_file" "$stage"; then
+            if execute_blacklist_batch "$stage" "$message"; then status=0; else status=$?; fi
+        else
+            status=1; fallback=not_applied_invalid_batch
+        fi
+        blacklist_report_inputs "$stage" "$fallback"
+        read -r total succeeded failed < <(awk -F '\t' '
+            FILENAME == ARGV[1] { final[$1]=$2; next }
+            { total++; if(final[$1]=="live_persisted") succeeded++; else failed++ }
+            END { print total+0, succeeded+0, failed+0 }
+        ' "$stage/results" "$stage/unique")
+        echo "Blacklist batch complete: $total unique IPs; $succeeded succeeded, $failed failed."
+        if [[ "$status" -eq 0 ]]; then
+            rm -f -- "$stage/unique" "$stage/inputs" "$stage/results" "$stage/cleanup" "$stage/policy" "$stage/eligible" "$stage/protected" "$stage/context" || return 1
+            rmdir -- "$stage" || return 1
+        else
+            echo "Error: Complete per-input batch evidence retained: $stage" >&2
+        fi
+        return "$status"
+    )
 }
 
 # Remove an exact address from this tool's live and persistent deny coverage
@@ -2098,6 +2429,7 @@ perform_unblacklist() {
     local ip="$1"
     local message="$2"
     local cleaned_tracking_file
+    local tracking_context
     local tracked_count
     local removed_live=0
 
@@ -2113,8 +2445,10 @@ perform_unblacklist() {
         return 1
     }
 
-    tracked_count=$(awk -v target="$ip" '$1 == target { count++ } END { print count + 0 }' "$IP_TRACKING_FILE")
-    awk -v target="$ip" '$1 != target' "$IP_TRACKING_FILE" > "$cleaned_tracking_file"
+    tracking_context=$(tracking_snapshot) || return 1
+
+    tracked_count=$(awk -v target="$ip" '$1 == target { count++ } END { print count + 0 }' "$tracking_context/source")
+    awk -v target="$ip" '$1 != target' "$tracking_context/source" > "$cleaned_tracking_file"
 
     if ipset test "$IP_SET_NAME" "$ip" >/dev/null 2>&1; then
         if ! ipset del "$IP_SET_NAME" "$ip"; then
@@ -2128,13 +2462,13 @@ perform_unblacklist() {
         echo "$ip was not present in live ipset: $IP_SET_NAME."
     fi
 
+    printf '%s\tkernel-removed=%s\n' "$ip" "$removed_live" > "$tracking_context/kernel.tsv"
     if [ "$tracked_count" -gt 0 ]; then
-        chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
-        chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
-        if ! mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"; then
-            [ "$removed_live" -eq 0 ] || ipset add "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1 || true
+        if ! cp -- "$cleaned_tracking_file" "$tracking_context/next" || ! tracking_publish "$tracking_context"; then
+            printf '%s\n' "$ip" > "$tracking_context/affected"
+            tracking_record_failure "$tracking_context" "$tracking_context/affected" unblacklist "removed-live=$removed_live" || true
             rm -f "$cleaned_tracking_file"
-            echo "ERROR: Failed to replace $IP_TRACKING_FILE; restored live deny coverage when possible."
+            echo "ERROR: Failed to replace $IP_TRACKING_FILE; live and persistent state need review; no automatic rollback."
             return 1
         fi
         echo "Removed $tracked_count tracking entr$( [ "$tracked_count" -eq 1 ] && printf 'y' || printf 'ies' ) for $ip."
@@ -2142,6 +2476,9 @@ perform_unblacklist() {
         rm -f "$cleaned_tracking_file"
         echo "$ip was not present in $IP_TRACKING_FILE."
     fi
+
+    rm -f "$cleaned_tracking_file"
+    tracking_discard "$tracking_context" || return 1
 
     echo "No csf.allow entry was created."
     [ -z "$message" ] || echo "Reason: $message"
@@ -2209,6 +2546,7 @@ perform_whitelist_local_addresses() {
     local local_ip_file
     local cleaned_tracking_file
     local tracking_backup
+    local tracking_context
     local before_count
     local after_count
     local removed_count
@@ -2231,6 +2569,8 @@ perform_whitelist_local_addresses() {
         exit 1
     fi
 
+    tracking_context=$(tracking_snapshot) || exit 1
+
     echo "--- Local Address Whitelist Action ---"
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
@@ -2240,29 +2580,38 @@ perform_whitelist_local_addresses() {
         else
             echo "Local address $ip is already present in $CSF_ALLOW_FILE."
         fi
-        ipset del "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1 || true
+        if ! ipset del "$IP_SET_NAME" "$ip" -exist >/dev/null 2>&1; then
+            printf '%s\tdelete-command-failed\n' "$ip" >> "$tracking_context/kernel.tsv"
+            tracking_record_failure "$tracking_context" "$local_ip_file" local-whitelist not-attempted || true
+            exit 1
+        fi
+        printf '%s\tdelete-command-succeeded\n' "$ip" >> "$tracking_context/kernel.tsv"
     done < "$local_ip_file"
 
-    before_count=$(wc -l < "$IP_TRACKING_FILE")
+    before_count=$(wc -l < "$tracking_context/source")
     awk 'NR == FNR { protected[$1] = 1; next } !($1 in protected)' \
-        "$local_ip_file" "$IP_TRACKING_FILE" > "$cleaned_tracking_file"
+        "$local_ip_file" "$tracking_context/source" > "$cleaned_tracking_file"
     after_count=$(wc -l < "$cleaned_tracking_file")
     removed_count=$((before_count - after_count))
 
     if [ "$removed_count" -gt 0 ]; then
         tracking_backup="${IP_TRACKING_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-        cp -a "$IP_TRACKING_FILE" "$tracking_backup" || {
+        cp -a "$tracking_context/source" "$tracking_backup" || {
             rm -f "$local_ip_file" "$cleaned_tracking_file"
             exit 1
         }
-        chmod --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
-        chown --reference="$IP_TRACKING_FILE" "$cleaned_tracking_file"
-        mv -f "$cleaned_tracking_file" "$IP_TRACKING_FILE"
+        if ! cp -- "$cleaned_tracking_file" "$tracking_context/next" || ! tracking_publish "$tracking_context"; then
+            tracking_record_failure "$tracking_context" "$local_ip_file" local-whitelist kernel-removal-attempted || true
+            exit 1
+        fi
+        rm -f "$cleaned_tracking_file"
         echo "Removed $removed_count local-address entries from tracking (backup: $tracking_backup)."
     else
         rm -f "$cleaned_tracking_file"
         echo "No local addresses were present in the tracking file."
     fi
+
+    tracking_discard "$tracking_context" || exit 1
 
     echo "Reloading CSF once to apply the local-address allowlist..."
     /usr/sbin/csf -r
@@ -2329,7 +2678,7 @@ perform_init() {
     fi
 
     echo "5. Ensuring tracking file $IP_TRACKING_FILE exists..."
-    touch "$IP_TRACKING_FILE" || { echo "ERROR: Cannot create tracking file $IP_TRACKING_FILE"; exit 1; }
+    tracking_initialize || { echo "ERROR: Cannot initialize safe tracking file $IP_TRACKING_FILE"; exit 1; }
 
     echo "6. Reloading CSF to apply new rules..."
     /usr/sbin/csf -r
@@ -2377,6 +2726,10 @@ perform_clear() {
         exit 1
     fi
     
+    local tracking_context
+    tracking_context=$(tracking_snapshot) || exit 1
+    : > "$tracking_context/next" || exit 1
+
     echo "Proceeding with full IPSET flush and tracking file clear..."
     
     if ipset flush "$IP_SET_NAME"; then
@@ -2386,16 +2739,12 @@ perform_clear() {
         exit 1
     fi
     
-    if truncate -s 0 "$IP_TRACKING_FILE"; then
-        echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE."
-    else
-        if true > "$IP_TRACKING_FILE"; then
-            echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE (using redirection)."
-        else
-            echo "ERROR: Failed to clear tracking file '$IP_TRACKING_FILE'."
-            exit 1
-        fi
+    if ! tracking_publish "$tracking_context"; then
+        tracking_record_failure "$tracking_context" "$tracking_context/source" clear live-flush-succeeded || true
+        exit 1
     fi
+    tracking_discard "$tracking_context" || exit 1
+    echo "Successfully cleared all content from tracking file: $IP_TRACKING_FILE."
 
     echo "IPSET '$IP_SET_NAME' is now empty. All prior bans are removed."
     local end_time_cmd
@@ -3236,7 +3585,7 @@ while true; do
             echo "  --whitelist <IP> [MSG]    Add IP to CSF allow list"
             echo "  --blacklist|--block <IP> [MSG]  Add IP to ipset and tracking (manual ban)"
             echo "                               Repairs missing tracking for an already-live reviewed ban"
-            echo "  --blacklist-file <FILE|-> [MSG]  Ban bare IPv4 addresses (one per line); MSG is one shared reason"
+            echo "  --blacklist-file <FILE|-> [MSG]  Batch bare IPv4s; one tracker normalization + guarded publish; itemize every input"
             echo "  --unblacklist <IP> [MSG]  Remove IP from this tool's live/tracked deny without adding csf.allow"
             echo "  --check-ip <IP>           Report live and persistent deny/allow coverage (read-only)"
             echo "  --promote-cidr <CIDR> [MSG]  Atomically replace covered child bans with a persistent IPv4 /24"
@@ -4178,7 +4527,9 @@ echo "Total unique IPs detected for action: $TOTAL_UNIQUE_IPS" > "/dev/stderr"
 echo "--- 🌍 Starting Batch GeoIP Lookup (Optimized) ---" > "/dev/stderr"
 
 # 1. Load existing IPs and their countries from the tracking file into a temporary file using robust AWK parsing
-TOTAL_TRACKING_LINES_FOR_CACHE_CMD=$(wc -l < "$IP_TRACKING_FILE" 2>/dev/null)
+TRACKING_SCAN_CONTEXT=$(tracking_snapshot) || exit 1
+TRACKING_SCAN_SOURCE="$TRACKING_SCAN_CONTEXT/source"
+TOTAL_TRACKING_LINES_FOR_CACHE_CMD=$(wc -l < "$TRACKING_SCAN_SOURCE" 2>/dev/null)
 TOTAL_TRACKING_LINES_FOR_CACHE=${TOTAL_TRACKING_LINES_FOR_CACHE_CMD}
 echo "Parsing $TOTAL_TRACKING_LINES_FOR_CACHE existing bans for GeoIP caching..." > "/dev/stderr"
 
@@ -4209,7 +4560,7 @@ gawk -v total_lines="$TOTAL_TRACKING_LINES_FOR_CACHE" \
         if (total_lines > 0) {
             printf "Parsing Progress: %d of %d (100.00%%) - Complete.\n" , total_lines, total_lines > "/dev/stderr";
         }
-    }' "$IP_TRACKING_FILE"
+    }' "$TRACKING_SCAN_SOURCE"
 
 # Load the simple IP\tCountry file into the shell array for fast lookup
 declare -A existing_ips_map
@@ -4272,7 +4623,7 @@ echo "--- ⚙️ START: FINAL EXECUTION (Loading bans and calling ipset) ---" > 
 # It only captures stdout (where "INSERTED" and "UPGRADED" messages are printed).
 LOG_SCAN_OUTPUT_CMD=$(
 gawk -v ip_set_name="$IP_SET_NAME" \
--v tracking_file="$IP_TRACKING_FILE" \
+-v tracking_file="$TRACKING_SCAN_SOURCE" \
 -v temp_tracking_file="$TEMP_TRACKING_FILE" \
 -v max_bans="$MAX_BANS" \
 -v max_permanent_bans="$MAX_PERMANENT_BANS" \
@@ -4513,7 +4864,15 @@ LOG_SCAN_OUTPUT=${LOG_SCAN_OUTPUT_CMD}
 # --- 💾 FIXED: ATOMIC FILE REPLACEMENT (Phase 2) ---
 # This check prevents replacement with a zero-byte file if no bans (old or new) exist.
 if [ -s "$TEMP_TRACKING_FILE" ]; then
-    mv "$TEMP_TRACKING_FILE" "$IP_TRACKING_FILE"
+    if ! cp -- "$TEMP_TRACKING_FILE" "$TRACKING_SCAN_CONTEXT/next" || ! tracking_publish "$TRACKING_SCAN_CONTEXT"; then
+        if cat -- "$TRACKING_SCAN_CONTEXT/source" "$TEMP_UNIQUE_IPS" > "$TRACKING_SCAN_CONTEXT/affected"; then
+            tracking_record_failure "$TRACKING_SCAN_CONTEXT" "$TRACKING_SCAN_CONTEXT/affected" automatic-scan kernel-plan-attempted || true
+        else
+            echo "ERROR: Cannot enumerate automatic-scan failure inputs; retain context: $TRACKING_SCAN_CONTEXT" >&2
+        fi
+        exit 1
+    fi
+    tracking_discard "$TRACKING_SCAN_CONTEXT" || exit 1
 else
     # The file is not moved, preserving whatever content was left by Phase 1 (even if empty).
     echo "ERROR: Tracking file update failed. File was empty or not created." >> /dev/stderr

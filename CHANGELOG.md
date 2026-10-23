@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make file blacklists normalize one tracker snapshot, bulk-add once and report every input, with independent live/persistence and bounded session-cleanup results.
+- Coordinate all eight tracker writers through file-only locks and exact beforeimage guards; preserve concurrent winners, ownership and private failure evidence without automatic rollback or native replay.
+- Add isolated concurrent CLI, recursive-hook, partial-failure, timeout and actual tracker-read-count regressions compatible with the legacy runtime.
+
 - Return failure when a newly inserted manual/batch ban cannot be persisted in the tracker; retain live coverage and state the repair requirement instead of reporting success.
 
 - Protect numeric IPv4/CIDR trust entries in recursive CSF Include files and advanced-filter address operands across scans, blacklist operations, reconciliation, migration, and rebuilds.
