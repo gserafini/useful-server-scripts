@@ -1,6 +1,7 @@
 """Actual private CLI copies with kernel/config paths exclusively replaced by fakes."""
 import hashlib, json, os, re, signal, subprocess, tempfile, time, unittest
 from pathlib import Path
+from fixture_process_guard import capture_fixture,run_fixture,spawn_fixture
 SOURCE=Path(__file__).resolve().parents[1]/'scripts/csf_ban_wp_login_attackers'
 class CLIProcesses(unittest.TestCase):
  def setUp(self):
@@ -11,10 +12,13 @@ class CLIProcesses(unittest.TestCase):
   code=SOURCE.read_text();code=code.replace('/usr/sbin/csf -r','"$CSF_BIN" -r').replace('/tmp/',str(self.root/'tmp')+'/')
   override='\n'.join([f'PATH="{self.bin}:/usr/bin:/bin"',f'IP_TRACKING_FILE="{self.tracker}"',f'CSF_ALLOW_FILE="{self.root}/allow"',f'CSF_IGNORE_FILE="{self.root}/ignore"',f'CSF_DENY_FILE="{self.root}/deny"',f'CSF_CONF_FILE="{self.root}/csf.conf"',f'CSF_TEMPIP_FILE="{self.root}/tempip"',f'CSF_POST_FILE="{self.root}/csfpost"',f'CSF_PROMOTE_LOCK_FILE="{self.root}/promotion.lock"',f'LFD_LOG_FILE="{self.root}/lfd.log"',f'CSF_BIN="{self.bin}/csf"',f'DEFAULT_LOG_PATHS="{self.root}/logs"',f'get_iptables_path() {{ printf "%s\\n" "{self.bin}/iptables"; }}','ensure_setup() { :; }','ensure_live_ipset_capacity() { :; }','repopulate_ipset_from_tracking_file() { :; }',f'''build_protected_ipv4_file() {{ printf '%s\\n' 127.0.0.1 10.20.30.40 > "$1"; awk '$1 ~ /^[0-9]/ {{print $1}}' "{self.root}/allow" >> "$1"; }}'''])+'\n'
   marker='# --- COMMAND LINE ARGUMENT PARSING ---';self.assertEqual(code.count(marker),1);code=code.replace(marker,override+marker);self.cli=self.root/'cli.sh';self.cli.write_text(code);self.cli.chmod(0o700);(self.root/'source-hashes.json').write_text(json.dumps({'reviewedSourceSHA256':hashlib.sha256(SOURCE.read_bytes()).hexdigest(),'isolatedAdapterSHA256':hashlib.sha256(self.cli.read_bytes()).hexdigest()}))
+  (self.root/'fixture_process_guard.py').write_text((SOURCE.parents[1]/'tests/fixture_process_guard.py').read_text())
   fake=r'''#!/usr/bin/python3.12
 import fcntl,json,os,subprocess,sys,time
 from pathlib import Path
 root=Path(__file__).resolve().parents[1];name=Path(sys.argv[0]).name;args=sys.argv[1:]
+sys.path.insert(0,str(root))
+from fixture_process_guard import run_fixture
 # Every kernel/reload hook must run with the real tracker mutex released.
 lock=root/'tracker.lock'
 if lock.exists():
@@ -58,7 +62,7 @@ if name=='ipset':
  if command in ['create','destroy','swap']:sys.exit(0)
  print('UNSUPPORTED FAKE IPSET',args,file=sys.stderr);sys.exit(96)
 if name=='csf':
- sys.exit(subprocess.run(['/bin/bash',str(root/'cli.sh'),'--rebuild-live-set'],env={'PATH':str(root/'bin')+':/usr/bin:/bin','LANG':'C','TMPDIR':str(root/'tmp')},timeout=8).returncode)
+ sys.exit(run_fixture(['/bin/bash',str(root/'cli.sh'),'--rebuild-live-set'],env={'PATH':str(root/'bin')+':/usr/bin:/bin','LANG':'C','TMPDIR':str(root/'tmp')},timeout=8).returncode)
 if name=='geoiplookup':print('GeoIP Country Edition: ZZ, Fixture');sys.exit(0)
 if name=='ip':print('2: eth0 inet 10.20.30.40/24 brd 10.20.30.255 scope global eth0');sys.exit(0)
 if name in ['conntrack','ss','iptables']:sys.exit(0)
@@ -66,7 +70,7 @@ print('FORBIDDEN native service/cleanup call',name,file=sys.stderr);sys.exit(95)
 '''
   for name in ['ipset','csf','geoiplookup','ip','conntrack','ss','iptables','systemctl','service','killall','pkill']:
    f=self.bin/name;f.write_text(fake);f.chmod(0o700)
-  subprocess.run(['bash','-n',str(self.cli)],check=True,capture_output=True)
+  syntax=run_fixture(['bash','-n',str(self.cli)],timeout=5,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);self.assertEqual(syntax.returncode,0,syntax.stderr)
   self.env={'PATH':str(self.bin)+':/usr/bin:/bin','LANG':'C','TMPDIR':str(self.root/'tmp')}
  def launch(self,args,env=None,tty=False):
   if tty:
@@ -74,15 +78,28 @@ print('FORBIDDEN native service/cleanup call',name,file=sys.stderr);sys.exit(95)
    master,slave=pty.openpty()
   else:slave=subprocess.PIPE
   trace=self.root/('trace-'+str(time.monotonic_ns())+'.log');trace.touch(mode=0o600)
-  proc=subprocess.Popen(['strace','-f','-e','trace=file,process','-o',str(trace),'bash',str(self.cli),*args],cwd=self.root,env={**self.env,**(env or {})},stdin=slave,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+  proc=spawn_fixture(['strace','-f','-e','trace=file,process','-o',str(trace),'bash',str(self.cli),*args],cwd=self.root,env={**self.env,**(env or {})},stdin=slave,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
   proc._fixture_trace=trace
+  self.addCleanup(self.cleanup_unfinished,proc)
   if tty:os.close(slave);os.write(master,b'YES\n');proc._fixture_master=master
   return proc
- def finish(self,proc,name):
-  try:out,err=proc.communicate(timeout=15)
-  except subprocess.TimeoutExpired:
-   os.killpg(proc.pid,signal.SIGKILL);out,err=proc.communicate();self.fail('private fixture process exceeded deadline: '+name)
+ def cleanup_unfinished(self,proc):
+  if getattr(proc,'_fixture_finished',False):return
+  result=capture_fixture(proc,0,force_stop='test teardown after an early failure')
+  proc._fixture_finished=True
+  (self.root/('teardown-'+str(proc.pid)+'.json')).write_text(json.dumps(result,indent=2))
   if hasattr(proc,'_fixture_master'):os.close(proc._fixture_master)
+  self.assertTrue(result['cleanup']['directChildReaped'],'private direct child not reaped; inspect teardown receipt')
+  self.assertFalse(result['cleanup']['pipeWritersUnknown'],'unknown pipe writers; inspect teardown receipt')
+  self.assertEqual(result['cleanup']['errors'],[],'guarded teardown errors; inspect receipt')
+  self.fail('unfinished private fixture required teardown; receipt preserved')
+ def finish(self,proc,name,force_stop=None):
+  result=capture_fixture(proc,15,force_stop=force_stop)
+  proc._fixture_finished=True
+  out,err=result['stdout'],result['stderr']
+  if hasattr(proc,'_fixture_master'):os.close(proc._fixture_master)
+  (self.root/(name+'.json')).write_text(json.dumps(result,indent=2))
+  if result['error']:self.fail('private fixture capture failed; preserved receipt: '+name+' '+result['error'])
   lines=proc._fixture_trace.read_text().splitlines()
   writes=[];execs=[]
   for line in lines:
@@ -99,12 +116,12 @@ print('FORBIDDEN native service/cleanup call',name,file=sys.stderr);sys.exit(95)
   for path in execs:
    self.assertNotIn(path,['/usr/sbin/csf','/sbin/ipset','/usr/sbin/ipset','/usr/sbin/conntrack','/sbin/conntrack','/usr/sbin/ss','/sbin/iptables'],path)
   (self.root/(name+'-syscalls.json')).write_text(json.dumps({'traceFile':str(proc._fixture_trace),'execPaths':sorted(set(execs)),'checkedMutationCalls':len(writes),'productionCSFOpens':0,'outsideFixtureWrites':0},indent=2))
-  (self.root/(name+'.json')).write_text(json.dumps({'returncode':proc.returncode,'stdout':out,'stderr':err},indent=2));return proc.returncode,out,err
+  return proc.returncode,out,err
  def race(self,args,wait_command,wait_ip,tty=False):
   a=self.launch(args,{'WAIT_COMMAND':wait_command,'WAIT_IP':wait_ip},tty=tty);deadline=time.monotonic()+8
   while not (self.root/'ready').exists():
    if a.poll() is not None:self.fail('first private CLI exited before barrier: '+str(self.finish(a,'early')))
-   if time.monotonic()>deadline:os.killpg(a.pid,signal.SIGKILL);self.finish(a,'barrier-timeout');self.fail('private CLI barrier timed out')
+   if time.monotonic()>deadline:self.finish(a,'barrier-timeout',force_stop='private CLI barrier deadline');self.fail('private CLI barrier timed out')
    time.sleep(.01)
   b=self.launch(['--blacklist','203.0.113.3','winner']);result=self.finish(b,'winner');self.assertEqual(result[0],0,result[2]);winner=self.tracker.read_bytes();(self.root/'go').touch();result=self.finish(a,'stale');self.assertNotEqual(result[0],0,result[2]);self.assertIn('beforeimage',result[2]);self.assertEqual(self.tracker.read_bytes(),winner);self.assertIn(b'203.0.113.3',winner)
  def test_two_single_cli_processes_preserve_winner(self):self.race(['--blacklist','203.0.113.1','stale'],'add','203.0.113.1')

@@ -1,6 +1,7 @@
 """Extract only blacklist functions; all firewall/session/policy calls are fakes."""
 import unittest,subprocess,tempfile,os,re,json
 from pathlib import Path
+from fixture_process_guard import run_fixture
 SCRIPT=Path(os.environ.get('SCRIPT',Path(__file__).resolve().parents[1]/'scripts/csf_ban_wp_login_attackers'))
 class BatchTests(unittest.TestCase):
  def run_case(self,inputs,tracker='',fail_ip='',bad_tracker=False,single=False,initial_live='',publish_fail=False,cleanup_advance=0,cleanup_exit=0):
@@ -47,8 +48,8 @@ ipset() {
 perform_blacklist_file "$FIXTURE/input" 'fixture reason'
 """
   if single:bash=bash.replace("perform_blacklist_file \"$FIXTURE/input\" 'fixture reason'", "perform_blacklist 203.0.113.1 'fixture reason'")
-  script=d/'case.sh';script.write_text(bash);syntax=subprocess.run(['bash','-n',str(script)],capture_output=True,text=True);self.assertEqual(syntax.returncode,0,syntax.stderr)
-  result=subprocess.run(['strace','-f','-e','trace=openat','-o',str(d/'opens'),'bash',str(script)],capture_output=True,text=True,env={'PATH':'/usr/bin:/bin','LANG':'C','TMPDIR':str(d),'FIXTURE':str(d),'FAIL_IP':fail_ip,'PUBLISH_FAIL':'yes' if publish_fail else 'no','CLEANUP_ADVANCE':str(cleanup_advance),'CLEANUP_EXIT':str(cleanup_exit)},timeout=15)
+  script=d/'case.sh';script.write_text(bash);syntax=run_fixture(['bash','-n',str(script)],timeout=5,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);self.assertEqual(syntax.returncode,0,syntax.stderr)
+  result=run_fixture(['strace','-f','-e','trace=openat','-o',str(d/'opens'),'bash',str(script)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env={'PATH':'/usr/bin:/bin','LANG':'C','TMPDIR':str(d),'FIXTURE':str(d),'FAIL_IP':fail_ip,'PUBLISH_FAIL':'yes' if publish_fail else 'no','CLEANUP_ADVANCE':str(cleanup_advance),'CLEANUP_EXIT':str(cleanup_exit)},timeout=15)
   events=(d/'events').read_text().splitlines();live=(d/'live').read_text().splitlines();tracked=(d/'tracker').read_text() if not bad_tracker else ''
   reads=sum('"'+str(d/'tracker')+'"' in line and 'O_RDONLY' in line for line in (d/'opens').read_text().splitlines())
   (d/'receipt.json').write_text(json.dumps({'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr,'events':events,'trackerReads':reads,'live':live,'tracked':tracked},indent=2))
