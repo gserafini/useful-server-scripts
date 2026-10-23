@@ -217,6 +217,9 @@ sudo csf_ban_wp_login_attackers --blacklist 1.2.3.4 "Brute force wp-login"
 # Ban a reviewed list after validating the entire input before any mutation
 sudo csf_ban_wp_login_attackers --blacklist-file campaign-ips.txt "Distributed crawler campaign"
 
+# File input currently uses the guarded single-IP path for each unique address.
+# It is not a single-pass tracker update or an atomic multi-IP transaction.
+
 # Read the reviewed list from stdin
 printf '%s\n' 1.2.3.4 5.6.7.8 | sudo csf_ban_wp_login_attackers --blacklist-file - "Distributed crawler campaign"
 

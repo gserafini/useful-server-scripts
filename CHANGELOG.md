@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Return failure when a newly inserted manual/batch ban cannot be persisted in the tracker; retain live coverage and state the repair requirement instead of reporting success.
+
 - Protect numeric IPv4/CIDR trust entries in recursive CSF Include files and advanced-filter address operands across scans, blacklist operations, reconciliation, migration, and rebuilds.
 - Abort safely when trust policy files cannot be read, Includes cycle, or numeric address entries are malformed; publish the protected inventory only after complete validation.
 - Run firewall regression tests against their own checkout by default, with an explicit `SCRIPT` override available for candidate verification.

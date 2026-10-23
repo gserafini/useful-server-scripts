@@ -1996,7 +1996,10 @@ perform_blacklist() {
 
     terminate_live_sessions_for_ip "$ip"
 
-    echo "$ip # [$timestamp] $ban_reason" | tee -a "$IP_TRACKING_FILE" > /dev/null
+    if ! printf '%s # [%s] %s\n' "$ip" "$timestamp" "$ban_reason" >> "$IP_TRACKING_FILE"; then
+        echo "ERROR: Could not persist tracking for new live IP $ip in $IP_TRACKING_FILE. Live coverage is retained; repair persistent tracking before reporting containment complete."
+        return 1
+    fi
     echo "Added $ip to tracking file: $IP_TRACKING_FILE."
     local end_time_cmd
     end_time_cmd=$(date +%s)
