@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Expose the complete protected IPv4 policy through read-only `--export-protected-ipv4`, so security consumers reuse recursive Includes, advanced filter operands and local-address protections without copying firewall logic.
+- Keep the ModSecurity adapter fixture inside its own checkout when invoked from another working directory; cPanel securetmp can prohibit executing fixtures in /tmp.
+
 - Make file blacklists normalize one tracker snapshot, bulk-add once and report every input, with independent live/persistence and bounded session-cleanup results.
 - Coordinate all eight tracker writers through file-only locks and exact beforeimage guards; preserve concurrent winners, ownership and private failure evidence without automatic rollback or native replay.
 - Add isolated concurrent CLI, recursive-hook, partial-failure, timeout and actual tracker-read-count regressions compatible with the legacy runtime.

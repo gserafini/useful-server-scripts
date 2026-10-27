@@ -360,6 +360,18 @@ build_protected_ipv4_file() {
     )
 }
 
+# Read-only public interface to the canonical complete protected-address policy.
+# Emit only after Includes, advanced filters and local interfaces all validate.
+perform_export_protected_ipv4() {
+    (
+        local output_file
+        output_file=$(mktemp) || return 1
+        trap 'rm -f "$output_file"' EXIT
+        build_protected_ipv4_file "$output_file" || return 1
+        cat -- "$output_file"
+    )
+}
+
 # Return success when an exact IPv4 is covered by an exact or CIDR policy entry.
 # IPv4 values fit exactly within awk's integer-safe numeric range.
 ipv4_matches_policy_file() {
@@ -3546,7 +3558,7 @@ MODSEC_EOF
 
 
 # --- COMMAND LINE ARGUMENT PARSING ---
-if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,reconcile-allowlist,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,unblacklist:,check-ip:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
+if ! TEMP_ARGS_CMD=$(getopt -o '' --long init,rebuild-live-set,reconcile-allowlist,resize-live-set:,whitelist-local-addresses,whitelist:,blacklist:,block:,blacklist-file:,unblacklist:,export-protected-ipv4,check-ip:,promote-cidr:,migrate-lfd-distributed,unblock:,logs:,clear,install-mod-security-triggers,abuse:,abuse-report:,abuse-min:,abuse-days:,abuse-since:,abuse-until:,abuse-email,raw-grep:,raw-search:,help -n 'csf_ban_wp_login_attackers' -- "$@"); then
     echo "Terminating..." >&2
     exit 1
 fi
@@ -3555,6 +3567,10 @@ eval set -- "$TEMP_ARGS"
 
 while true; do
   case "$1" in
+    --export-protected-ipv4 )
+      perform_export_protected_ipv4
+      exit $?
+      ;;
     --init )
       perform_init
       ;;
@@ -3587,6 +3603,7 @@ while true; do
             echo "                               Repairs missing tracking for an already-live reviewed ban"
             echo "  --blacklist-file <FILE|-> [MSG]  Batch bare IPv4s; one tracker normalization + guarded publish; itemize every input"
             echo "  --unblacklist <IP> [MSG]  Remove IP from this tool's live/tracked deny without adding csf.allow"
+            echo "  --export-protected-ipv4  Print validated local/allow/ignore IPv4 policy, including Includes (read-only)"
             echo "  --check-ip <IP>           Report live and persistent deny/allow coverage (read-only)"
             echo "  --promote-cidr <CIDR> [MSG]  Atomically replace covered child bans with a persistent IPv4 /24"
             echo "  --migrate-lfd-distributed  Move recent LF_DISTATTACK blocks into persistent ipset coverage"

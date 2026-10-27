@@ -13,7 +13,7 @@ fail() {
 # shellcheck source=/dev/null
 source "$SCRIPT"
 
-sandbox=$(mktemp -d "$PWD/tests/.tmp.modsec-blacklist.XXXXXX")
+sandbox=$(mktemp -d "$(dirname "${BASH_SOURCE[0]}")/.tmp.modsec-blacklist.XXXXXX")
 trap 'rm -rf "$sandbox"' EXIT
 
 cat > "$sandbox/fake-ban-script" <<'EOF'
