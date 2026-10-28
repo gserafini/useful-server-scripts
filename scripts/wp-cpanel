@@ -1,0 +1,7 @@
+#!/usr/local/bin/php --ea-reference-dir=.
+<?php
+// cPanel chooses the site's CLI PHP from the current WordPress directory.
+// Keep an explicit `phpXX /usr/local/bin/wp` override and the vendor PHAR intact.
+// argv[0] must name the PHAR so `wp cli update` replaces it, not this launcher.
+$argv[0] = $_SERVER['argv'][0] = '/usr/local/lib/wp-cli/wp-cli.phar';
+require $argv[0];

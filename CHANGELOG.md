@@ -93,3 +93,10 @@
 - Persist `high_volume_bans` across CSF rebuilds by replaying its tracking file from `csfpost.sh`.
 - Bulk-restore tracked bans, deduplicate entries, and exclude assigned local IPv4 addresses from replay.
 - Add safe live-set resizing and local-address cleanup commands with regression coverage.
+
+## 2026-10-27 — Match WP-CLI to the site PHP on dc3-1
+
+The cPanel-aware `wp-cpanel` launcher selects the current WordPress root's PHP
+for ordinary WP-CLI commands. This prevents PHP 8.2 Composer platform failures
+on sites served by PHP 8.5, while retaining explicit PHP overrides and the
+unmodified vendor PHAR/self-update target.

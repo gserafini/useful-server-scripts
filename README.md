@@ -625,3 +625,30 @@ Contributions are welcome! Please:
 **Repository**: [https://github.com/gserafini/useful-server-scripts](https://github.com/gserafini/useful-server-scripts)
 
 **Built with assistance from**: Gemini Advanced (for csf_ban_wp_login_attackers and get_nameservers.sh)
+
+### cPanel WP-CLI launcher (dc3-1)
+
+`scripts/wp-cpanel` is the dc3-1 `/usr/local/bin/wp` launcher. It uses cPanel's
+CLI PHP selector with `--ea-reference-dir=.` so maintenance commands use the
+PHP configured for the current WordPress directory, instead of the system
+default selected from the root-owned PHAR directory. Always change into the
+intended WordPress root before plain `wp` commands. For commands from elsewhere,
+use the verified explicit `phpXX /usr/local/bin/wp --path=...` form.
+
+The unmodified vendor PHAR is `/usr/local/lib/wp-cli/wp-cli.phar`. Both argv
+arrays name that file so `wp cli update` updates the PHAR without replacing
+the launcher. Explicit PHP invocations continue to work. This does not change
+cPanel's system default or any site's web PHP configuration.
+
+Before deployment, preserve/hash the installed PHAR, install an identical copy
+at that library path, and test the staged launcher as the account owner with
+`--info` and a read-only plugin-loading command. Only then atomically replace
+`/usr/local/bin/wp` with the reviewed launcher. Keep the original PHAR as a
+rollback receipt. Do not run the generic all-script symlink installer on this
+launcher; deployment is explicit and dc3-1-only.
+
+Test: `python3.12 tests/test_wp_cpanel.py` (requires cPanel EA PHP 8.2/8.5 and
+the Share root). The fixture runs outside cPanel's noexec securetmp.
+
+This repository uses `master`; publish the checked-out branch with
+`git push origin HEAD` rather than assuming a `main` branch.
