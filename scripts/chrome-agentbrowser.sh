@@ -5,8 +5,9 @@
 # Root-run Puppeteer or Playwright scripts set their executablePath to
 # /usr/local/bin/chrome-agentbrowser. Chrome cannot be sandboxed as root, so this:
 # - drops --no-sandbox and --disable-setuid-sandbox (the sandbox works for agentbrowser);
-# - hands the library's per-launch temp profile (/tmp/puppeteer_dev_chrome_profile-* or
-#   /tmp/playwright_chromiumdev_profile-*, created by root) to agentbrowser, and refuses
+# - hands the library's per-launch temp profile (/tmp/puppeteer_dev_chrome_profile-*,
+#   /tmp/playwright_chromiumdev_profile-* or Lighthouse's /tmp/lighthouse.*, created by root)
+#   to agentbrowser, and refuses
 #   any other profile agentbrowser does not own;
 # - execs Chrome through setpriv with no capabilities, no way to regain privileges and a
 #   clean environment, keeping the pipe file descriptors that --remote-debugging-pipe uses.
@@ -28,7 +29,7 @@ fi
 
 hand_over_profile() {
     local dir="$1"
-    if [[ "$dir" =~ ^/tmp/(puppeteer_dev_chrome_profile-|playwright_chromiumdev_profile-)[A-Za-z0-9]+$ ]] \
+    if [[ "$dir" =~ ^/tmp/(puppeteer_dev_chrome_profile-|playwright_chromiumdev_profile-|lighthouse\.)[A-Za-z0-9]+$ ]] \
         && [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(stat -c %u "$dir")" = 0 ]; then
         chown -R -h -P "$BROWSER_USER:$BROWSER_USER" "$dir"
         return 0

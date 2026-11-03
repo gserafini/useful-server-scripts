@@ -59,6 +59,12 @@ grep -qx 'profile=writable' <<<"$out" || fail "temp profile not writable by agen
 [ "$(stat -c %U "$PROFILE")" = agentbrowser ] || fail "temp profile not owned by agentbrowser"
 rm -rf "$PROFILE"; PROFILE=""
 
+# 3b. Lighthouse's chrome-launcher names its temp profile /tmp/lighthouse.XXXXXX.
+PROFILE=$(mktemp -d /tmp/lighthouse.XXXXXX)
+out=$(run "--user-data-dir=$PROFILE")
+grep -qx 'profile=writable' <<<"$out" || fail "chrome-launcher temp profile not handed to agentbrowser: $out"
+rm -rf "$PROFILE"; PROFILE=""
+
 # 4. Any other root-owned profile is refused with the remedy.
 set +e
 err=$(run "--user-data-dir=$WORK/../" 2>&1 >/dev/null); rc=$?
