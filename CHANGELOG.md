@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `config/tmpfiles.d/agentbrowser-tmp.conf` (installed to `/etc/tmpfiles.d/`): a 10-day age cleanup for `/var/lib/agentbrowser/tmp`, where Chrome launched through `chrome-agentbrowser` keeps its per-launch temp directories since `TMPDIR` moved out of `/tmp` (server_ops B1929).
 - Add `wake_when_reachable.sh`: a silent scheduler check that queues one ClaudeGram wake the first time an SSH target answers (non-interactive probe with a timeout and strict host keys). First use: the MacBook Pro Node update.
 - Add `kernel_fix_watch.sh`: a silent scheduler check that queues one ClaudeGram wake when a kernel CVE fix lands (KernelCare live patch or distro errata), and fails visibly when a check cannot run. First watch: CVE-2026-98432.
 - Expose the complete protected IPv4 policy through read-only `--export-protected-ipv4`, so security consumers reuse recursive Includes, advanced filter operands and local-address protections without copying firewall logic.
