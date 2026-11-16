@@ -14,5 +14,10 @@ mktemp() {
         case "$fixture_arg" in /tmp/*) fixture_arg="$TMPDIR/${fixture_arg##*/}";; esac
         fixture_args+=("$fixture_arg")
     done
-    command mktemp "${fixture_args[@]}"
+    # Bash 4.1 treats an empty array as unbound under nounset.
+    if [ "$#" -eq 0 ]; then
+        command mktemp
+    else
+        command mktemp "${fixture_args[@]}"
+    fi
 }
