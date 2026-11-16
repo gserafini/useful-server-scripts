@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Count WordPress login volume from the actual requested login path, excluding login URLs in referrers, user agents and other routes' query strings. This prevents ordinary logged-out background requests from triggering the 100-request login ban.
 - Expose the complete protected IPv4 policy through read-only `--export-protected-ipv4`, so security consumers reuse recursive Includes, advanced filter operands and local-address protections without copying firewall logic.
 - Keep the ModSecurity adapter fixture inside its own checkout when invoked from another working directory; cPanel securetmp can prohibit executing fixtures in /tmp.
 

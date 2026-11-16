@@ -37,6 +37,7 @@ eval "$policy_match_block"
 eval "$policy_filter_block"
 eval "$reconcile_block"
 eval "$blacklist_block"
+source "$(dirname "${BASH_SOURCE[0]}")/tracking_fixture_functions.sh"
 
 [ "$(keyword_rule_pattern '1 union select')" = 'union select' ] ||
     fail "multiword signature was truncated"

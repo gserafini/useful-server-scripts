@@ -3990,7 +3990,9 @@ keywords=(
   # --- Brute Force / Scanning ---
   ["1 tools.ua.random"]="tools.ua.random user agent"
   ["1 /wordpresshp/wp-login.php?action=register"]="tried to register on our WordPress honeypot"
-  ["100 wp-login"]="tried to access wp-login"
+  # Count the requested login path, not a login URL in Referer/User-Agent or
+  # another route's query string (for example a logged-out admin heartbeat).
+  ["100 \] \"[A-Z][A-Z]* \([^?\" ]*/\)\?wp-login\(\.php\)\?[? /]"]="tried to access wp-login"
   ["5 wp-login.*500"]="wp-login and got 500 error code"
   ["20 wp-login.*403"]="wp-login and got 403 error code"
   ["5 wp-login.*404"]="wp-login and got 404 error code"
