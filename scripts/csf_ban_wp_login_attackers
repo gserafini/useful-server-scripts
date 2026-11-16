@@ -165,6 +165,13 @@ validate_ip() {
 # substring "union" (which also occurs in Jetpack's legitimate grunion.css).
 keyword_rule_pattern() {
     local rule="$1"
+    # Match the actual requested login path, excluding Referer/User-Agent and
+    # another route's query string. Keep the BRE out of the associative key:
+    # legacy Bash rejects keys containing this mix of quotes and brackets.
+    if [ "$rule" = '100 wp-login' ]; then
+        printf '%s\n' '\] "[A-Z][A-Z]* \([^?" ]*/\)\?wp-login\(\.php\)\?[? /]'
+        return
+    fi
     printf '%s\n' "${rule#* }"
 }
 
