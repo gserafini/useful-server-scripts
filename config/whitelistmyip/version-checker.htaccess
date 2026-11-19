@@ -1,0 +1,15 @@
+# Deployed to /home/serafini/public_html/version-checker/.htaccess
+# Source of truth: useful-server-scripts/config/whitelistmyip/version-checker.htaccess
+#
+# 2026-10-22 security containment (server_ops B1587): this internal tool (reCAPTCHA keys, CSF deny
+# list, domain/user map, auto_login.php, error_log) was publicly readable.
+# Remove this file only after moving secrets out of the webroot or adding auth.
+Require all denied
+
+# 2026-11-19 (server_ops B2003): only the WhitelistMyIP.com backend may reach the data-only intake
+# endpoint: Namecheap server182.web-hosting.com calls from 198.54.114.2; 198.54.116.2 is the site IP. CONN_REMOTE_ADDR is the real TCP peer, so an
+# X-Forwarded-For header relayed through a trusted local proxy (mod_remoteip trusts 127.0.0.1
+# for Imunify360) cannot impersonate it. whitelist_ip.php checks the caller again itself.
+<Files "whitelist_ip.php">
+    Require expr "%{CONN_REMOTE_ADDR} in { '198.54.114.2', '198.54.116.2' }"
+</Files>

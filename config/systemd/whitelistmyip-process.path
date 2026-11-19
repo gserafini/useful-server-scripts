@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the WhitelistMyIP.com request spool (server_ops B2003)
+
+[Path]
+PathExistsGlob=/home/serafini/whitelistmyip-spool/*.json
+Unit=whitelistmyip-process.service
+
+[Install]
+WantedBy=multi-user.target

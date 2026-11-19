@@ -2,3 +2,4 @@
 .agent-success-pack/
 .gitmodules
 .claude/*.local.json
+__pycache__/

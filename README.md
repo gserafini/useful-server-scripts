@@ -549,36 +549,84 @@ sudo kill_long_php.sh
 
 ---
 
-#### inotify_watch_for_csf_whitelist_additions.sh
+#### WhitelistMyIP.com self-service unblocking (`whitelistmyip_process.py`)
 
-Monitors a file using `inotify` and adds IPs to CSF whitelist when detected.
+A client whose network our firewall blocked can restore their own access at
+https://whitelistmyip.com/. That site (Namecheap `server182.web-hosting.com`, calling
+from `198.54.114.2`; the site itself is `198.54.116.2`) calls
+`serafinistudios.com/version-checker/whitelist_ip.php` with the visitor's IP,
+name, email and website (server_ops B2003).
 
----
-
-#### inotify_watch_for_csf_whitelist_requests.sh
-
-Monitors for whitelist requests and processes them.
-
-#### whitelist_notify.sh
-
-Sends the owner a whitelist audit message after a WhitelistMyIP request. In
-addition to CSF deny files and external blocklists, it captures live and tracked
-`high_volume_bans` evidence on both hosting servers. This preserves the original
-automated-ban reason before the next allowlist reconciliation removes the
-trusted address from the auxiliary deny set.
-
-The notifier also queues a ClaudeGram wake in the server-operations chat with
-the client name, site, IP, and captured block evidence. The wake asks the ops
-agent to reconstruct the original block, classify a false positive versus real
-abuse, fix a faulty detector when appropriate, and verify the allowlist and site
-health. Client email addresses are intentionally excluded from the wake prompt.
-Repeated requests for the same IP are collapsed into one investigation during a
-10-minute window, while the existing email remains as a delivery fallback.
+- **Intake.** `config/whitelistmyip/whitelist_ip.php` validates the request and
+  writes one `0600` JSON file to `/home/serafini/whitelistmyip-spool/`. It
+  returns the `{"success": bool}` shape the site expects and never runs a
+  command. `config/whitelistmyip/version-checker.htaccess` admits only those two
+  addresses as the real TCP peer (`CONN_REMOTE_ADDR`, so a relayed `X-Forwarded-For`
+  cannot impersonate it) and keeps the rest of version-checker denied (B1587).
+- **Trigger.** `whitelistmyip-process.path` starts the processor as root when a
+  request appears; `whitelistmyip-process.timer` sweeps every 15 minutes.
+- **Spool safety.** The processor opens the spool without following links,
+  checks its owner and mode, and handles one file at a time. Each request is
+  recorded before its file is removed, with at most 20 per run.
+- **Evidence.** It re-validates every field and records the block evidence on
+  dc3-1 and dc2-5: CSF deny and covering ranges, temp bans and allows,
+  `high_volume_bans` set and tracking, CSF blocklists, Imunify360.
+- **Not blocked: no firewall change.** The one exception is an Apache wp-login
+  GeoIP exception (`Allow from IP` in `/root/csf_whitelist_ips.conf`, behind a
+  passing `apachectl -t`) when that server's GeoIP data does not place the IP in
+  the US.
+- **What a client may lift.** Blocks our automation placed: lfd counts from
+  `mod_security`, `cpanel`, `smtpauth`, `imapd`, `pop3d` and `ftpd`, and scanner
+  bans with fewer than 20 violations.
+- **Held for Gabriel.** Anything a person or a security sweep placed, a denied
+  range, an external blocklist, an exploit signature, SSH brute force, 20+
+  violations, or evidence that could not be read.
+- **Unblocking.** It runs `csf -dr`, `csf -trd` (other temp allows survive) and
+  `csf_ban_wp_login_attackers --unblacklist`, then adds 30-day `csf -ta` allows
+  for TCP 80 and 443 inbound only. `ALLOWIN` outranks every ban, so the sites
+  stay reachable, while mail, cPanel and SSH keep their brute-force protection.
+  There is never a permanent all-ports `csf.allow` entry.
+- **dc2-5.** It gets the same steps over SSH, receiving only the validated IP and
+  an inert-ASCII comment, each shell-quoted and re-checked there.
+- **Notification.** Gabriel gets one email per request (`[WhitelistMyIP.com] IP
+  unblocked for NAME`, or "was not blocked", HELD or refused). When something
+  was actually blocked, The Watcher gets a ClaudeGram wake to investigate the
+  original block. The wake marks client text as untrusted and never asks the
+  agent to approve. Repeats within 10 minutes are quiet; each IP is limited to
+  5 processed requests a day, and at most 30 requests an hour may change
+  anything. Emails about requests that changed nothing are capped at 10 an
+  hour. If the spool becomes unusable or the processor fails, Gabriel gets an
+  alert email, at most once every 6 hours.
 
 ```bash
-sudo ./scripts/whitelist_notify.sh 203.0.113.10 "Client Name" \
-  "client@example.com" "example.com"
+whitelistmyip_process.py --status            # last 10 requests and any held ones
+sudo whitelistmyip_process.py --dry-run      # read the spool, change nothing
+sudo whitelistmyip_process.py --approve 1795000000-0123456789abcdef
+journalctl -u whitelistmyip-process.service -n 50
 ```
+
+Install on dc3-1:
+
+```bash
+install -d -o serafini -g serafini -m 0700 /home/serafini/whitelistmyip-spool
+ln -s "$PWD/scripts/whitelistmyip_process.py" /usr/local/bin/whitelistmyip_process.py
+install -m 0644 config/systemd/whitelistmyip-process.{service,path,timer} /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now whitelistmyip-process.path whitelistmyip-process.timer
+install -o serafini -g serafini -m 0644 config/whitelistmyip/whitelist_ip.php \
+  /home/serafini/public_html/version-checker/whitelist_ip.php
+install -o serafini -g serafini -m 0644 config/whitelistmyip/version-checker.htaccess \
+  /home/serafini/public_html/version-checker/.htaccess
+```
+
+Tests: `TMPDIR=$HOME/.cache python3.12 -B tests/test_whitelistmyip_process.py`
+and `tests/test_whitelistmyip_endpoint.py` (the second needs a PHP CLI).
+
+The previous design (`inotify_watch_for_csf_whitelist_requests.sh`,
+`inotify_watch_for_csf_whitelist_additions.sh` and `whitelist_notify.sh`) was
+removed for four reasons. Its root loop executed a web-written file with bash,
+with the website and email fields reaching that shell unescaped. The endpoint
+accepted calls from anywhere. Every requester got a permanent all-ports
+`csf.allow` entry. The second loop restarted Apache on every `csf.allow` change.
 
 ---
 

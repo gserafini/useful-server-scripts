@@ -1,0 +1,10 @@
+[Unit]
+Description=Sweep the WhitelistMyIP.com request spool every 15 minutes (backstop for the path unit)
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=15min
+Unit=whitelistmyip-process.service
+
+[Install]
+WantedBy=timers.target

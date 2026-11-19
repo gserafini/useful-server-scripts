@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rebuild WhitelistMyIP.com self-service unblocking (server_ops B2003). Since the serafini account moved to dc3-1 on 2026-10-22 it had silently done nothing: the root watcher was never started, and the version-checker lockdown returned 403. The intake endpoint now admits only the whitelistmyip.com host and is data-only. A systemd-triggered root processor (`whitelistmyip_process.py`) re-validates each request from a link-safe spool. It changes nothing for an IP that is not blocked, and holds deliberate bans, attack histories and incomplete evidence for approval. Otherwise it clears CSF, ipset and tracking bans and adds 30-day temp allows for TCP 80/443 only on dc3-1 and dc2-5. It also adds the wp-login GeoIP exception when needed, and emails one report per request. No request text ever reaches a shell. It replaces permanent all-ports `csf.allow` grants.
+- Remove `inotify_watch_for_csf_whitelist_requests.sh`, `inotify_watch_for_csf_whitelist_additions.sh` and `whitelist_notify.sh`. The first ran a web-writable file as root with unescaped request fields; the second restarted Apache on every `csf.allow` change; the processor replaces the third.
+
 - Count WordPress login volume from the actual requested login path, excluding login URLs in referrers, user agents and other routes' query strings. This prevents ordinary logged-out background requests from triggering the 100-request login ban.
 - Add `config/tmpfiles.d/agentbrowser-tmp.conf` (installed to `/etc/tmpfiles.d/`): a 10-day age cleanup for `/var/lib/agentbrowser/tmp`, where Chrome launched through `chrome-agentbrowser` keeps its per-launch temp directories since `TMPDIR` moved out of `/tmp` (server_ops B1929).
 - Add `wake_when_reachable.sh`: a silent scheduler check that queues one ClaudeGram wake the first time an SSH target answers (non-interactive probe with a timeout and strict host keys). First use: the MacBook Pro Node update.

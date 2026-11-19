@@ -1,0 +1,17 @@
+[Unit]
+Description=Process WhitelistMyIP.com unblock requests (useful-server-scripts, server_ops B2003)
+Documentation=https://github.com/gserafini/useful-server-scripts
+After=network-online.target csf.service lfd.service
+Wants=network-online.target
+# A brake on crash loops: normal use (at most 20 requests per run) never comes close. If it
+# trips, the 15-minute timer retries once the window has passed.
+StartLimitIntervalSec=120
+StartLimitBurst=30
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/whitelistmyip_process.py
+TimeoutStartSec=15min
+Nice=5
+UMask=0077
+PrivateTmp=yes
