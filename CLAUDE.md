@@ -4,6 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Note**: See [IMPLEMENTATION_CHECKLIST.md](IMPLEMENTATION_CHECKLIST.md) for maintenance and enhancement tracking.
 
+## Public Repository: No Client Data (CRITICAL)
+
+This repository is **public** on GitHub. Never put client or end-user names, email addresses, IP
+addresses, domains or log excerpts in tests, fixtures, docs or commit messages, even when a test
+reproduces a real incident. Use `example.com`/`example.org`, `Pat Client`, and generic addresses
+(`1.2.3.4`, `5.6.7.8`; RFC 5737 ranges where the code accepts non-global addresses). Before
+pushing, grep the diff for the real identifiers you worked with. (2026-11-19: real client
+identifiers reached test fixtures and had to be scrubbed with a squash and force-push.)
+
 ## Project Overview
 
 This repository contains a collection of bash scripts for Linux server administration, primarily focused on security hardening, WordPress management, and cPanel/WHM server maintenance. All scripts are designed to run with root privileges on production servers.
