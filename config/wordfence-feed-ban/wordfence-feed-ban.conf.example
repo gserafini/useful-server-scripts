@@ -1,0 +1,5 @@
+# Wordfence blocked-IP feed sources for scripts/wordfence_feed_ban.py.
+# Install as /etc/wordfence-feed-ban.conf (root, mode 0600). One https:// site base per line;
+# each site must run the "WordFence Get Blocked IPs" helper plugin. Never commit real sites.
+https://example.com
+https://www.example.org

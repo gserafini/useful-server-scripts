@@ -1,128 +1,139 @@
 <?php
-// Prevent overlapping cron runs from piling up and spawning redundant ban checks.
+// Ban Wordfence-reported attackers through the tracked csf_ban_wp_login_attackers helper
+// (kernel ipset high_volume_bans plus persistent tracking). Legacy PHP runner for hosts
+// without Python 3; scripts/wordfence_feed_ban.py is the maintained implementation.
+//
+// Sites: /etc/wordfence-feed-ban.conf, one https:// base per line (see
+// config/wordfence-feed-ban/wordfence-feed-ban.conf.example). This repository is public:
+// never commit real site names.
+//
+// Usage: php wordfence_ban_ips.php [limit=N] [maxdays=N] [dryrun=1] [config=PATH]
+// Prints nothing when nothing changed, so `| mail -E ...` only mails real bans or errors.
+// Exit codes: 0 ok, 1 some feed failed, 2 configuration error, 4 CSF policy unreadable.
+
 $lock_file = fopen('/var/run/wordfence_ban_ips.lock', 'c');
 if ($lock_file === false) {
 	fwrite(STDERR, "Unable to open lock file /var/run/wordfence_ban_ips.lock\n");
 	exit(1);
 }
-
 if (!flock($lock_file, LOCK_EX | LOCK_NB)) {
-	echo "Another wordfence_ban_ips.php instance is already running, exiting.\n";
-	exit(0);
+	exit(0); // a previous run is still working; stay silent
 }
-
 ftruncate($lock_file, 0);
 fwrite($lock_file, getmypid() . PHP_EOL);
-
 register_shutdown_function(function () use ($lock_file) {
 	flock($lock_file, LOCK_UN);
 	fclose($lock_file);
 });
 
-// 1. Get list of all IPs we want to deny
-// 2. Check to see if they're already in csf.deny (it's expensive to try to deny each IP individually and let csf check it)
-// 3. Add IPs to deny file
-
-echo "Getting IPs to ban from WordFence...\n";
-
-$sites = array();
-$sites[] = "https://sharethepractice.org/";
-$sites[] = "https://serafinistudios.com/";
-$sites[] = "https://www.asaentertainment.com/";
-$sites[] = "https://gabrielserafini.com/";
-//$sites[] = "https://christiansciencenursing.org/";
-$sites[] = "https://firstchurchstl.com/";
-$sites[] = "https://offyonder.com/";
-#$sites[] = "https://www.ssicinnercircle.com/";
-#$sites[] = "https://ssiconline.com/";
-$sites[] = "https://interprosepr.com";
-
-$ips_to_ban = array();
-
-// Add args to $_GET
-if($argc>1)
-  parse_str(implode('&',array_slice($argv, 1)), $_GET);
-
-$maxdays = $_GET['maxdays'] ?? 30;
-$limit = $_GET['limit'] ?? 20;
-$format = $_GET['format'] ?? 'json';
-
-$params = "?get_wordfence_blocked_ips=true&format=$format&maxdays=$maxdays&limit=$limit";
-
-$csf_deny_file = '/etc/csf/csf.deny';
-$csf_ignore_file = '/etc/csf/csf.ignore';
-$csf_allow_file = '/etc/csf/csf.allow';
+if ($argc > 1) {
+	parse_str(implode('&', array_slice($argv, 1)), $_GET);
+}
+$maxdays = max(1, (int) ($_GET['maxdays'] ?? 30));
+$limit = max(1, (int) ($_GET['limit'] ?? 20));
+$dryrun = !empty($_GET['dryrun']);
+$config_file = $_GET['config'] ?? '/etc/wordfence-feed-ban.conf';
 $ban_script = '/usr/local/bin/csf_ban_wp_login_attackers';
 
-// Check existing IPs in CSF files and IPSET
-$csf_deny_file_contents = file_get_contents($csf_deny_file);
-echo "Lines in $csf_deny_file: " . count( explode(PHP_EOL,$csf_deny_file_contents)). "\n";
+// 1. Site list from local configuration.
+$lines = @file($config_file, FILE_IGNORE_NEW_LINES);
+if ($lines === false) {
+	echo "ERROR: cannot read $config_file\n";
+	exit(2);
+}
+$sites = array();
+foreach ($lines as $n => $line) {
+	$value = trim(preg_replace('/#.*/', '', $line));
+	if ($value === '') {
+		continue;
+	}
+	if (!preg_match('#^https://[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+/?$#', $value)) {
+		echo "ERROR: $config_file line " . ($n + 1) . ": expected https://host with no path\n";
+		exit(2);
+	}
+	$sites[rtrim(strtolower($value), '/')] = true;
+}
+if (!$sites) {
+	echo "ERROR: no sites in $config_file\n";
+	exit(2);
+}
 
-$csf_ignore_file_contents = file_get_contents($csf_ignore_file);
-echo "Lines in $csf_ignore_file: " . count( explode(PHP_EOL,$csf_ignore_file_contents)). "\n";
-
-$csf_allow_file_contents = file_get_contents($csf_allow_file);
-echo "Lines in $csf_allow_file: " . count( explode(PHP_EOL,$csf_allow_file_contents)). "\n";
-
-// Get IPs already in IPSET (using high_volume_bans set name)
-$ipset_ips = shell_exec('ipset list high_volume_bans 2>/dev/null | grep -E "^[0-9]" || echo ""');
-echo "IPs in IPSET: " . count( explode(PHP_EOL, trim($ipset_ips))). "\n";
-
-echo "\n";
-
-$existing_ips = $csf_ignore_file_contents.$csf_allow_file_contents.$csf_deny_file_contents.$ipset_ips;
-
-foreach ($sites as $site) {
-	$url = $site . $params;
-	echo "Getting IPs from: $url\n";
-	$raw_ips = file_get_contents($url);
-	if ($raw_ips) {
-		$site_ips = json_decode($raw_ips);
-		//print_r($site_ips);
-		if ($site_ips) {
-			foreach ($site_ips as $details) {
-				if (!isset($ips_to_ban[$details->IP]) && isset($details->IP)) {
-					$details->site = $site;
-					$ips_to_ban[$details->IP] = $details;
-				}
-			}
+// 2. Exact membership set: every IPv4 already in CSF allow/ignore/deny or the live ipset.
+//    (The old strpos() test treated 1.2.3.4 as present when 11.2.3.45 was listed.)
+$existing = array();
+foreach (array('/etc/csf/csf.ignore', '/etc/csf/csf.allow', '/etc/csf/csf.deny') as $policy) {
+	$text = @file_get_contents($policy);
+	if ($text === false) {
+		echo "ERROR: cannot read $policy\n";
+		exit(4);
+	}
+	if (preg_match_all('/(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])/', $text, $m)) {
+		foreach ($m[1] as $ip) {
+			$existing[$ip] = true;
 		}
 	}
 }
-echo "\n";
-echo "Found total of " . count($ips_to_ban) . " IPs to check! \n";
+$live = (string) shell_exec('ipset save high_volume_bans 2>/dev/null');
+if (preg_match_all('/^add high_volume_bans (\S+)/m', $live, $m)) {
+	foreach ($m[1] as $ip) {
+		$existing[$ip] = true;
+	}
+}
 
-$ips_added = 0;
-
-foreach ($ips_to_ban as $IP => $details) {
-	//echo "Checking $IP\n";
-	if (strpos($existing_ips, $IP) === false) {
-		// Build reason string for ban
-		$reason = "WordFence: {$details->blockCount} blocks for {$details->blockType} on {$details->site} ({$details->countryCode} {$details->countryName})";
-
-		echo "Banning $IP: $reason\n";
-
-		// Call csf_ban_wp_login_attackers to add to IPSET
-		$cmd = escapeshellcmd($ban_script) . ' --blacklist ' . escapeshellarg($IP) . ' ' . escapeshellarg($reason) . ' 2>&1';
-		$output = shell_exec($cmd);
-
-		if ($output) {
-			echo "  Output: " . trim($output) . "\n";
+// 3. Collect new, valid, public IPv4 sources from every feed.
+$errors = array();
+$candidates = array();
+$context = stream_context_create(array(
+	'http' => array('timeout' => 30, 'user_agent' => 'wordfence-feed-ban/1.0'),
+	'ssl' => array('verify_peer' => true, 'verify_peer_name' => true),
+));
+foreach (array_keys($sites) as $site) {
+	$url = $site . "/?get_wordfence_blocked_ips=true&format=json&maxdays=$maxdays&limit=$limit";
+	$raw = @file_get_contents($url, false, $context);
+	if ($raw === false) {
+		$errors[] = "$site: feed request failed";
+		continue;
+	}
+	if (trim($raw) === '') {
+		continue; // the helper plugin returns an empty body when nothing was blocked
+	}
+	$rows = json_decode($raw);
+	if (!is_array($rows)) {
+		$errors[] = "$site: feed did not return a JSON list";
+		continue;
+	}
+	foreach ($rows as $row) {
+		$ip = (is_object($row) && isset($row->IP) && is_string($row->IP)) ? $row->IP : '';
+		if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+			continue;
 		}
-
-		$ips_added++;
+		if (isset($existing[$ip]) || isset($candidates[$ip])) {
+			continue;
+		}
+		$type = (isset($row->blockType) && preg_match('/^[a-z0-9_-]{1,24}$/', (string) $row->blockType)) ? $row->blockType : 'other';
+		$count = isset($row->blockCount) ? (int) $row->blockCount : 0;
+		$candidates[$ip] = "WordFence: $count $type blocks on $site";
 	}
-	else {
-		unset($ips_to_ban[$IP]);
+}
+
+// 4. Ban through the tracked helper; it re-checks protected policy for every address.
+$added = 0;
+foreach ($candidates as $ip => $reason) {
+	if ($dryrun) {
+		echo "DRYRUN would ban $ip: $reason\n";
+		continue;
 	}
+	$output = shell_exec(escapeshellcmd($ban_script) . ' --blacklist ' . escapeshellarg($ip) . ' ' . escapeshellarg($reason) . ' 2>&1');
+	echo "Banned $ip: $reason\n";
+	if ($output) {
+		echo '  ' . str_replace("\n", "\n  ", trim($output)) . "\n";
+	}
+	$added++;
 }
-
-if ($ips_added > 0) {
-	echo "\nSuccessfully added $ips_added IPs to IPSET via csf_ban_wp_login_attackers\n";
+foreach ($errors as $error) {
+	echo "ERROR: $error\n";
 }
-else {
-	echo "\nNo new IPs to add - all IPs already banned in CSF or IPSET.\n";
+if ($added > 0) {
+	echo "Added $added IPs via csf_ban_wp_login_attackers.\n";
 }
-
-echo "Done!\n";
-
+exit($errors ? 1 : 0);

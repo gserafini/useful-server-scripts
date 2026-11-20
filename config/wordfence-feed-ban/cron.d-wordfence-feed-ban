@@ -1,0 +1,4 @@
+# /etc/cron.d/wordfence-feed-ban: ban new Wordfence-reported attackers every 15 minutes.
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/15 * * * * root /usr/bin/python3.12 -I /usr/local/useful-server-scripts/scripts/wordfence_feed_ban.py >> /var/log/wordfence-feed-ban.log 2>&1

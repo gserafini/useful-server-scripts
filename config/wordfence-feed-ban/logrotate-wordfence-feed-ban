@@ -1,0 +1,8 @@
+/var/log/wordfence-feed-ban.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    create 0600 root root
+}
